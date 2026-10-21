@@ -490,6 +490,95 @@ index e3e42012..198fb98f 100644
  // called whenever a texture is destroyed
  // it is guaranteed that the texture is not in use and all associated resources (descriptor sets, framebuffers) can be destroyed safely
  void VulkanRenderer::surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture)
+diff --git a/src/Cafe/IOSU/fsa/iosu_fsa.cpp b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
+index 1429d083..70e446cf 100644
+--- a/src/Cafe/IOSU/fsa/iosu_fsa.cpp
++++ b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
+@@ -165,7 +165,20 @@ namespace iosu
+ 		FSCVirtualFile* __FSAOpenNode(FSAClient* client, std::string_view path, FSC_ACCESS_FLAG accessFlags, sint32& fscStatus)
+ 		{
+ 			std::string translatedPath = __FSATranslatePath(client, path);
+-			return fsc_open(translatedPath.c_str(), accessFlags, &fscStatus);
++			FSCVirtualFile* fscFile = fsc_open(translatedPath.c_str(), accessFlags, &fscStatus);
++			if (!fscFile)
++			{
++				// diagnostic: log paths the game asked for that don't exist (each path once, capped)
++				static std::mutex s_missingMutex;
++				static std::unordered_set<std::string> s_loggedMissing;
++				std::unique_lock _l(s_missingMutex);
++				if (s_loggedMissing.size() < 500 && !s_loggedMissing.contains(translatedPath))
++				{
++					s_loggedMissing.insert(translatedPath);
++					cemuLog_log(LogType::Force, "[FileMissing] {} (status {})", translatedPath, fscStatus);
++				}
++			}
++			return fscFile;
+ 		}
+ 
+ 		class _FSAHandleTable {
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
+index 13ef6613..ac2d74cd 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
+@@ -552,7 +552,13 @@ namespace coreinit
+ 		// once a line is full or \n is written it will be posted to log
+ 		auto flushLine = [](CafeLogBuffer& cafeLogBuffer, std::string_view cafeLogName) -> void
+ 		{
+-			cemuLog_log(LogType::CoreinitLogging, "[{0}] {1}", cafeLogName, std::basic_string_view(cafeLogBuffer.lineBuffer.data(), cafeLogBuffer.lineLength));
++			// cap the number of game debug lines so log.txt stays small
++			static sint32 s_cafeLogLineBudget = 5000;
++			if (s_cafeLogLineBudget > 0)
++			{
++				s_cafeLogLineBudget--;
++				cemuLog_log(LogType::CoreinitLogging, "[{0}] {1}", cafeLogName, std::basic_string_view(cafeLogBuffer.lineBuffer.data(), cafeLogBuffer.lineLength));
++			}
+ 			cafeLogBuffer.lineLength = 0;
+ 		};
+ 
+diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
+index d4e562e0..f6e13e0f 100644
+--- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
++++ b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
+@@ -369,6 +369,15 @@ namespace snd_core
+ 				while (voiceItr->next)
+ 					voiceItr = voiceItr->next.GetPtr();
+ 				cemuLog_logDebug(LogType::Force, "Dropped voice {}", (uint32)voiceItr->index);
++				{
++					// diagnostic: log the first few voice drops
++					static sint32 s_dropLogBudget = 40;
++					if (s_dropLogBudget > 0)
++					{
++						s_dropLogBudget--;
++						cemuLog_log(LogType::Force, "[AXDiag] dropped voice {} (priority {}) to make room for a voice with priority {}", (uint32)voiceItr->index, i, priority);
++					}
++				}
+ 				// drop voice
+ 				if (voiceItr->playbackState != 0)
+ 				{
+@@ -409,6 +418,12 @@ namespace snd_core
+ 			if (!vpb)
+ 			{
+ 				// no voice available
++				static sint32 s_acquireFailLogBudget = 40;
++				if (s_acquireFailLogBudget > 0)
++				{
++					s_acquireFailLogBudget--;
++					cemuLog_log(LogType::Force, "[AXDiag] AXAcquireVoice failed, no free voice (requested priority {})", priority);
++				}
+ 				__AXVoiceListSpinlock.unlock();
+ 				return nullptr;
+ 			}
+diff --git a/src/Cemu/Logging/CemuLogging.cpp b/src/Cemu/Logging/CemuLogging.cpp
+index f2d9ac05..28555c35 100644
+--- a/src/Cemu/Logging/CemuLogging.cpp
++++ b/src/Cemu/Logging/CemuLogging.cpp
+@@ -264,4 +264,6 @@ std::unique_lock<decltype(LogContext.log_mutex)> cemuLog_acquire()
+ void cemuLog_setActiveLoggingFlags(uint64 flagMask)
+ {
+ 	s_loggingFlagMask = flagMask | cemuLog_getFlag(LogType::Force);
++	// Light Fix diagnostic build: always record unsupported OS calls and the game's own debug messages
++	s_loggingFlagMask |= cemuLog_getFlag(LogType::UnsupportedAPI) | cemuLog_getFlag(LogType::CoreinitLogging);
+ }
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
 index 3c1587e7..7430cfee 100644
 --- a/src/android/app/build.gradle.kts

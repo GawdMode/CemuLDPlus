@@ -23,6 +23,11 @@ All builds are listed on the [Releases](../../releases) page.
 
 Requires a 64-bit (arm64) Android device running Android 11 or newer, the same as SSimco's build.
 
+## Known issues
+
+- Some NPC voice lines (for example the mini-quest characters) don't play, and their text may not appear until
+  you tap. This also happens in regular Cemu, on Android and PC, and is being looked into.
+
 ## Important: play at 720p
 
 The fix works at the game's native **1280x720** resolution. In **Graphic packs**, set
@@ -59,7 +64,9 @@ of the larger texture was ever filled in. That's why lighting only worked in a s
 [`lightfix.patch`](lightfix.patch) adds tracking and copying for these "offset" textures. A pair is only
 linked after checking with Cemu's address math that both memory layouts really line up. It also adds
 depth↔color copies with offsets on Vulkan. The patch writes `[TexCreate]` and `[OffsetTexSync]` lines to
-`log.txt` to help with diagnosing problems.
+`log.txt` to help with diagnosing problems. It also logs missing game files (`[FileMissing]`), sound voice
+problems (`[AXDiag]`), unsupported system calls and the game's own debug messages, to help track down the
+missing NPC voice lines (a long-standing Cemu issue with LEGO Dimensions that isn't fixed yet).
 
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.
