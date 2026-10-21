@@ -1,0 +1,109 @@
+name: Build Cemu Light Fix APK
+
+# Downloads SSimco's Cemu Android port at a fixed commit, applies lightfix.patch,
+# builds the APK and publishes it as a GitHub release for direct download on the device.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CEMU_REPO: https://github.com/SSimco/Cemu.git
+  CEMU_COMMIT: 8759323e5b72594665b55e02f99db3c1e1e7de8a
+  VCPKG_ROOT: "${{ github.workspace }}/cemu/dependencies/vcpkg"
+  VCPKG_BINARY_SOURCES: "clear;files,/home/runner/vcpkg-binary-cache,readwrite"
+  VCPKG_FORCE_DOWNLOADED_BINARIES: true
+  # throwaway test signing key, kept fixed so newer test builds install over older ones
+  TEST_KEYSTORE_B64: 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
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: lightfix
+
+      - name: Download Cemu source and apply the fix
+        run: |
+          git clone "$CEMU_REPO" cemu
+          cd cemu
+          git checkout "$CEMU_COMMIT"
+          git submodule update --init --recursive
+          git apply --verbose ../lightfix/lightfix.patch
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update -qq
+          sudo apt install -y gettext
+
+      - name: Uncompile message catalogs
+        working-directory: cemu
+        run: |
+          for mo_file in bin/resources/*/cemu.mo
+          do
+            language_code=$(basename $(dirname $mo_file))
+            po_file=src/android/app/src/main/assets/translations/$language_code/cemu.po
+            mkdir -p $(dirname $po_file)
+            msgunfmt $mo_file -o $po_file || echo "Failed to uncompile message catalog from $mo_file"
+          done
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/vcpkg-binary-cache
+          key: vcpkg-android-${{ env.CEMU_COMMIT }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-android-${{ env.CEMU_COMMIT }}-
+            vcpkg-android-
+
+      - name: Bootstrap vcpkg
+        working-directory: cemu
+        run: |
+          mkdir -p /home/runner/vcpkg-binary-cache
+          bash ./dependencies/vcpkg/bootstrap-vcpkg.sh
+
+      - name: Set up test signing key
+        run: |
+          mkdir -p ~/.android
+          echo "$TEST_KEYSTORE_B64" | base64 --decode > ~/.android/debug.keystore
+
+      - name: Build APK
+        working-directory: cemu/src/android
+        run: |
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          ./gradlew assembleRelease
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          APK=$(find cemu/src/android/app/build/outputs/apk -name "*.apk" | head -n 1)
+          echo "Found $APK"
+          cp "$APK" out/Cemu-LightFix.apk
+          ls -la out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cemu-LightFix
+          path: out/Cemu-LightFix.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Cemu Light Fix test build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            Test build of SSimco's Cemu for Android (commit ${{ env.CEMU_COMMIT }}) with an experimental
+            fix for LEGO Dimensions lighting being limited to a square around the player.
+            Installs as a separate app called "Cemu Light Fix" next to the regular Cemu app.
+          files: out/Cemu-LightFix.apk

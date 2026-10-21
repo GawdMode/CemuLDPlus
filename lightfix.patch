@@ -1,0 +1,517 @@
+diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
+index 4445fb26..6612b6a2 100644
+--- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
+@@ -500,11 +500,18 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
+ 
+ }
+ 
++static void LatteTexture_SyncOffsetRelation(LatteTextureRelation* rel, LatteTexture* targetTexture);
++
+ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
+ {
+ 	// note: Currently this function assumes that only one other texture is updated per slice/mip (if multiple overlap, we should merge the one with the latest timestamp the latest of each individually)
+ 	for (auto& texRel : texture->list_compatibleRelations)
+ 	{
++		if (texRel->isOffsetRelation)
++		{
++			LatteTexture_SyncOffsetRelation(texRel, texture);
++			continue;
++		}
+ 		LatteTexture* baseTexture = texRel->baseTexture;
+ 		LatteTexture* subTexture = texRel->subTexture;
+ 		for (sint32 cMipIndex = 0; cMipIndex < texRel->mipCount; cMipIndex++)
+@@ -730,6 +737,292 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
+ 	}
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------------
++// Offset (sub-region) texture relations
++// Some games render into surfaces that start in the middle of a larger surface. For example TT Games' LEGO titles
++// appear to render shadow cascades into 960x960 surfaces that are placed inside a single taller shadow atlas.
++// Previously, textures were only synchronized if they share the same start address, so only the first region of such
++// an atlas ever received data. The code below detects sub-textures that map onto a row range of a larger texture and
++// copies data between the two (sub <-> its row range in the base) whenever one of them is used and the other has newer data.
++// ---------------------------------------------------------------------------------------------------------------------
++
++static sint32 s_offsetRelLogBudget = 300;
++
++static uint32 _LatteTexture_NormalizeSwizzle(uint32 swizzle)
++{
++	// swizzle is stored either as raw pointer bits (0x000-0x700) or already shifted (0-7) depending on where the texture was created
++	if (swizzle > 7)
++		swizzle >>= 8;
++	return swizzle & 7;
++}
++
++// returns the byte offset of texel (x,y) of slice 0 / mip 0 relative to the start of the surface
++static bool _LatteTexture_GetTexelByteOffset(Latte::E_HWTILEMODE tileMode, uint32 bpp, uint32 pitch, uint32 height, uint32 swizzle, uint32 x, uint32 y, uint32& offsetOut)
++{
++	// note: isDepth only changes the pixel order inside an 8x8 micro tile, which does not matter for row-offset matching
++	switch (tileMode)
++	{
++	case Latte::E_HWTILEMODE::TM_LINEAR_GENERAL:
++	case Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED:
++		offsetOut = LatteAddrLib::ComputeSurfaceAddrFromCoordLinear(x, y, 0, 0, bpp, pitch, height, 1);
++		return true;
++	case Latte::E_HWTILEMODE::TM_1D_TILED_THIN1:
++		offsetOut = LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x, y, 0, bpp, pitch, height, tileMode, false);
++		return true;
++	case Latte::E_HWTILEMODE::TM_2D_TILED_THIN1:
++	case Latte::E_HWTILEMODE::TM_2D_TILED_THIN2:
++	case Latte::E_HWTILEMODE::TM_2D_TILED_THIN4:
++	case Latte::E_HWTILEMODE::TM_2B_TILED_THIN1:
++	case Latte::E_HWTILEMODE::TM_2B_TILED_THIN2:
++	case Latte::E_HWTILEMODE::TM_2B_TILED_THIN4:
++		offsetOut = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiled(x, y, 0, 0, bpp, pitch, height, 1, tileMode, false, swizzle & 1, (swizzle >> 1) & 3);
++		return true;
++	default:
++		return false; // thick and 3D tile modes are not handled
++	}
++}
++
++// check if every texel (x,y) of subTexture maps to texel (x, y+yOffset) of baseTexture, given the byte offset between both surfaces
++static bool _LatteTexture_VerifyOffsetMapping(LatteTexture* baseTexture, uint32 baseSwizzle, LatteTexture* subTexture, uint32 subSwizzle, uint32 byteOffset, sint32 yOffset)
++{
++	const uint32 bpp = baseTexture->GetBPP();
++	const uint32 pitch = (uint32)baseTexture->pitch;
++	const sint32 w = subTexture->width;
++	const sint32 h = subTexture->height;
++	auto checkTexel = [&](sint32 x, sint32 y) -> bool
++	{
++		uint32 offSub, offBase;
++		if (!_LatteTexture_GetTexelByteOffset(subTexture->tileMode, bpp, pitch, subTexture->height, subSwizzle, x, y, offSub))
++			return false;
++		if (!_LatteTexture_GetTexelByteOffset(baseTexture->tileMode, bpp, pitch, baseTexture->height, baseSwizzle, x, y + yOffset, offBase))
++			return false;
++		return (offSub + byteOffset) == offBase;
++	};
++	// sample a grid of texels plus the edges
++	for (sint32 y = 0; y < h; y += 7)
++	{
++		for (sint32 x = 0; x < w; x += 5)
++		{
++			if (!checkTexel(x, y))
++				return false;
++		}
++		if (!checkTexel(w - 1, y))
++			return false;
++	}
++	for (sint32 x = 0; x < w; x += 3)
++	{
++		if (!checkTexel(x, h - 1))
++			return false;
++	}
++	return true;
++}
++
++// called when sliceMipInfoA (of textureA) and sliceMipInfoB (of textureB) overlap but don't start at the same address
++static void LatteTexture_TryTrackOffsetRelation(LatteTextureSliceMipInfo* sliceMipInfoA, LatteTextureSliceMipInfo* sliceMipInfoB)
++{
++	// figure out which one is the containing (base) slice
++	LatteTextureSliceMipInfo* baseInfo;
++	LatteTextureSliceMipInfo* subInfo;
++	if (sliceMipInfoA->addrStart < sliceMipInfoB->addrStart && sliceMipInfoB->addrEnd <= sliceMipInfoA->addrEnd)
++	{
++		baseInfo = sliceMipInfoA;
++		subInfo = sliceMipInfoB;
++	}
++	else if (sliceMipInfoB->addrStart < sliceMipInfoA->addrStart && sliceMipInfoA->addrEnd <= sliceMipInfoB->addrEnd)
++	{
++		baseInfo = sliceMipInfoB;
++		subInfo = sliceMipInfoA;
++	}
++	else
++		return; // partial overlap, not handled
++	LatteTexture* baseTexture = baseInfo->texture;
++	LatteTexture* subTexture = subInfo->texture;
++	if (baseTexture == subTexture)
++		return;
++	// only handle sub textures which are a single plain 2D surface and base mip 0
++	if (subInfo->sliceIndex != 0 || subInfo->mipIndex != 0 || baseInfo->mipIndex != 0)
++		return;
++	if (subTexture->depth != 1 || subTexture->Is3DTexture() || baseTexture->Is3DTexture())
++		return;
++	// check if this relation is already known
++	for (auto& it : baseTexture->list_compatibleRelations)
++	{
++		if (it->baseTexture == baseTexture && it->subTexture == subTexture)
++			return;
++	}
++
++	const uint32 byteOffset = subInfo->addrStart - baseInfo->addrStart;
++	const uint32 bpp = baseTexture->GetBPP();
++	const uint32 baseSwizzle = _LatteTexture_NormalizeSwizzle(baseTexture->swizzle);
++	const uint32 subSwizzle = _LatteTexture_NormalizeSwizzle(subTexture->swizzle);
++
++	auto logResult = [&](const char* result, sint32 yOffset)
++	{
++		if (s_offsetRelLogBudget <= 0)
++			return;
++		// only log each combination of texture shapes and result once
++		static std::unordered_set<uint64> s_loggedCombinations;
++		uint64 key = (uint64)(uintptr_t)result;
++		key = key * 31 + (uint64)baseTexture->width; key = key * 31 + (uint64)baseTexture->height; key = key * 31 + (uint64)baseTexture->format; key = key * 31 + (baseTexture->isDepth ? 1 : 2);
++		key = key * 31 + (uint64)subTexture->width; key = key * 31 + (uint64)subTexture->height; key = key * 31 + (uint64)subTexture->format; key = key * 31 + (subTexture->isDepth ? 1 : 2);
++		key = key * 31 + (uint64)(uint32)yOffset;
++		if (s_loggedCombinations.contains(key))
++			return;
++		s_loggedCombinations.insert(key);
++		s_offsetRelLogBudget--;
++		cemuLog_log(LogType::Force, "[OffsetTexSync] {} | base {:08x} {}x{}x{} pitch {} fmt {:04x} tm {} swz {} depth {} slice {} | sub {:08x} {}x{} pitch {} fmt {:04x} tm {} swz {} depth {} | byteOffset {:x} yOffset {}",
++			result,
++			baseTexture->physAddress, baseTexture->width, baseTexture->height, baseTexture->depth, baseInfo->pitch, (uint32)baseTexture->format, (uint32)baseInfo->tileMode, baseSwizzle, baseTexture->isDepth ? 1 : 0, baseInfo->sliceIndex,
++			subTexture->physAddress, subTexture->width, subTexture->height, subInfo->pitch, (uint32)subTexture->format, (uint32)subInfo->tileMode, subSwizzle, subTexture->isDepth ? 1 : 0,
++			byteOffset, yOffset);
++	};
++
++	// basic compatibility checks
++	if (baseInfo->pitch != subInfo->pitch || baseInfo->tileMode != subInfo->tileMode)
++	{
++		logResult("rejected (pitch/tilemode mismatch)", -1);
++		return;
++	}
++	if (baseTexture->IsCompressedFormat() || subTexture->IsCompressedFormat())
++	{
++		logResult("rejected (compressed format)", -1);
++		return;
++	}
++	if (!LatteTexture_IsTexelSizeCompatibleFormat(baseTexture->format, subTexture->format))
++	{
++		logResult("rejected (texel size mismatch)", -1);
++		return;
++	}
++	if (baseTexture->isDepth == subTexture->isDepth && !LatteTexture_IsFormatViewCompatible(baseTexture->format, subTexture->format))
++	{
++		logResult("rejected (format not compatible)", -1);
++		return;
++	}
++	if (LatteTexture_IsBlockedFormatRelation(baseTexture, subTexture))
++	{
++		logResult("rejected (blocked format pair)", -1);
++		return;
++	}
++	if (subTexture->width > baseTexture->width)
++	{
++		logResult("rejected (sub wider than base)", -1);
++		return;
++	}
++	// calculate the y offset
++	const uint32 bytesPerRow = ((uint32)baseInfo->pitch * bpp) / 8;
++	if (bytesPerRow == 0 || (byteOffset % bytesPerRow) != 0)
++	{
++		logResult("rejected (offset is not a whole number of rows)", -1);
++		return;
++	}
++	const sint32 yOffset = (sint32)(byteOffset / bytesPerRow);
++	if ((yOffset + subTexture->height) > baseTexture->height)
++	{
++		logResult("rejected (sub does not fit inside base)", yOffset);
++		return;
++	}
++	// verify that the memory layouts really line up
++	const char* acceptReason = "accepted";
++	if (!_LatteTexture_VerifyOffsetMapping(baseTexture, baseSwizzle, subTexture, subSwizzle, byteOffset, yOffset))
++	{
++		// the swizzle stored for a texture is not always reliable, retry while ignoring it
++		if (!_LatteTexture_VerifyOffsetMapping(baseTexture, 0, subTexture, 0, byteOffset, yOffset))
++		{
++			logResult("rejected (layout mismatch)", yOffset);
++			return;
++		}
++		acceptReason = "accepted (swizzle ignored)";
++	}
++	logResult(acceptReason, yOffset);
++
++	LatteTextureRelation* rel = (LatteTextureRelation*)malloc(sizeof(LatteTextureRelation));
++	memset(rel, 0, sizeof(LatteTextureRelation));
++	rel->baseTexture = baseTexture;
++	rel->subTexture = subTexture;
++	rel->baseMipIndex = 0;
++	rel->baseSliceIndex = baseInfo->sliceIndex;
++	rel->mipCount = 1;
++	rel->sliceCount = 1;
++	rel->yOffset = yOffset;
++	rel->isOffsetRelation = true;
++	rel->lastSyncedUpdate = 0;
++	rel->lastSyncedBaseUpdate = 0;
++	baseTexture->list_compatibleRelations.push_back(rel);
++	subTexture->list_compatibleRelations.push_back(rel);
++	// make sure already rendered data is picked up on next use
++	baseTexture->reloadFromDynamicTextures = true;
++	subTexture->reloadFromDynamicTextures = true;
++}
++
++// copy a rectangle between two textures, handling depth<->color conversion. Coordinates are in original (unscaled) texels
++static bool _LatteTexture_CopyRegion(LatteTexture* src, sint32 srcSlice, LatteTexture* dst, sint32 dstSlice, sint32 srcX, sint32 srcY, sint32 dstX, sint32 dstY, sint32 width, sint32 height)
++{
++	if (src->isDepth == dst->isDepth)
++	{
++		LatteTexture_CopySlice(src, srcSlice, 0, dst, dstSlice, 0, srcX, srcY, dstX, dstY, width, height);
++		return true;
++	}
++	return g_renderer->surfaceCopy_copySurfaceRegionWithFormatConversion(src, 0, srcSlice, dst, 0, dstSlice, srcX, srcY, dstX, dstY, width, height);
++}
++
++// sync data between a sub texture and its row range inside the base texture. targetTexture is the texture that is about to be used
++static void LatteTexture_SyncOffsetRelation(LatteTextureRelation* rel, LatteTexture* targetTexture)
++{
++	LatteTexture* baseTexture = rel->baseTexture;
++	LatteTexture* subTexture = rel->subTexture;
++	LatteTextureSliceMipInfo* subInfo = subTexture->sliceMipInfo + subTexture->GetSliceMipArrayIndex(0, 0);
++	LatteTextureSliceMipInfo* baseInfo = baseTexture->sliceMipInfo + baseTexture->GetSliceMipArrayIndex(rel->baseSliceIndex, 0);
++	const bool toBase = (targetTexture == baseTexture);
++	LatteTexture* srcTexture = toBase ? subTexture : baseTexture;
++	LatteTextureSliceMipInfo* srcInfo = toBase ? subInfo : baseInfo;
++	LatteTextureSliceMipInfo* dstInfo = toBase ? baseInfo : subInfo;
++	uint64& lastSyncedSrc = toBase ? rel->lastSyncedUpdate : rel->lastSyncedBaseUpdate;
++
++	if (!srcTexture->isUpdatedOnGPU)
++		return; // data only exists in RAM, the target already loads it from there
++	if (srcInfo->lastDynamicUpdate == 0 || srcInfo->lastDynamicUpdate <= lastSyncedSrc)
++		return; // nothing new since the last sync
++	if (!toBase && srcInfo->lastDynamicUpdate <= dstInfo->lastDynamicUpdate)
++		return; // sub texture was written more recently than the base, don't overwrite it with older data
++	lastSyncedSrc = srcInfo->lastDynamicUpdate;
++
++	if (!LatteTexture_doesEffectiveRescaleRatioMatch(baseTexture, 0, subTexture, 0))
++	{
++		if (s_offsetRelLogBudget > 0)
++		{
++			s_offsetRelLogBudget--;
++			sint32 bw, bh, sw, sh;
++			baseTexture->GetEffectiveSize(bw, bh, 0);
++			subTexture->GetEffectiveSize(sw, sh, 0);
++			cemuLog_log(LogType::Force, "[OffsetTexSync] cannot copy, resolution scale differs (graphic pack). base {:08x} {}x{} -> {}x{}, sub {:08x} {}x{} -> {}x{}", baseTexture->physAddress, baseTexture->width, baseTexture->height, bw, bh, subTexture->physAddress, subTexture->width, subTexture->height, sw, sh);
++		}
++		return;
++	}
++
++	bool copied;
++	if (toBase)
++		copied = _LatteTexture_CopyRegion(subTexture, 0, baseTexture, rel->baseSliceIndex, 0, 0, 0, rel->yOffset, subTexture->width, subTexture->height);
++	else
++		copied = _LatteTexture_CopyRegion(baseTexture, rel->baseSliceIndex, subTexture, 0, 0, rel->yOffset, 0, 0, subTexture->width, subTexture->height);
++
++	static sint32 s_syncLogBudget = 40;
++	if (s_syncLogBudget > 0)
++	{
++		s_syncLogBudget--;
++		cemuLog_log(LogType::Force, "[OffsetTexSync] sync {} {} | sub {:08x} ({}x{} depth {}) base {:08x} ({}x{} depth {}) y {}", toBase ? "sub->base" : "base->sub", copied ? "ok" : "FAILED", subTexture->physAddress, subTexture->width, subTexture->height, subTexture->isDepth ? 1 : 0, baseTexture->physAddress, baseTexture->width, baseTexture->height, baseTexture->isDepth ? 1 : 0, rel->yOffset);
++	}
++
++	if (copied)
++	{
++		targetTexture->isUpdatedOnGPU = true;
++		if (dstInfo->lastDynamicUpdate < srcInfo->lastDynamicUpdate)
++			dstInfo->lastDynamicUpdate = srcInfo->lastDynamicUpdate;
++		// remember the state after the copy so the copied data isn't sent straight back
++		rel->lastSyncedUpdate = std::max(rel->lastSyncedUpdate, subInfo->lastDynamicUpdate);
++		rel->lastSyncedBaseUpdate = std::max(rel->lastSyncedBaseUpdate, baseInfo->lastDynamicUpdate);
++	}
++}
++
+ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
+ {
+ 	for (sint32 mipIndex = 0; mipIndex < texture->mipLevels; mipIndex++)
+@@ -768,6 +1061,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
+ 						else
+ 						{
+ 							LatteTexture_TrackDataOverlap(texture, sliceMipInfo, occupancy);
++							LatteTexture_TryTrackOffsetRelation(sliceMipInfo, occupancy.sliceMipInfo);
+ 						}
+ 					}
+ 				}
+diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.h b/src/Cafe/HW/Latte/Core/LatteTexture.h
+index 6c09e840..9d95036f 100644
+--- a/src/Cafe/HW/Latte/Core/LatteTexture.h
++++ b/src/Cafe/HW/Latte/Core/LatteTexture.h
+@@ -273,6 +273,11 @@ struct LatteTextureRelation
+ 	sint32 mipCount;
+ 	//sint32 xOffset;
+ 	sint32 yOffset;
++	// set for relations where subTexture starts inside a slice of baseTexture (non-zero yOffset)
++	// data is copied between the sub texture and its row range in the base texture whenever either side has newer GPU data
++	bool isOffsetRelation;
++	uint64 lastSyncedUpdate; // sub texture update counter at the last sync
++	uint64 lastSyncedBaseUpdate; // base texture update counter at the last sync
+ };
+ 
+ // used if external modules want to retrieve texture cache information
+diff --git a/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp b/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp
+index 4c11e57c..eb79ccf7 100644
+--- a/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp
+@@ -74,6 +74,17 @@ LatteTextureView* LatteTexture_CreateTexture(Latte::E_DIM dim, MPTR physAddress,
+ {
+ 	const auto tex = g_renderer->texture_createTextureEx(dim, physAddress, physMipAddress, format, width, height, depth, pitch, mipLevels, swizzle, tileMode, isDepth);
+ 
++	// diagnostic: log the first few hundred distinct texture shapes so lighting/shadow buffers can be identified from log.txt
++	{
++		static std::unordered_set<uint64> s_loggedTexShapes;
++		uint64 key = ((uint64)width) | ((uint64)height << 14) | ((uint64)depth << 28) | ((uint64)format << 40) | ((uint64)(isDepth ? 1 : 0) << 52) | ((uint64)tileMode << 53);
++		if (s_loggedTexShapes.size() < 400 && !s_loggedTexShapes.contains(key))
++		{
++			s_loggedTexShapes.insert(key);
++			cemuLog_log(LogType::Force, "[TexCreate] {:08x} {}x{}x{} pitch {} fmt {:04x} tm {} swz {:x} depth {} dim {} mips {}", physAddress, width, height, depth, pitch, (uint32)format, (uint32)tileMode, swizzle, isDepth ? 1 : 0, (uint32)dim, mipLevels);
++		}
++	}
++
+ 	// init slice/mip info array
+ 	LatteTexture_InitSliceAndMipInfo(tex);
+ 	LatteTexture_RegisterTextureMemoryOccupancy(tex);
+diff --git a/src/Cafe/HW/Latte/Renderer/Renderer.h b/src/Cafe/HW/Latte/Renderer/Renderer.h
+index 01a6d3b2..61c893d4 100644
+--- a/src/Cafe/HW/Latte/Renderer/Renderer.h
++++ b/src/Cafe/HW/Latte/Renderer/Renderer.h
+@@ -120,6 +120,16 @@ public:
+ 
+ 	// surface copy
+ 	virtual void surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 width, sint32 height) = 0;
++	// depth<->color copy of a rectangle. Coordinates and size are in original (unscaled) texels. Returns false if not supported
++	virtual bool surfaceCopy_copySurfaceRegionWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 srcX, sint32 srcY, sint32 dstX, sint32 dstY, sint32 width, sint32 height)
++	{
++		if (srcX == 0 && srcY == 0 && dstX == 0 && dstY == 0)
++		{
++			surfaceCopy_copySurfaceWithFormatConversion(sourceTexture, srcMip, srcSlice, destinationTexture, dstMip, dstSlice, width, height);
++			return true;
++		}
++		return false;
++	}
+ 
+ 	// buffer cache
+ 	virtual void bufferCache_init(const sint32 bufferSize) = 0;
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
+index 8a93e120..bfa607c2 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
+@@ -310,10 +310,11 @@ public:
+ 
+ 	// surface copy
+ 	void surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 width, sint32 height) override;
++	bool surfaceCopy_copySurfaceRegionWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 srcX, sint32 srcY, sint32 dstX, sint32 dstY, sint32 width, sint32 height) override;
+ 	void surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture);
+ 
+ 	private:
+-	void surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint32 texSrcMip, sint32 texSrcSlice, LatteTextureVk* dstTextureVk, sint32 texDstMip, sint32 texDstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight);
++	void surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint32 texSrcMip, sint32 texSrcSlice, LatteTextureVk* dstTextureVk, sint32 texDstMip, sint32 texDstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight, sint32 effectiveSrcX = 0, sint32 effectiveSrcY = 0, sint32 effectiveDstX = 0, sint32 effectiveDstY = 0);
+ 
+ 	void surfaceCopy_cleanup();
+ 
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
+index e3e42012..198fb98f 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
+@@ -579,7 +579,7 @@ VKRObjectDescriptorSet* VulkanRenderer::surfaceCopy_getOrCreateDescriptorSet(VkC
+ 	return vkObjDescriptorSet;
+ }
+ 
+-void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint32 texSrcMip, sint32 texSrcSlice, LatteTextureVk* dstTextureVk, sint32 texDstMip, sint32 texDstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight)
++void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint32 texSrcMip, sint32 texSrcSlice, LatteTextureVk* dstTextureVk, sint32 texDstMip, sint32 texDstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight, sint32 effectiveSrcX, sint32 effectiveSrcY, sint32 effectiveDstX, sint32 effectiveDstY)
+ {
+ 	draw_endRenderPass();
+ 
+@@ -640,8 +640,9 @@ void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint3
+ 	pushConstantData.vertexOffsets[6] = 1.0f;
+ 	pushConstantData.vertexOffsets[7] = -1.0f;
+ 
+-	pushConstantData.srcTexelOffset[0] = 0;
+-	pushConstantData.srcTexelOffset[1] = 0;
++	// the shader fetches source texel (gl_FragCoord.xy + srcTexelOffset), gl_FragCoord is relative to the destination origin
++	pushConstantData.srcTexelOffset[0] = effectiveSrcX - effectiveDstX;
++	pushConstantData.srcTexelOffset[1] = effectiveSrcY - effectiveDstY;
+ 
+ 	vkCmdPushConstants(m_state.currentCommandBuffer, copySurfacePipelineInfo->vkObjPipeline->m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushConstantData), &pushConstantData);
+ 
+@@ -650,21 +651,21 @@ void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint3
+ 	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+ 	renderPassInfo.renderPass = copySurfacePipelineInfo->vkObjRenderPass->m_renderPass;
+ 	renderPassInfo.framebuffer = vkObjFramebuffer->m_frameBuffer;
+-	renderPassInfo.renderArea.offset = { 0, 0 };
++	renderPassInfo.renderArea.offset = { effectiveDstX, effectiveDstY };
+ 	renderPassInfo.renderArea.extent = { (uint32_t)effectiveCopyWidth, (uint32_t)effectiveCopyHeight };
+ 	renderPassInfo.clearValueCount = 0;
+ 
+ 	VkViewport viewport{};
+-	viewport.x = 0;
+-	viewport.y = (float)effectiveCopyHeight;
++	viewport.x = (float)effectiveDstX;
++	viewport.y = (float)(effectiveDstY + effectiveCopyHeight);
+ 	viewport.width = (float)effectiveCopyWidth;
+ 	viewport.height = (float)-effectiveCopyHeight;
+ 	viewport.minDepth = 0.0f;
+ 	viewport.maxDepth = 1.0f;
+ 
+ 	VkRect2D scissor;
+-	scissor.offset.x = 0;
+-	scissor.offset.y = 0;
++	scissor.offset.x = effectiveDstX;
++	scissor.offset.y = effectiveDstY;
+ 	scissor.extent.width = effectiveCopyWidth;
+ 	scissor.extent.height = effectiveCopyHeight;
+ 
+@@ -821,6 +822,39 @@ void VulkanRenderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* s
+ 	surfaceCopy_viaDrawcall(srcTextureVk, texSrcMip, texSrcSlice, dstTextureVk, texDstMip, texDstSlice, effectiveCopyWidth, effectiveCopyHeight);
+ }
+ 
++bool VulkanRenderer::surfaceCopy_copySurfaceRegionWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 srcX, sint32 srcY, sint32 dstX, sint32 dstY, sint32 width, sint32 height)
++{
++	LatteTextureVk* srcTextureVk = (LatteTextureVk*)sourceTexture;
++	LatteTextureVk* dstTextureVk = (LatteTextureVk*)destinationTexture;
++	if (srcTextureVk->isDepth == dstTextureVk->isDepth)
++		return false; // only depth<->color is handled here
++	if (!LatteTexture_doesEffectiveRescaleRatioMatch(srcTextureVk, srcMip, dstTextureVk, dstMip))
++		return false;
++	if (srcTextureVk->GetBPP() != dstTextureVk->GetBPP())
++		return false;
++	// scale to effective size
++	sint32 effectiveCopyWidth = width;
++	sint32 effectiveCopyHeight = height;
++	LatteTexture_scaleToEffectiveSize(sourceTexture, &effectiveCopyWidth, &effectiveCopyHeight, 0);
++	sint32 effectiveSrcX = srcX;
++	sint32 effectiveSrcY = srcY;
++	LatteTexture_scaleToEffectiveSize(sourceTexture, &effectiveSrcX, &effectiveSrcY, 0);
++	sint32 effectiveDstX = dstX;
++	sint32 effectiveDstY = dstY;
++	LatteTexture_scaleToEffectiveSize(destinationTexture, &effectiveDstX, &effectiveDstY, 0);
++	// make sure the region fits into both textures
++	sint32 srcEffectiveWidth, srcEffectiveHeight;
++	srcTextureVk->GetEffectiveSize(srcEffectiveWidth, srcEffectiveHeight, srcMip);
++	sint32 dstEffectiveWidth, dstEffectiveHeight;
++	dstTextureVk->GetEffectiveSize(dstEffectiveWidth, dstEffectiveHeight, dstMip);
++	if (effectiveSrcX + effectiveCopyWidth > srcEffectiveWidth || effectiveSrcY + effectiveCopyHeight > srcEffectiveHeight)
++		return false;
++	if (effectiveDstX + effectiveCopyWidth > dstEffectiveWidth || effectiveDstY + effectiveCopyHeight > dstEffectiveHeight)
++		return false;
++	surfaceCopy_viaDrawcall(srcTextureVk, srcMip, srcSlice, dstTextureVk, dstMip, dstSlice, effectiveCopyWidth, effectiveCopyHeight, effectiveSrcX, effectiveSrcY, effectiveDstX, effectiveDstY);
++	return true;
++}
++
+ // called whenever a texture is destroyed
+ // it is guaranteed that the texture is not in use and all associated resources (descriptor sets, framebuffers) can be destroyed safely
+ void VulkanRenderer::surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture)
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 3c1587e7..7430cfee 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -45,7 +45,8 @@ android {
+     compileSdk = 36
+     ndkVersion = "29.0.14206865"
+     defaultConfig {
+-        applicationId = "info.cemu.cemu"
++        // Light Fix test build: separate app id so it installs next to the regular Cemu app
++        applicationId = "info.cemu.cemu.lightfix"
+         minSdk = 30
+         targetSdk = 35
+         versionName = getVersionName()
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 053d3be8..1455fa33 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -1,5 +1,5 @@
+ <resources>
+-    <string name="app_name" translatable="false">Cemu</string>
++    <string name="app_name" translatable="false">Cemu Light Fix</string>
+     <string name="cemu_original_authors" translatable="false">Exzap, Petergov</string>
+     <string name="cemu_website" translatable="false">https://cemu.info</string>
+     <string name="cemu_online_guide" translatable="false">https://cemu.info/online-guide</string>
