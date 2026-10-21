@@ -6,6 +6,8 @@ name: Build Cemu Light Fix APK
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 permissions:
@@ -99,11 +101,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Cemu Light Fix test build ${{ github.run_number }}
+          name: Cemu Light Fix build ${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
           body: |
-            Test build of SSimco's Cemu for Android (commit ${{ env.CEMU_COMMIT }}) with an experimental
-            fix for LEGO Dimensions lighting being limited to a square around the player.
-            Installs as a separate app called "Cemu Light Fix" next to the regular Cemu app.
+            Unofficial build of [SSimco's Cemu for Android](https://github.com/SSimco/Cemu) with a fix for **LEGO Dimensions lighting being stuck in a square around the player**.
+
+            **Download:** `Cemu-LightFix.apk` below. It installs as a separate app called **Cemu Light Fix**, next to your regular Cemu.
+
+            - Play at **1280x720** (set *LEGO Dimensions → Resolution* to the default, or leave it off). Higher resolutions may still have lighting problems.
+            - The emulated Toy Pad and other features are the same as SSimco's build.
+            - To move your save and Toy Pad figures from regular Cemu, see the [README](https://github.com/${{ github.repository }}#moving-your-save-from-regular-cemu).
+            - Problems? Open an [Issue](https://github.com/${{ github.repository }}/issues) and attach your log (game list menu → **Share log file**).
+
+            Not affiliated with SSimco or the Cemu team. Based on SSimco/Cemu commit `${{ env.CEMU_COMMIT }}`. Licensed under MPL-2.0.
           files: out/Cemu-LightFix.apk
