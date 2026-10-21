@@ -23,6 +23,11 @@ All builds are listed on the [Releases](../../releases) page.
 
 Requires a 64-bit (arm64) Android device running Android 11 or newer, the same as SSimco's build.
 
+**Installed build 1 or 2?** Those two were signed with throwaway keys, so Android won't update them
+("package conflicts with an existing package"). Copy your save out of Cemu Light Fix first (see below,
+copying to regular Cemu or your Downloads folder), uninstall Cemu Light Fix, then install the newest build and
+copy the save back. Build 3 and later can all be installed as normal updates.
+
 ## Known issues
 
 - Some NPC voice lines (for example the mini-quest characters) don't play, and their text may not appear until

@@ -72,10 +72,13 @@ jobs:
           mkdir -p /home/runner/vcpkg-binary-cache
           bash ./dependencies/vcpkg/bootstrap-vcpkg.sh
 
-      - name: Set up test signing key
+      - name: Set up signing key
         run: |
-          mkdir -p ~/.android
-          echo "$TEST_KEYSTORE_B64" | base64 --decode > ~/.android/debug.keystore
+          # fixed key so every build can be installed as an update over the previous one
+          echo "$TEST_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/lightfix.keystore"
+          echo "ANDROID_STORE_FILE=$RUNNER_TEMP/lightfix.keystore" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_STORE_PASSWORD=android" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
 
       - name: Build APK
         working-directory: cemu/src/android
@@ -90,6 +93,12 @@ jobs:
           echo "Found $APK"
           cp "$APK" out/Cemu-LightFix.apk
           ls -la out
+
+      - name: Check the APK is signed with the fixed key
+        run: |
+          APKSIGNER=$(ls -d $ANDROID_HOME/build-tools/*/ | sort -V | tail -n 1)apksigner
+          "$APKSIGNER" verify --print-certs out/Cemu-LightFix.apk | tee signer.txt
+          grep -qi "SHA-256 digest: 70921a61c17e664a1cf7d4f6aa810097b40029b6d17e7a19a3d17b3c8977d3f2" signer.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
