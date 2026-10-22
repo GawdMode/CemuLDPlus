@@ -535,89 +535,163 @@ index 13ef6613..ac2d74cd 100644
  			cafeLogBuffer.lineLength = 0;
  		};
  
+diff --git a/src/Cafe/OS/libs/snd_core/ax_aux.cpp b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
+index a9176562..7fb96387 100644
+--- a/src/Cafe/OS/libs/snd_core/ax_aux.cpp
++++ b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
+@@ -145,6 +145,7 @@ namespace snd_core
+ 			return r;
+ 		if (auxBusIndex >= AX_AUX_BUS_COUNT)
+ 			return -5;
++		cemuLog_log(LogType::Force, "[AXDiag] AXRegisterAuxCallback device {} index {} bus {} func {:08x}", device, deviceIndex, auxBusIndex, funcMPTR);
+ 		if (device == AX_DEV_TV)
+ 		{
+ 			__AXAuxTVCallbackFunc[auxBusIndex] = funcMPTR;
+@@ -283,6 +284,14 @@ namespace snd_core
+ 			return r;
+ 		if (auxBus >= AX_AUX_BUS_COUNT)
+ 			return -5;
++		{
++			static sint32 s_logBudget = 30;
++			if (s_logBudget > 0)
++			{
++				s_logBudget--;
++				cemuLog_log(LogType::Force, "[AXDiag] AXSetAuxReturnVolume device {} index {} bus {} volume {:04x}", device, deviceIndex, auxBus, volume);
++			}
++		}
+ 		if( device == AX_DEV_TV )
+ 		{ 
+ 			__AXTVAuxReturnVolume[auxBus] = volume;
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a44..d132aff5 100644
+index 31a24a44..0a32e9d5 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-@@ -751,15 +751,20 @@ namespace snd_core
- 	{
- 		if (internalShadowCopy->lpf.on == _swapEndianU16(AX_LPF_OFF))
- 			return;
--		float a0 = (float)_swapEndianS16(internalShadowCopy->lpf.a0) / 32767.0f;
--		float b0 = (float)_swapEndianS16(internalShadowCopy->lpf.b0) / 32767.0f;
--		float prevSample = (float)_swapEndianS16((sint16)internalShadowCopy->lpf.yn1) * 256.0f / 32767.0f;
-+		// one-pole low-pass filter: y[n] = a0 * x[n] + b0 * y[n-1]
-+		// a0 and b0 are unsigned 1.15 fixed point (a0 + b0 = 1.0 for a unity gain low-pass)
-+		// previously the feedback term was subtracted, which turned the filter into a high-pass and made filtered voices (e.g. dialogue) almost inaudible
-+		float a0 = (float)_swapEndianU16(internalShadowCopy->lpf.a0) / 32768.0f;
-+		float b0 = (float)_swapEndianU16(internalShadowCopy->lpf.b0) / 32768.0f;
-+		// samples in sampleData are 16-bit samples scaled by 256, yn1 holds the last output as a plain 16-bit sample
-+		float prevSample = (float)(sint16)_swapEndianU16(internalShadowCopy->lpf.yn1) * 256.0f;
- 		for (sint32 i = 0; i < sampleCount; i++)
- 		{
--			sampleData[i] = a0 * sampleData[i] - b0 * prevSample;
-+			sampleData[i] = a0 * sampleData[i] + b0 * prevSample;
- 			prevSample = sampleData[i];
- 		}
--		internalShadowCopy->lpf.yn1 = (uint16)_swapEndianS16((sint16)(prevSample / 256.0f * 32767.0f));
-+		float yn1 = std::clamp(prevSample / 256.0f, -32768.0f, 32767.0f);
-+		internalShadowCopy->lpf.yn1 = _swapEndianU16((uint16)(sint16)yn1);
+@@ -804,24 +804,123 @@ namespace snd_core
+ 		// todo
  	}
  
- 	// mix audio generated from voice into main bus and aux buses
-@@ -967,7 +972,16 @@ namespace snd_core
+-	void AXMix_ProcessVoices(AXVPBInternal_t* firstVoice)
++	// ---- diagnostic: track long/looping voices (music, dialogue) and log how they are set up and how long they play ----
++	struct AXVoiceDiagState
++	{
++		bool active{};
++		bool tracked{};
++		uint32 endOffset{};
++		uint32 startOffset{};
++		uint32 lastOffset{};
++		uint32 frames{};
++		float peakDecoded{};
++		float peakAfterVolume{};
++		float peakAfterFilters{};
++	};
++	static AXVoiceDiagState s_voiceDiag[AX_MAX_VOICES];
++	static sint32 s_voiceDiagLogBudget = 3000;
++
++	static float _AXDiagPeak(const float* samples, size_t count)
++	{
++		float p = 0.0f;
++		for (size_t i = 0; i < count; i++)
++			p = std::max(p, std::fabs(samples[i]));
++		return p / 256.0f; // in 16-bit sample units
++	}
++
++	static void _AXDiagLogEnd(sint32 idx, const char* reason)
++	{
++		AXVoiceDiagState& st = s_voiceDiag[idx];
++		if (st.tracked && s_voiceDiagLogBudget > 0)
++		{
++			s_voiceDiagLogBudget--;
++			cemuLog_log(LogType::Force, "[AXVoice] end v{} ({}) after {}ms, advanced {} of {} | peak decoded {:.0f} after-volume {:.0f} after-filters {:.0f}",
++				idx, reason, st.frames * 3, (sint64)st.lastOffset - (sint64)st.startOffset, (sint64)st.endOffset - (sint64)st.startOffset, st.peakDecoded, st.peakAfterVolume, st.peakAfterFilters);
++		}
++		st = {};
++	}
++
++	static void _AXDiagLogStart(sint32 idx, AXVPBInternal_t* v)
+ 	{
+-		if (firstVoice == nullptr)
++		if (s_voiceDiagLogBudget <= 0)
+ 			return;
++		s_voiceDiagLogBudget--;
++		auto vol = [v](sint32 bus, sint32 ch) -> uint32 { return _swapEndianU16(v->deviceMixTV[ch * 4 + bus].vol); };
++		std::string auxInfo;
++		for (sint32 bus = 1; bus < AX_BUS_COUNT; bus++)
++		{
++			uint32 mask = _swapEndianU16(v->deviceMixMaskTV[bus]);
++			if (mask == 0)
++				continue;
++			auxInfo += fmt::format(" aux{}[mask {:03x} vol {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}]", bus - 1, mask, vol(bus, 0), vol(bus, 1), vol(bus, 2), vol(bus, 3), vol(bus, 4), vol(bus, 5));
++		}
++		uint32 drcMask = 0;
++		for (sint32 i = 0; i < 8; i++)
++			drcMask |= _swapEndianU16(v->deviceMixMaskDRC[i]);
++		cemuLog_log(LogType::Force, "[AXVoice] start v{} fmt {} loop {} len {} src {:08x} filter {} ve {:04x} lpf {}[{:04x} {:04x}] biquad {} | TV main[mask {:03x} vol {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}]{} | DRC mask {:x}",
++			idx, _swapEndianU16(v->internalOffsets.format), _swapEndianU16(v->internalOffsets.loopFlag),
++			(sint64)v->internalOffsets.GetEndOffset32() - (sint64)v->internalOffsets.GetCurrentOffset32(),
++			v->src.GetSrcRatio32(), _swapEndianU16(v->srcFilterMode), (uint32)v->veVolume,
++			_swapEndianU16(v->lpf.on), _swapEndianU16(v->lpf.a0), _swapEndianU16(v->lpf.b0), _swapEndianU16(v->biquad.on),
++			_swapEndianU16(v->deviceMixMaskTV[0]), vol(0, 0), vol(0, 1), vol(0, 2), vol(0, 3), vol(0, 4), vol(0, 5), auxInfo, drcMask);
++	}
++
++	void AXMix_ProcessVoices(AXVPBInternal_t* firstVoice)
++	{
++		bool voiceSeen[AX_MAX_VOICES] = {};
++		if (firstVoice != nullptr)
++		{
+ 		size_t sampleCount = AXGetInputSamplesPerFrame();
+ 		AXVPBInternal_t* internalVoice = firstVoice;
+ 		cemu_assert_debug(sndGeneric.initParam.frameLength == 0);
+ 		float tmpSampleBuffer[AX_SAMPLES_MAX];
+ 		while (internalVoice)
  		{
- 			sint32be* auxInput = AXAux_GetInputBuffer(AX_DEV_TV, 0, auxBus);
- 			if (auxInput == nullptr)
++			sint32 idx = (sint32)(uint16)internalVoice->index;
++			AXVoiceDiagState* st = (idx >= 0 && idx < AX_MAX_VOICES) ? &s_voiceDiag[idx] : nullptr;
++			if (st)
 +			{
-+				// no effect callback registered for this AUX bus
-+				// instead of dropping everything sent to it, pass the bus through to the main bus (dry)
-+				// some games (e.g. LEGO Dimensions) send dialogue to an AUX bus and would otherwise be silent
-+				float* auxBusSamples = __AXMixBufferTV + (1 + auxBus) * (sampleCount * AX_TV_CHANNEL_COUNT);
-+				float returnVolume = (float)__AXTVAuxReturnVolume[auxBus] / 32768.0f;
-+				for (size_t i = 0; i < sampleCount * AX_TV_CHANNEL_COUNT; i++)
-+					__AXMixBufferTV[i] += auxBusSamples[i] * returnVolume;
- 				continue;
++				voiceSeen[idx] = true;
++				uint32 endOffset = internalVoice->internalOffsets.GetEndOffset32();
++				uint32 curOffset = internalVoice->internalOffsets.GetCurrentOffset32();
++				bool voiceLoops = _swapEndianU16(internalVoice->internalOffsets.loopFlag) != 0;
++				if (st->active && st->endOffset != endOffset && !voiceLoops)
++					_AXDiagLogEnd(idx, "replaced");
++				if (!st->active)
++				{
++					st->active = true;
++					st->endOffset = endOffset;
++					st->startOffset = curOffset;
++					st->tracked = voiceLoops || ((sint64)endOffset - (sint64)curOffset) > 40000;
++					if (st->tracked)
++						_AXDiagLogStart(idx, internalVoice);
++				}
 +			}
- 			float* tvInput = __AXMixBufferTV + (1 + auxBus) * (sampleCount * AX_TV_CHANNEL_COUNT);
- 			AXAuxMix_StoreAuxSamples(tvInput, auxInput, sampleCount * AX_TV_CHANNEL_COUNT);
+ 			AXVoiceMix_DecodeSamples(internalVoice, tmpSampleBuffer, sampleCount);
++			if (st && st->tracked)
++				st->peakDecoded = std::max(st->peakDecoded, _AXDiagPeak(tmpSampleBuffer, sampleCount));
+ 			AXVoiceMix_ApplyADSR(internalVoice, tmpSampleBuffer, sampleCount);
++			if (st && st->tracked)
++				st->peakAfterVolume = std::max(st->peakAfterVolume, _AXDiagPeak(tmpSampleBuffer, sampleCount));
+ 			AXVoiceMix_ApplyBiquad(internalVoice, tmpSampleBuffer, sampleCount);
+ 			AXVoiceMix_ApplyLowPass(internalVoice, tmpSampleBuffer, sampleCount);
++			if (st && st->tracked)
++			{
++				st->peakAfterFilters = std::max(st->peakAfterFilters, _AXDiagPeak(tmpSampleBuffer, sampleCount));
++				st->frames++;
++				st->lastOffset = internalVoice->internalOffsets.GetCurrentOffset32();
++			}
+ 			AXVoiceMix_MixIntoBuses(internalVoice, tmpSampleBuffer, sampleCount, sampleCount);
+ 			// next
+ 			internalVoice = internalVoice->nextToProcess.GetPtr();
  		}
-diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-index 6cb1599a..34093cba 100644
---- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
-+++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-@@ -267,17 +267,29 @@ namespace snd_core
- 		}
- 		else if (__AXMode[AX_DEV_TV] == AX_MODE_STEREO)
- 		{
-+			// the mixer always produces 6 channels (L, R, LS, RS, C, LFE)
-+			// fold center and surround channels into the stereo output, otherwise anything a game routes to them (e.g. dialogue on the center channel) is lost
- 			sint32* inputChannel0 = __AXTVBuffer48.GetPtr() + numSamples * 0;
- 			sint32* inputChannel1 = __AXTVBuffer48.GetPtr() + numSamples * 1;
-+			sint32* inputChannelLS = __AXTVBuffer48.GetPtr() + numSamples * 2;
-+			sint32* inputChannelRS = __AXTVBuffer48.GetPtr() + numSamples * 3;
-+			sint32* inputChannelC = __AXTVBuffer48.GetPtr() + numSamples * 4;
- 			sint16* dmaOutputBuffer = __AXTVDMABuffers[frameIndex];
-+			constexpr float kFoldGain = 0.70710678f; // -3dB
- 			for (sint32 i = 0; i < numSamples; i++)
- 			{
--				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel0), -32768), 32767));
--				dmaOutputBuffer[1] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel1), -32768), 32767));
-+				float c = (float)_swapEndianS32(*inputChannelC) * kFoldGain;
-+				float l = (float)_swapEndianS32(*inputChannel0) + c + (float)_swapEndianS32(*inputChannelLS) * kFoldGain;
-+				float r = (float)_swapEndianS32(*inputChannel1) + c + (float)_swapEndianS32(*inputChannelRS) * kFoldGain;
-+				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::clamp(l, -32768.0f, 32767.0f));
-+				dmaOutputBuffer[1] = _swapEndianS16((sint16)std::clamp(r, -32768.0f, 32767.0f));
- 				dmaOutputBuffer += 2;
- 				// next sample
- 				inputChannel0++;
- 				inputChannel1++;
-+				inputChannelLS++;
-+				inputChannelRS++;
-+				inputChannelC++;
- 			}
- 			AIInitDMA(__AXTVDMABuffers[frameIndex], numSamples * 2 * sizeof(sint16)); // 2ch output
- 		}
++		}
++		// voices that were active last frame but not processed anymore have stopped
++		for (sint32 i = 0; i < AX_MAX_VOICES; i++)
++		{
++			if (s_voiceDiag[i].active && !voiceSeen[i])
++				_AXDiagLogEnd(i, "stopped");
++		}
+ 	}
+ 
+ 	void AXMix_MergeBusSamples(float* input, sint32* output, sint32 sampleCount, uint16& volume, sint16 delta)
 diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 index d4e562e0..f6e13e0f 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
