@@ -1,31 +1,38 @@
-# Cemu Light Fix for Android
+# Cemu LD+ for Android
 
-An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco/Cemu) with a fix for
-**LEGO Dimensions lighting being stuck in a square around the player**. On the regular build, everything
-outside a small box around your character goes dark. With this build, the whole level is lit.
+An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco/Cemu) made for **LEGO Dimensions**:
+
+- **Lighting fix:** on the regular build, lighting is stuck in a square around your character and everything else
+  goes dark. Here the whole level is lit.
+- **Toy Pad on the second screen** (for example the AYN Thor's bottom screen) with every character and vehicle
+  ready to place, pictures, Toy Tags, franchise logos and search.
+- **Better sound:** fixed sound filter, balanced left/right with a simple reverb, and an optional volume boost.
 
 Everything else matches SSimco's Android Cemu, including the built-in emulated Toy Pad.
 
+> This project used to be called **Cemu Light Fix**. Old links and the installed app keep working: new builds
+> install as an update over Cemu Light Fix and keep your saves and settings.
+>
 > This is a community build. It is not made by, or affiliated with, SSimco or the Cemu team.
 > Please don't report problems with this build to them. Use this repo's [Issues](../../issues) page instead.
 
 ## Download
 
-**[Download the latest Cemu-LightFix.apk](../../releases/latest/download/Cemu-LightFix.apk)**
+**[Download the latest Cemu-LDPlus.apk](../../releases/latest/download/Cemu-LDPlus.apk)**
 
 All builds are listed on the [Releases](../../releases) page.
 
 ## Install
 
 1. Download the APK on your Android device and open it. If Android asks, allow installs from your browser or file manager.
-2. It installs as a **separate app called "Cemu Light Fix"**, next to your regular Cemu. Your regular Cemu and its saves are not touched.
-3. Open Cemu Light Fix and add your games folder, the same way as in regular Cemu.
+2. It installs as a **separate app called "Cemu LD+"**, next to your regular Cemu. Your regular Cemu and its saves are not touched.
+3. Open Cemu LD+ and add your games folder, the same way as in regular Cemu.
 
 Requires a 64-bit (arm64) Android device running Android 11 or newer, the same as SSimco's build.
 
 **Installed build 1 or 2?** Those two were signed with throwaway keys, so Android won't update them
-("package conflicts with an existing package"). Copy your save out of Cemu Light Fix first (see below,
-copying to regular Cemu or your Downloads folder), uninstall Cemu Light Fix, then install the newest build and
+("package conflicts with an existing package"). Copy your save out of Cemu LD+ first (see below,
+copying to regular Cemu or your Downloads folder), uninstall Cemu LD+, then install the newest build and
 copy the save back. Build 3 and later can all be installed as normal updates.
 
 ## Known issues
@@ -39,7 +46,7 @@ greeting sound and then speak in text. That's how the original game works too.
 
 ## Important: game profile settings (fixes stuttering, crunchy audio)
 
-Cemu Light Fix is a separate app, so it starts with its own default settings. With the defaults, LEGO Dimensions
+Cemu LD+ is a separate app, so it starts with its own default settings. With the defaults, LEGO Dimensions
 audio can stutter and sound crunchy or rumbly, especially in the hub, even though the frame rate is fine.
 
 On the game list, **long-press LEGO Dimensions → Edit game profile** and set:
@@ -52,7 +59,7 @@ These are tested on an AYN Thor. If you use a custom GPU driver in your regular 
 ## Too quiet? Use the volume boost
 
 LEGO Dimensions mixes its sound very quietly, so even at full volume it can be hard to hear on a handheld. In
-**Settings → Audio**, first make sure **TV volume** is at 100%, then raise **TV volume boost (Cemu Light Fix)**
+**Settings → Audio**, first make sure **TV volume** is at 100%, then raise **TV volume boost (Cemu LD+)**
 (+3 to +18 dB). A soft limiter keeps loud moments from crackling. Start with +12 dB.
 
 ## Important: play at 720p
@@ -63,7 +70,7 @@ have broken or missing lighting. Support for those may come in a later build.
 
 ## Toy Pad on the second screen (dual-screen devices)
 
-On devices with a second screen (for example the AYN Thor's bottom screen), Cemu Light Fix shows the emulated
+On devices with a second screen (for example the AYN Thor's bottom screen), Cemu LD+ shows the emulated
 LEGO Dimensions Toy Pad there while you play:
 
 - The three pads with the figure on each spot, glowing in the colors the game sets (like the real pad's lights).
@@ -83,7 +90,7 @@ while you use the touch screen.
 
 - **Figure pictures:** the app doesn't include any game artwork. The first time a figure is shown, its picture is
   downloaded from the community [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) collection
-  and kept in the `toypad/figures` folder inside the Cemu Light Fix folder. Characters stand on a drawing of their
+  and kept in the `toypad/figures` folder inside the Cemu LD+ folder. Characters stand on a drawing of their
   Toy Tag from the [LEGO Dimensions Wiki](https://lego-dimensions.fandom.com/wiki/Toy_Tag), kept in `toypad/tags`.
   Franchise logos come from the [LegoToypad](https://github.com/harrysof/LegoToypad) project (`toypad/logos`). Without internet the figure's name is shown
   instead. To use your own picture for a figure, put it in that folder named by figure number (for example `1.png`
@@ -97,15 +104,15 @@ Copying leaves the originals in place, so you won't lose anything.
 
 1. In regular **Cemu**, open the menu on the game list and tap **Open Cemu folder**. Android's Files app opens.
 2. Go to `mlc01` → `usr` → `save` and long-press the **`00050000`** folder.
-3. Tap **⋮** → **Copy to…** → **☰** → **Cemu Light Fix**, then open `mlc01` → `usr` → `save` and tap **Copy**.
-   If Cemu Light Fix already has a `00050000` folder there, delete it first.
+3. Tap **⋮** → **Copy to…** → **☰** → **Cemu LD+**, then open `mlc01` → `usr` → `save` and tap **Copy**.
+   If Cemu LD+ already has a `00050000` folder there, delete it first.
 4. **Emulated Toy Pad figures:** go back to the main **Cemu** folder, long-press **`emulatedUSBDevices`**,
-   then **⋮** → **Copy to…** → **Cemu Light Fix** (top level) → **Copy**.
-5. If you installed the game's update or DLC through Cemu's **Title Manager**, install them again in Cemu Light Fix.
+   then **⋮** → **Copy to…** → **Cemu LD+** (top level) → **Copy**.
+5. If you installed the game's update or DLC through Cemu's **Title Manager**, install them again in Cemu LD+.
 6. **Shader cache (less stutter):** in the main **Cemu** folder open `shaderCache` → `transferable`, long-press
    **`0005000010194200.bin`** (that's the US game; other regions use their own number), also select the file with the same number
-   ending in `_vkpipeline.bin` if there is one, then **⋮** → **Copy to…** → **Cemu Light Fix** → `shaderCache` →
-   `transferable` → **Copy**. Cemu Light Fix then starts with every shader your regular Cemu has already built,
+   ending in `_vkpipeline.bin` if there is one, then **⋮** → **Copy to…** → **Cemu LD+** → `shaderCache` →
+   `transferable` → **Copy**. Cemu LD+ then starts with every shader your regular Cemu has already built,
    instead of building them again while you play.
 
 ## Reporting a problem
@@ -115,7 +122,7 @@ Open an [Issue](../../issues) with:
 - your device and Android version
 - the game and region (US / EU)
 - what went wrong (a screenshot helps a lot)
-- your log file: in Cemu Light Fix, open the game list menu, tap **Share log file**, and attach it
+- your log file: in Cemu LD+, open the game list menu, tap **Share log file**, and attach it
 
 ## What the fix changes (technical)
 

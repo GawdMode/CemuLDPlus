@@ -1025,7 +1025,7 @@ index 58e8f4b5..6b1ed12a 100644
  
  	/* AXFXReverbStd */
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 3c1587e7..7430cfee 100644
+index 3c1587e7..479b43eb 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -45,7 +45,8 @@ android {
@@ -1033,7 +1033,7 @@ index 3c1587e7..7430cfee 100644
      ndkVersion = "29.0.14206865"
      defaultConfig {
 -        applicationId = "info.cemu.cemu"
-+        // Light Fix test build: separate app id so it installs next to the regular Cemu app
++        // Cemu LD+: separate app id (kept from the Light Fix builds) so it installs next to the regular Cemu app and updates in place
 +        applicationId = "info.cemu.cemu.lightfix"
          minSdk = 30
          targetSdk = 35
@@ -3115,7 +3115,7 @@ index 00000000..457ffbf6
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
 new file mode 100644
-index 00000000..e573180e
+index 00000000..2cdc70af
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
 @@ -0,0 +1,29 @@
@@ -3123,7 +3123,7 @@ index 00000000..e573180e
 +
 +import android.content.Context
 +
-+/** Extra loudness for the game's TV sound (Cemu Light Fix). Stored in the app's preferences. */
++/** Extra loudness for the game's TV sound (Cemu LD+). Stored in the app's preferences. */
 +object NativeAudioBoost {
 +    private const val PREFS = "lightfix_audio"
 +    private const val KEY_BOOST_DB = "volume_boost_db"
@@ -3172,7 +3172,7 @@ index 5c178c2f..3d1bfb75 100644
      external fun clearDimensionsFigure(pad: Int, index: Int)
  
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
-index 4c61cbd5..7ba12fd7 100644
+index 4c61cbd5..066bc1f5 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
 @@ -1,11 +1,13 @@
@@ -3202,7 +3202,7 @@ index 4c61cbd5..7ba12fd7 100644
              labelFormatter = { "$it%" }
          )
 +        Slider(
-+            label = "TV volume boost (Cemu Light Fix)",
++            label = "TV volume boost (Cemu LD+)",
 +            initialValue = { NativeAudioBoost.getSavedBoostDb(context) },
 +            valueFrom = 0,
 +            steps = NativeAudioBoost.MAX_BOOST_DB / NativeAudioBoost.STEP_DB - 1,
@@ -3301,13 +3301,13 @@ index 5325cb1e..2e1fa933 100644
      }
  }
 diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
-index 053d3be8..1455fa33 100644
+index 053d3be8..71202a35 100644
 --- a/src/android/app/src/main/res/values/strings.xml
 +++ b/src/android/app/src/main/res/values/strings.xml
 @@ -1,5 +1,5 @@
  <resources>
 -    <string name="app_name" translatable="false">Cemu</string>
-+    <string name="app_name" translatable="false">Cemu Light Fix</string>
++    <string name="app_name" translatable="false">Cemu LD+</string>
      <string name="cemu_original_authors" translatable="false">Exzap, Petergov</string>
      <string name="cemu_website" translatable="false">https://cemu.info</string>
      <string name="cemu_online_guide" translatable="false">https://cemu.info/online-guide</string>

@@ -1,6 +1,6 @@
 ---
 name: Problem report
-about: Something looks or works wrong in Cemu Light Fix
+about: Something looks or works wrong in Cemu LD+
 title: ""
 labels: bug
 ---
@@ -24,4 +24,4 @@ labels: bug
 (if you can)
 
 **Log file:**
-Please attach your log. In Cemu Light Fix, open the game list menu and tap **Share log file**.
+Please attach your log. In Cemu LD+, open the game list menu and tap **Share log file**.

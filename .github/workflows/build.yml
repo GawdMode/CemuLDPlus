@@ -1,4 +1,4 @@
-name: Build Cemu Light Fix APK
+name: Build Cemu LD+ APK
 
 # Downloads SSimco's Cemu Android port at a fixed commit, applies lightfix.patch,
 # builds the APK and publishes it as a GitHub release for direct download on the device.
@@ -33,7 +33,7 @@ jobs:
         include:
           - variant: lightfix
             patch: lightfix.patch
-            apk: Cemu-LightFix.apk
+            apk: Cemu-LDPlus.apk
           # "Cemu Control" = same Cemu with no fixes, for comparison tests. Uncomment to build it again.
           # - variant: control
           #   patch: control.patch
@@ -135,20 +135,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Cemu Light Fix build ${{ github.run_number }}
+          name: Cemu LD+ build ${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
           body: |
-            Unofficial build of [SSimco's Cemu for Android](https://github.com/SSimco/Cemu) with a fix for **LEGO Dimensions lighting being stuck in a square around the player**.
+            Unofficial build of [SSimco's Cemu for Android](https://github.com/SSimco/Cemu) made for **LEGO Dimensions**: lighting fix, Toy Pad on the second screen, and better sound.
 
-            **Download:** `Cemu-LightFix.apk` below. It installs as a separate app called **Cemu Light Fix**, next to your regular Cemu.
+            **Download:** `Cemu-LDPlus.apk` below. It installs as a separate app called **Cemu LD+** next to your regular Cemu, and as an update over Cemu Light Fix (saves and settings stay).
 
             - Play at **1280x720** (set *LEGO Dimensions → Resolution* to the default, or leave it off). Higher resolutions may still have lighting problems.
-            - The emulated Toy Pad and other features are the same as SSimco's build.
-            - To move your save and Toy Pad figures from regular Cemu, see the [README](https://github.com/${{ github.repository }}#moving-your-save-from-regular-cemu).
+            - Setup tips (game profile settings, volume boost, moving your save and shader cache): see the [README](https://github.com/${{ github.repository }}#readme).
             - Problems? Open an [Issue](https://github.com/${{ github.repository }}/issues) and attach your log (game list menu → **Share log file**).
-
-            `Cemu-Control-test.apk` (if present) is only for testing: the same Cemu with **no** fixes, installed as a separate "Cemu Control" app, used to compare against Cemu Light Fix. Most people don't need it.
 
             Not affiliated with SSimco or the Cemu team. Based on SSimco/Cemu commit `${{ env.CEMU_COMMIT }}`. Licensed under MPL-2.0.
           files: out/*.apk
