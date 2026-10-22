@@ -30,8 +30,9 @@ copy the save back. Build 3 and later can all be installed as normal updates.
 
 ## Known issues
 
-- The intro logos take about a minute before you can skip. This build logs how much of that time is spent loading
-  (`[BootIO]` lines in the log) to see whether it can be made faster.
+- The intro logos take about 45 seconds before you can skip. That's the game's own timed logo sequence, not
+  loading (the game reads almost nothing from disk while they're shown), so it can't be shortened without
+  patching the game itself. Copying your shader cache from regular Cemu (see below) removes extra delay on first runs.
 
 Not a bug: side-quest characters in the Adventure Worlds (for example Hans Moleman in Springfield) only play a short
 greeting sound and then speak in text. That's how the original game works too.
