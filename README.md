@@ -30,8 +30,9 @@ copy the save back. Build 3 and later can all be installed as normal updates.
 
 ## Known issues
 
-- Some NPC voice lines (for example the mini-quest characters) don't play, and their text may not appear until
-  you tap. This also happens in regular Cemu, on Android and PC, and is being looked into.
+- Some NPC voice lines (for example the mini-quest characters) don't play in regular Cemu, on Android and PC,
+  and their text may not appear until you tap. **Build 4 includes an experimental fix** for this (see below).
+  If voices are still missing or sound wrong for you, please open an Issue with your log.
 
 ## Important: play at 720p
 
@@ -73,6 +74,16 @@ depth↔color copies with offsets on Vulkan. The patch writes `[TexCreate]` and 
 problems (`[AXDiag]`), unsupported system calls and the game's own debug messages, to help track down the
 missing NPC voice lines (a long-standing Cemu issue with LEGO Dimensions that isn't fixed yet).
 
+### Audio fix (build 4 and later)
+
+Three fixes in Cemu's sound mixer, based on the approach SpiderNic96 (metalnic96) described for LEGO Dimensions dialogue:
+
+- The per-voice low-pass filter subtracted its feedback term instead of adding it, which turned it into a
+  high-pass filter and made filtered voices almost silent. It now behaves as a proper low-pass filter.
+- In stereo mode only the left and right channels of the game's 6-channel mix were played. Center and surround
+  channels are now folded into the stereo output.
+- Sound sent to an AUX effect bus with no effect registered was thrown away. It's now passed through.
+
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.
 
@@ -87,6 +98,7 @@ build is SSimco's code at that commit plus the patch in this repo.
 - [Cemu](https://github.com/cemu-project/Cemu) by the Cemu team
 - [Android port](https://github.com/SSimco/Cemu) by SSimco
 - Lighting fix by GawdMode
+- Audio fix approach by [SpiderNic96 (metalnic96)](https://www.youtube.com/watch?v=WLu_5vb614w)
 
 Cemu is licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/MPL/2.0/), and the changes in
 `lightfix.patch` are offered under the same license.
