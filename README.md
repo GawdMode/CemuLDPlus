@@ -82,6 +82,18 @@ of the larger texture was ever filled in. That's why lighting only worked in a s
 linked after checking with Cemu's address math that both memory layouts really line up. It also adds
 depth↔color copies with offsets on Vulkan. It only links two textures after checking that their memory layouts really line up, and caches those checks.
 
+### Sound filter fix (build 7 and later)
+
+Cemu's per-voice low-pass filter subtracted its feedback term instead of adding it. That turned it into a
+high-pass filter at roughly a third of the intended volume, so many voices and effects sounded thin and quiet.
+LEGO Dimensions uses this filter on most of its sounds. It now works as a proper low-pass filter.
+
+### Diagnostic logging
+
+These builds also write extra lines to `log.txt` to help track down the missing NPC dialogue and the long intro:
+opened files (`[FileOpen]`), missing files (`[FileMissing]`), how long sounds are set up and why they stop
+(`[AXVoice]`), unsupported system calls and the game's own debug messages.
+
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.
 
