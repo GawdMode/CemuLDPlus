@@ -92,7 +92,7 @@ LEGO Dimensions uses this filter on most of its sounds. It now works as a proper
 
 These builds also write extra lines to `log.txt` to help track down the missing NPC dialogue and the long intro:
 opened files (`[FileOpen]`), missing files (`[FileMissing]`), how long sounds are set up and why they stop
-(`[AXVoice]`), unsupported system calls and the game's own debug messages.
+(`[AXVoice]`, `[AXHist]`), unsupported system calls and the game's own debug messages.
 
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.

@@ -579,19 +579,22 @@ index a9176562..7fb96387 100644
  		{ 
  			__AXTVAuxReturnVolume[auxBus] = volume;
 diff --git a/src/Cafe/OS/libs/snd_core/ax_internal.h b/src/Cafe/OS/libs/snd_core/ax_internal.h
-index cb7c153e..5dd999da 100644
+index cb7c153e..4e84d9bc 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_internal.h
 +++ b/src/Cafe/OS/libs/snd_core/ax_internal.h
-@@ -221,4 +221,6 @@ namespace snd_core
+@@ -221,4 +221,9 @@ namespace snd_core
  	extern SysAllocator<sint32, AX_SAMPLES_MAX * AX_TV_CHANNEL_COUNT> __AXTVOutputBuffer;
  	extern SysAllocator<sint32, AX_SAMPLES_MAX * AX_DRC_CHANNEL_COUNT * 2> __AXDRCOutputBuffer;
  
 +	// diagnostics: remember why a voice stopped (1 = game stopped it, 2 = game freed it, 3 = dropped for a higher priority voice)
 +	void AXDiag_NoteVoiceStop(sint32 voiceIndex, uint8 reason);
++	// diagnostics: per-voice history of recent API calls, written to the log when a voice stops without playing
++	void AXDiag_Record(sint32 voiceIndex, uint8 type, uint32 v0 = 0, uint32 v1 = 0, uint32 v2 = 0, uint32 v3 = 0);
++	void AXDiag_DumpHistory(sint32 voiceIndex);
  }
 \ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a44..4154c1bd 100644
+index 31a24a44..8112fcc5 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 @@ -751,15 +751,24 @@ namespace snd_core
@@ -624,7 +627,7 @@ index 31a24a44..4154c1bd 100644
  	}
  
  	// mix audio generated from voice into main bus and aux buses
-@@ -804,24 +813,161 @@ namespace snd_core
+@@ -804,24 +813,165 @@ namespace snd_core
  		// todo
  	}
  
@@ -692,8 +695,12 @@ index 31a24a44..4154c1bd 100644
 +		{
 +			// short voice that stopped almost immediately without playing anything
 +			s_voiceQuickStopLogBudget--;
-+			cemuLog_log(LogType::Force, "[AXVoice] quickstop v{} ({}) after {}ms without playing | fmt {} samples {:08x} len {}",
-+				idx, reason, st.frames * 3, st.format, st.samplesAddr, (sint64)st.endOffset - (sint64)st.startOffset);
++			cemuLog_log(LogType::Force, "[AXVoice] quickstop v{} ({}) after {}ms without playing | fmt {} samples {:08x} len {} | start abs {:x} end abs {:x}",
++				idx, reason, st.frames * 3, st.format, st.samplesAddr, (sint64)st.endOffset - (sint64)st.startOffset, st.startOffset, st.endOffset);
++			static sint32 s_quickStopCount = 0;
++			s_quickStopCount++;
++			if (s_quickStopCount <= 60 || (s_quickStopCount % 20) == 0)
++				AXDiag_DumpHistory(idx);
 +		}
 +		st = {};
 +	}
@@ -789,7 +796,7 @@ index 31a24a44..4154c1bd 100644
  
  	void AXMix_MergeBusSamples(float* input, sint32* output, sint32 sampleCount, uint16& volume, sint16 delta)
 diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-index d4e562e0..2e6ec373 100644
+index d4e562e0..793ea1ee 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 @@ -369,6 +369,16 @@ namespace snd_core
@@ -809,7 +816,96 @@ index d4e562e0..2e6ec373 100644
  				// drop voice
  				if (voiceItr->playbackState != 0)
  				{
-@@ -409,6 +419,12 @@ namespace snd_core
+@@ -393,6 +403,88 @@ namespace snd_core
+ 		return nullptr;
+ 	}
+ 
++	// ---- diagnostics: per-voice history of recent API calls ----
++	enum AXDiagCallType : uint8
++	{
++		AXDIAG_ACQUIRE = 1, AXDIAG_FREE, AXDIAG_SETSTATE, AXDIAG_SETOFFSETS, AXDIAG_SETSAMPLESADDR, AXDIAG_SETCUR, AXDIAG_SETEND, AXDIAG_SETLOOPOFS,
++		AXDIAG_SETLOOPFLAG, AXDIAG_GETOFFSETS, AXDIAG_SETADPCM, AXDIAG_SETADPCMLOOP, AXDIAG_SETCUREX, AXDIAG_SETENDEX, AXDIAG_SETLOOPOFSEX, AXDIAG_GETCUREX, AXDIAG_SETOFFSETSEX
++	};
++	struct AXDiagCall
++	{
++		uint64 timeMs;
++		uint8 type;
++		uint16 repeat;
++		uint32 v[4];
++		uint32 absCur;
++		uint32 absEnd;
++	};
++	static constexpr sint32 AXDIAG_HISTORY = 24;
++	static std::mutex s_axHistMutex;
++	static AXDiagCall s_axHist[AX_MAX_VOICES][AXDIAG_HISTORY];
++	static uint8 s_axHistPos[AX_MAX_VOICES];
++
++	static uint64 _AXDiagNowMs()
++	{
++		return (uint64)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++	}
++
++	void AXDiag_Record(sint32 voiceIndex, uint8 type, uint32 v0, uint32 v1, uint32 v2, uint32 v3)
++	{
++		if (voiceIndex < 0 || voiceIndex >= AX_MAX_VOICES)
++			return;
++		AXVPBInternal_t* internal = __AXVPBInternalVoiceArray + voiceIndex;
++		std::unique_lock _l(s_axHistMutex);
++		uint8& pos = s_axHistPos[voiceIndex];
++		AXDiagCall& prev = s_axHist[voiceIndex][(pos + AXDIAG_HISTORY - 1) % AXDIAG_HISTORY];
++		bool isPoll = (type == AXDIAG_GETOFFSETS || type == AXDIAG_GETCUREX);
++		if (isPoll && prev.type == type)
++		{
++			// collapse repeated polling into one entry
++			prev.repeat++;
++			prev.timeMs = _AXDiagNowMs();
++			prev.v[0] = v0; prev.v[1] = v1; prev.v[2] = v2; prev.v[3] = v3;
++			prev.absCur = internal->internalOffsets.GetCurrentOffset32();
++			prev.absEnd = internal->internalOffsets.GetEndOffset32();
++			return;
++		}
++		AXDiagCall& c = s_axHist[voiceIndex][pos];
++		c.timeMs = _AXDiagNowMs();
++		c.type = type;
++		c.repeat = 1;
++		c.v[0] = v0; c.v[1] = v1; c.v[2] = v2; c.v[3] = v3;
++		c.absCur = internal->internalOffsets.GetCurrentOffset32();
++		c.absEnd = internal->internalOffsets.GetEndOffset32();
++		pos = (pos + 1) % AXDIAG_HISTORY;
++	}
++
++	void AXDiag_DumpHistory(sint32 voiceIndex)
++	{
++		if (voiceIndex < 0 || voiceIndex >= AX_MAX_VOICES)
++			return;
++		static const char* names[] = { "?", "Acquire", "Free", "SetState", "SetOffsets", "SetSamplesAddr", "SetCurrentOffset", "SetEndOffset", "SetLoopOffset",
++			"SetLoop", "GetOffsets", "SetAdpcm", "SetAdpcmLoop", "SetCurrentOffsetEx", "SetEndOffsetEx", "SetLoopOffsetEx", "GetCurrentOffsetEx", "SetOffsetsEx" };
++		AXVPB* vpb = __AXVPBArrayPtr + voiceIndex;
++		AXVPBInternal_t* internal = __AXVPBInternalVoiceArray + voiceIndex;
++		std::unique_lock _l(s_axHistMutex);
++		uint64 now = _AXDiagNowMs();
++		std::string out = fmt::format("[AXHist] v{} now: public samples {:08x} fmt {} loopFlag {} loop {:x} end {:x} cur {:x} | internal abs loop {:x} end {:x} cur {:x}",
++			voiceIndex, _swapEndianU32(vpb->offsets.samples), _swapEndianU16(vpb->offsets.format), _swapEndianU16(vpb->offsets.loopFlag),
++			_swapEndianU32(vpb->offsets.loopOffset), _swapEndianU32(vpb->offsets.endOffset), _swapEndianU32(vpb->offsets.currentOffset),
++			internal->internalOffsets.GetLoopOffset32(), internal->internalOffsets.GetEndOffset32(), internal->internalOffsets.GetCurrentOffset32());
++		cemuLog_log(LogType::Force, "{}", out);
++		uint8 pos = s_axHistPos[voiceIndex];
++		for (sint32 i = 0; i < AXDIAG_HISTORY; i++)
++		{
++			const AXDiagCall& c = s_axHist[voiceIndex][(pos + i) % AXDIAG_HISTORY];
++			if (c.type == 0 || c.type >= (sizeof(names) / sizeof(names[0])))
++				continue;
++			if (now - c.timeMs > 3000)
++				continue; // only the last 3 seconds
++			cemuLog_log(LogType::Force, "[AXHist]   -{}ms {}{} args {:x} {:x} {:x} {:x} -> abs cur {:x} end {:x}",
++				now - c.timeMs, names[c.type], c.repeat > 1 ? fmt::format(" x{}", c.repeat) : std::string(), c.v[0], c.v[1], c.v[2], c.v[3], c.absCur, c.absEnd);
++		}
++	}
++
+ 	AXVPB* AXAcquireVoiceEx(uint32 priority, MPTR callbackEx, MPTR userParam)
+ 	{
+ 		cemu_assert(priority != AX_PRIORITY_FREE && priority < AX_PRIORITY_MAX);
+@@ -409,6 +501,12 @@ namespace snd_core
  			if (!vpb)
  			{
  				// no voice available
@@ -822,15 +918,31 @@ index d4e562e0..2e6ec373 100644
  				__AXVoiceListSpinlock.unlock();
  				return nullptr;
  			}
-@@ -424,6 +440,7 @@ namespace snd_core
+@@ -418,12 +516,15 @@ namespace snd_core
+ 		vpb->callbackEx = callbackEx;
+ 		AXVPB_SetVoiceDefault(vpb);
+ 		__AXVoiceListSpinlock.unlock();
++		AXDiag_Record((sint32)vpb->index, AXDIAG_ACQUIRE, priority);
+ 		return vpb;
+ 	}
+ 
  	void AXFreeVoice(AXVPB* vpb)
  	{
  		cemu_assert(vpb != nullptr);
 +		AXDiag_NoteVoiceStop((sint32)vpb->index, 2);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_FREE);
  		__AXVoiceListSpinlock.lock();
  		if (vpb->priority == (uint32be)AX_PRIORITY_FREE)
  		{
-@@ -618,6 +635,7 @@ namespace snd_core
+@@ -608,6 +709,7 @@ namespace snd_core
+ 
+ 	void AXSetVoiceState(AXVPB* vpb, sint32 voiceState)
+ 	{
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETSTATE, (uint32)voiceState, (uint32)vpb->playbackState);
+ 		if (vpb->playbackState != (uint32be)voiceState)
+ 		{
+ 			vpb->playbackState = voiceState;
+@@ -618,6 +720,7 @@ namespace snd_core
  			if (voiceState == 0)
  			{
  				vpb->depop = (uint32be)1;
@@ -838,6 +950,115 @@ index d4e562e0..2e6ec373 100644
  			}
  		}
  	}
+@@ -645,6 +748,7 @@ namespace snd_core
+ 		internal->adpcmData.scale = adpcm->scale;
+ 		AXSetSyncFlag(vpb, AX_SYNCFLAG_ADPCMDATA);
+ 		AXVoiceProtection_Acquire(vpb);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETADPCM, _swapEndianU16(adpcm->scale), _swapEndianU16(adpcm->gain));
+ 	}
+ 
+ 	void AXSetVoiceAdpcmLoop(AXVPB* vpb, AXPBADPCMLOOP_t* adpcmLoop)
+@@ -658,6 +762,7 @@ namespace snd_core
+ 		}
+ 		AXSetSyncFlag(vpb, AX_SYNCFLAG_ADPCMLOOP);
+ 		AXVoiceProtection_Acquire(vpb);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETADPCMLOOP, _swapEndianU16(adpcmLoop->loopScale));
+ 	}
+ 
+ 	void AXSetVoiceSrc(AXVPB* vpb, AXPBSRC_t* src)
+@@ -947,12 +1052,14 @@ namespace snd_core
+ 		{
+ 			cemu_assert_debug(false);
+ 		}
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETOFFSETS, (uint32)format | ((uint32)_swapEndianU16(pbOffset->loopFlag) << 16), _swapEndianU32(pbOffset->currentOffset), _swapEndianU32(pbOffset->endOffset), _swapEndianU32(pbOffset->samples));
+ 	}
+ 
+ 	void AXSetVoiceOffsetsEx(AXVPB* vpb, AXPBOFFSET_t* pbOffset, void* sampleBase)
+ 	{
+ 		// used by F1 Racing
+ 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETOFFSETSEX, memory_getVirtualOffsetFromPointer(sampleBase));
+ 
+ 		AXPBOFFSET_t tmpOffsets = *pbOffset;
+ 		tmpOffsets.samples = _swapEndianU32(memory_getVirtualOffsetFromPointer(sampleBase));
+@@ -963,6 +1070,7 @@ namespace snd_core
+ 	{
+ 		vpb->offsets.samples = _swapEndianU32(memory_getVirtualOffsetFromPointer(sampleBase));
+ 		AXGetVoiceOffsets(vpb, &vpb->offsets);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETSAMPLESADDR, memory_getVirtualOffsetFromPointer(sampleBase), _swapEndianU32(vpb->offsets.currentOffset), _swapEndianU32(vpb->offsets.endOffset));
+ 	}
+ 
+ 	void AXGetVoiceOffsets(AXVPB* vpb, AXPBOFFSET_t* pbOffset)
+@@ -1016,6 +1124,7 @@ namespace snd_core
+ 			cemu_assert_debug(false);
+ 		}
+ 		cemuLog_log(LogType::SoundAPI, "Retrieved voice offsets for voice {:08x} - base {:08x} current {:08x} loopFlag {:04x} loop {:08x} end {:08x}", memory_getVirtualOffsetFromPointer(vpb), _swapEndianU32(pbOffset->samples), _swapEndianU32(pbOffset->currentOffset), _swapEndianU16(pbOffset->loopFlag), _swapEndianU32(pbOffset->loopOffset), _swapEndianU32(pbOffset->endOffset));
++		AXDiag_Record((sint32)vpb->index, AXDIAG_GETOFFSETS, _swapEndianU32(pbOffset->samples), _swapEndianU32(pbOffset->currentOffset), _swapEndianU32(pbOffset->endOffset));
+ 	}
+ 
+ 	void AXGetVoiceOffsetsEx(AXVPB* vpb, AXPBOFFSET_t* pbOffset, MPTR sampleBase)
+@@ -1059,6 +1168,7 @@ namespace snd_core
+ 		internal->internalOffsets.currentOffsetPtrLow = _swapEndianU16(currentOffsetPtr & 0xFFFF);
+ 		AXSetSyncFlag(vpb, AX_SYNCFLAG_CURRENTOFFSET);
+ 		AXVoiceProtection_Acquire(vpb);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETCUR, currentOffset, sampleBase);
+ 	}
+ 
+ 	void AXSetVoiceLoopOffset(AXVPB* vpb, uint32 loopOffset)
+@@ -1092,6 +1202,7 @@ namespace snd_core
+ 		internal->internalOffsets.loopOffsetPtrLow = _swapEndianU16(loopOffsetPtr & 0xFFFF);
+ 		AXSetSyncFlag(vpb, AX_SYNCFLAG_LOOPOFFSET);
+ 		AXVoiceProtection_Acquire(vpb);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETLOOPOFS, loopOffset, sampleBase);
+ 	}
+ 
+ 	void AXSetVoiceEndOffset(AXVPB* vpb, uint32 endOffset)
+@@ -1126,11 +1237,13 @@ namespace snd_core
+ 		internal->internalOffsets.endOffsetPtrLow = _swapEndianU16(endOffsetPtr & 0xFFFF);
+ 		AXSetSyncFlag(vpb, AX_SYNCFLAG_ENDOFFSET);
+ 		AXVoiceProtection_Acquire(vpb);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETEND, endOffset, sampleBase);
+ 	}
+ 
+ 	void AXSetVoiceCurrentOffsetEx(AXVPB* vpb, uint32 currentOffset, MPTR sampleBase)
+ 	{
+ 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETCUREX, currentOffset, sampleBase);
+ 		AXPBOFFSET_t pbOffset;
+ 		vpb->offsets.samples = _swapEndianU32(sampleBase);
+ 		AXGetVoiceOffsets(vpb, &pbOffset);
+@@ -1140,6 +1253,7 @@ namespace snd_core
+ 	void AXSetVoiceLoopOffsetEx(AXVPB* vpb, uint32 loopOffset, MPTR sampleBase)
+ 	{
+ 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETLOOPOFSEX, loopOffset, sampleBase);
+ 		AXPBOFFSET_t pbOffset;
+ 		vpb->offsets.samples = _swapEndianU32(sampleBase);
+ 		AXGetVoiceOffsets(vpb, &pbOffset);
+@@ -1149,6 +1263,7 @@ namespace snd_core
+ 	void AXSetVoiceEndOffsetEx(AXVPB* vpb, uint32 endOffset, MPTR sampleBase)
+ 	{
+ 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETENDEX, endOffset, sampleBase);
+ 		AXPBOFFSET_t pbOffset;
+ 		vpb->offsets.samples = _swapEndianU32(sampleBase);
+ 		AXGetVoiceOffsets(vpb, &pbOffset);
+@@ -1160,6 +1275,7 @@ namespace snd_core
+ 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
+ 		AXPBOFFSET_t pbOffset;
+ 		AXGetVoiceOffsetsEx(vpb, &pbOffset, sampleBase);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_GETCUREX, sampleBase, _swapEndianU32(pbOffset.currentOffset));
+ 		return _swapEndianU32(pbOffset.currentOffset);
+ 	}
+ 
+@@ -1170,6 +1286,7 @@ namespace snd_core
+ 		internal->internalOffsets.loopFlag = _swapEndianU16(loopState);
+ 		AXSetSyncFlag(vpb, AX_SYNCFLAG_LOOPFLAG);
+ 		AXVoiceProtection_Acquire(vpb);
++		AXDiag_Record((sint32)vpb->index, AXDIAG_SETLOOPFLAG, loopState);
+ 	}
+ 
+ 	uint32 vpbLoopTracker_loopCount[AX_MAX_VOICES];
 diff --git a/src/Cemu/Logging/CemuLogging.cpp b/src/Cemu/Logging/CemuLogging.cpp
 index f2d9ac05..28555c35 100644
 --- a/src/Cemu/Logging/CemuLogging.cpp
