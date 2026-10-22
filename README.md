@@ -67,8 +67,12 @@ On devices with a second screen (for example the AYN Thor's bottom screen), Cemu
 LEGO Dimensions Toy Pad there while you play:
 
 - The three pads with the figure on each spot, glowing in the colors the game sets (like the real pad's lights).
-- Your figures as round character and vehicle pictures, split into **Characters** and **Vehicles and gadgets**.
-  Figures that are on the pad get a green check.
+- **Every character and vehicle, ready to place.** No need to create figures first: tap any of them and it's made
+  the first time you use it. Figures on the pad get a green check.
+- **Franchise logos:** tap a logo to show just that franchise's characters and vehicles (each vehicle's three builds
+  together), or **All** for everything A to Z.
+- **Search:** tap the search box and type on the small keyboard that appears on the Toy Pad screen.
+- When you rebuild a vehicle in the game, the pad shows the new build.
 - Tap an empty spot, then a figure from your collection, to place it. Or tap a figure first, then a spot.
 - Tap a figure on the pad for **Move** (then tap where it should go) or **Remove**.
 
@@ -80,7 +84,8 @@ while you use the touch screen.
 - **Figure pictures:** the app doesn't include any game artwork. The first time a figure is shown, its picture is
   downloaded from the community [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) collection
   and kept in the `toypad/figures` folder inside the Cemu Light Fix folder. Characters stand on a drawing of their
-  Toy Tag from the [LEGO Dimensions Wiki](https://lego-dimensions.fandom.com/wiki/Toy_Tag), kept in `toypad/tags`. Without internet the figure's name is shown
+  Toy Tag from the [LEGO Dimensions Wiki](https://lego-dimensions.fandom.com/wiki/Toy_Tag), kept in `toypad/tags`.
+  Franchise logos come from the [LegoToypad](https://github.com/harrysof/LegoToypad) project (`toypad/logos`). Without internet the figure's name is shown
   instead. To use your own picture for a figure, put it in that folder named by figure number (for example `1.png`
   for Batman, `1000.png` for the Police Car). You can turn the downloads off with the **Figure pictures** switch.
 - **Background:** tap **Choose background picture** to use any picture on your device behind the Toy Pad, or keep the
@@ -155,6 +160,8 @@ build is SSimco's code at that commit plus the patch in this repo.
 - Lighting fix by GawdMode
 - Figure pictures (downloaded on your device, not included here) from the
   [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) community collection (Chteupnin's assets)
+- Franchise logos and the franchise and vehicle family lists from [LegoToypad](https://github.com/harrysof/LegoToypad)
+  by harrysof (logos downloaded on your device, not included here)
 - Toy Tag drawings (downloaded on your device, not included here) from the
   [LEGO Dimensions Wiki](https://lego-dimensions.fandom.com/wiki/Toy_Tag) community
 

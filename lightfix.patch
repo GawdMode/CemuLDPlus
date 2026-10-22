@@ -525,7 +525,7 @@ index 1429d083..8d4c2b5b 100644
  				return FSA_RESULT::OK;
  
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
-index b23560f1..3be9ea7b 100644
+index b23560f1..86df912c 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 @@ -575,6 +575,8 @@ namespace nsyshid
@@ -670,7 +670,7 @@ index b23560f1..3be9ea7b 100644
  	bool DimensionsUSB::MoveFigure(uint8 pad, uint8 index, uint8 oldPad, uint8 oldIndex)
  	{
  		if (oldIndex == index)
-@@ -1016,6 +1144,11 @@ namespace nsyshid
+@@ -1016,6 +1144,20 @@ namespace nsyshid
  		return (uint32&)modelNumber[0];
  	}
  
@@ -679,19 +679,30 @@ index b23560f1..3be9ea7b 100644
 +		return GetFigureId(buf);
 +	}
 +
++	uint32 DimensionsUSB::GetFigureIdAtIndex(uint8 index)
++	{
++		std::lock_guard lock(m_dimensionsMutex);
++		if (index >= m_figures.size())
++			return 0;
++		const DimensionsMini& figure = m_figures[index];
++		return figure.index != 255 ? figure.id : 0;
++	}
++
  	DimensionsUSB::DimensionsMini&
  	DimensionsUSB::GetFigureByIndex(uint8 index)
  	{
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.h b/src/Cafe/OS/libs/nsyshid/Dimensions.h
-index 00ceff9e..69a3ff24 100644
+index 00ceff9e..e8c05f48 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.h
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.h
-@@ -78,6 +78,19 @@ namespace nsyshid
+@@ -78,6 +78,21 @@ namespace nsyshid
  		static std::map<const uint32, const char*> GetListMinifigs();
  		static std::map<const uint32, const char*> GetListTokens();
  		std::string FindFigure(uint32 figNum);
 +		// figure number stored in a figure's data (characters < 1000, vehicles and gadgets >= 1000)
 +		uint32 GetFigureIdFromData(const std::array<uint8, 0x2D * 0x04>& buf);
++		// figure number of the figure currently on the pad at this index (follows in-game vehicle rebuilds), 0 if none
++		uint32 GetFigureIdAtIndex(uint8 index);
 +
 +		// Toy Pad light state as last set by the game (index 0 = center, 1 = left, 2 = right)
 +		struct PadLight
@@ -706,7 +717,7 @@ index 00ceff9e..69a3ff24 100644
  
  	  protected:
  		std::mutex m_dimensionsMutex;
-@@ -104,6 +117,11 @@ namespace nsyshid
+@@ -104,6 +119,11 @@ namespace nsyshid
  
  		bool m_isAwake = false;
  
@@ -1028,10 +1039,20 @@ index 3c1587e7..7430cfee 100644
          targetSdk = 35
          versionName = getVersionName()
 diff --git a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
-index 1190bf43..e956b930 100644
+index 1190bf43..77319a1a 100644
 --- a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 +++ b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
-@@ -381,3 +381,44 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_moveDimensionsFigur
+@@ -334,6 +334,9 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsFigure
+ {
+ 	if (const auto& opt = NativeEmulatedUSBDevices::g_dimensionSlots.at(slot))
+ 	{
++		uint32 live = nsyshid::g_dimensionstoypad.GetFigureIdAtIndex((uint8)slot);
++		if (live != 0 && live != opt->number)
++			return env->NewStringUTF(nsyshid::g_dimensionstoypad.FindFigure(live).c_str());
+ 		return env->NewStringUTF(opt->name.c_str());
+ 	}
+ 
+@@ -381,3 +384,48 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_moveDimensionsFigur
  		oldSlot = std::nullopt;
  	}
  }
@@ -1042,7 +1063,11 @@ index 1190bf43..e956b930 100644
 +	if (slot < 0 || slot >= (jint)NativeEmulatedUSBDevices::g_dimensionSlots.size())
 +		return -1;
 +	if (const auto& opt = NativeEmulatedUSBDevices::g_dimensionSlots.at(slot))
-+		return (jint)opt->number;
++	{
++		// the game rewrites a vehicle's number when it's rebuilt, so prefer what's on the pad right now
++		uint32 live = nsyshid::g_dimensionstoypad.GetFigureIdAtIndex((uint8)slot);
++		return (jint)(live != 0 ? live : opt->number);
++	}
 +	return -1;
 +}
 +
@@ -1151,12 +1176,383 @@ index 29a5c740..342d30c8 100644
      override fun onPause() {
          super.onPause()
  
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt
+new file mode 100644
+index 00000000..fc3d5993
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt
+@@ -0,0 +1,365 @@
++package info.cemu.cemu.emulation.toypadscreen
++
++// Generated list of every LEGO Dimensions character and vehicle/gadget the emulated Toy Pad knows,
++// with its franchise. Figure numbers and names match Cemu's figure list; franchises and vehicle families
++// follow the community LegoToypad project (github.com/harrysof/LegoToypad).
++
++class Franchise(val index: Int, val name: String, val logoUrl: String)
++
++class CatalogFigure(val id: Int, val name: String, val franchise: Int, val isVehicle: Boolean, val family: String, val build: Int)
++
++private const val LOGO_BASE = "https://raw.githubusercontent.com/harrysof/LegoToypad/main/All%20Bin%20Files/"
++
++val FRANCHISES: List<Franchise> = listOf(
++    Franchise(1, "Adventure Time", LOGO_BASE + "Adventure%20Time/Logo/Adventure_Time.png"),
++    Franchise(2, "Back to the Future", LOGO_BASE + "Back%20to%20the%20Future/Logo/Back_to_the_future.png"),
++    Franchise(3, "Beetlejuice", LOGO_BASE + "Beetlejuice/Logo/Beetlejuice.png"),
++    Franchise(4, "DC Comics", LOGO_BASE + "DC%20Comics/Logo/DC_Comics.png"),
++    Franchise(5, "Doctor Who", LOGO_BASE + "Doctor%20Who/Logo/Doctor_Who.png"),
++    Franchise(6, "E.T. the Extra-Terrestrial", LOGO_BASE + "E.T.%20the%20Extra-Terrestrial/Logo/E.T..png"),
++    Franchise(7, "Fantastic Beasts and Where to Find Them", LOGO_BASE + "Fantastic%20Beasts%20and%20Where%20to%20Find%20Them/Logo/Fantastic_Beasts.png"),
++    Franchise(8, "Ghostbusters", LOGO_BASE + "Ghostbusters/Logo/Ghostbusters.png"),
++    Franchise(9, "Ghostbusters 2016", LOGO_BASE + "Ghostbusters%202016/Logo/Ghostbusters%20%282016%29.png"),
++    Franchise(10, "Gremlins", LOGO_BASE + "Gremlins/Logo/Gremlins.png"),
++    Franchise(11, "Harry Potter", LOGO_BASE + "Harry%20Potter/Logo/Harry_Potter.png"),
++    Franchise(12, "Jurassic World", LOGO_BASE + "Jurassic%20World/Logo/Jurassic_World.png"),
++    Franchise(13, "Knight Rider", LOGO_BASE + "Knight%20Rider/Logo/Knight_Rider.png"),
++    Franchise(14, "Legends of Chima", LOGO_BASE + "Legends%20of%20Chima/Logo/Lego_Chima.png"),
++    Franchise(15, "LEGO City Undercover", LOGO_BASE + "LEGO%20City%20Undercover/Logo/Lego_City_Undercover.png"),
++    Franchise(16, "Midway Arcade", LOGO_BASE + "Midway%20Arcade/Logo/Midway.png"),
++    Franchise(17, "Mission Impossible", LOGO_BASE + "Mission%20Impossible/Logo/Mission_Impossible.png"),
++    Franchise(18, "Ninjago", LOGO_BASE + "Ninjago/Logo/Lego_Ninjago.png"),
++    Franchise(19, "Portal 2", LOGO_BASE + "Portal%202/Logo/Portal_2.png"),
++    Franchise(20, "Scooby-Doo!", LOGO_BASE + "Scooby-Doo%21/Logo/Scooby-Doo.png"),
++    Franchise(21, "Sonic the Hedgehog", LOGO_BASE + "Sonic%20the%20Hedgehog/Logo/Sonic.png"),
++    Franchise(22, "Teen Titans Go!", LOGO_BASE + "Teen%20Titans%20Go%21/Logo/Teen_Titans_Go.png"),
++    Franchise(23, "The A-Team", LOGO_BASE + "The%20A-Team/Logo/The_A-team.png"),
++    Franchise(24, "The Goonies", LOGO_BASE + "The%20Goonies/Logo/The_Goonies.png"),
++    Franchise(25, "The LEGO Batman Movie", LOGO_BASE + "The%20LEGO%20Batman%20Movie/Logo/The_LEGO_Batman_Movie.png"),
++    Franchise(26, "The LEGO Movie", LOGO_BASE + "The%20LEGO%20Movie/Logo/The_LEGO_Movie.png"),
++    Franchise(27, "The Lord of the Rings", LOGO_BASE + "The%20Lord%20of%20the%20Rings/Logo/The_Lord_of_the_rings.png"),
++    Franchise(28, "The Powerpuff Girls", LOGO_BASE + "The%20Powerpuff%20Girls/Logo/Powerpuff_Girls.png"),
++    Franchise(29, "The Simpsons", LOGO_BASE + "The%20Simpsons/Logo/The_Simpsons.png"),
++    Franchise(30, "The Wizard of Oz", LOGO_BASE + "The%20Wizard%20of%20Oz/Logo/The_Wizard_of_OZ.png"),
++)
++
++val CATALOG: List<CatalogFigure> = listOf(
++    CatalogFigure(1, "Batman", 4, false, "", 0),
++    CatalogFigure(2, "Gandalf", 27, false, "", 0),
++    CatalogFigure(3, "Wyldstyle", 26, false, "", 0),
++    CatalogFigure(4, "Aquaman", 4, false, "", 0),
++    CatalogFigure(5, "Bad Cop", 26, false, "", 0),
++    CatalogFigure(6, "Bane", 4, false, "", 0),
++    CatalogFigure(7, "Bart Simpson", 29, false, "", 0),
++    CatalogFigure(8, "Benny", 26, false, "", 0),
++    CatalogFigure(9, "Chell", 19, false, "", 0),
++    CatalogFigure(10, "Cole", 18, false, "", 0),
++    CatalogFigure(11, "Cragger", 14, false, "", 0),
++    CatalogFigure(12, "Cyborg", 4, false, "", 0),
++    CatalogFigure(13, "Cyberman", 5, false, "", 0),
++    CatalogFigure(14, "Doc Brown", 2, false, "", 0),
++    CatalogFigure(15, "The Doctor", 5, false, "", 0),
++    CatalogFigure(16, "Emmet", 26, false, "", 0),
++    CatalogFigure(17, "Eris", 14, false, "", 0),
++    CatalogFigure(18, "Gimli", 27, false, "", 0),
++    CatalogFigure(19, "Gollum", 27, false, "", 0),
++    CatalogFigure(20, "Harley Quinn", 4, false, "", 0),
++    CatalogFigure(21, "Homer Simpson", 29, false, "", 0),
++    CatalogFigure(22, "Jay", 18, false, "", 0),
++    CatalogFigure(23, "Joker", 4, false, "", 0),
++    CatalogFigure(24, "Kai", 18, false, "", 0),
++    CatalogFigure(25, "ACU Trooper", 12, false, "", 0),
++    CatalogFigure(26, "Gamer Kid", 16, false, "", 0),
++    CatalogFigure(27, "Krusty the Clown", 29, false, "", 0),
++    CatalogFigure(28, "Laval", 14, false, "", 0),
++    CatalogFigure(29, "Legolas", 27, false, "", 0),
++    CatalogFigure(30, "Lloyd", 18, false, "", 0),
++    CatalogFigure(31, "Marty McFly", 2, false, "", 0),
++    CatalogFigure(32, "Nya", 18, false, "", 0),
++    CatalogFigure(33, "Owen Grady", 12, false, "", 0),
++    CatalogFigure(34, "Peter Venkman", 8, false, "", 0),
++    CatalogFigure(35, "Slimer", 8, false, "", 0),
++    CatalogFigure(36, "Scooby-Doo", 20, false, "", 0),
++    CatalogFigure(37, "Sensei Wu", 18, false, "", 0),
++    CatalogFigure(38, "Shaggy", 20, false, "", 0),
++    CatalogFigure(39, "Stay Puft", 8, false, "", 0),
++    CatalogFigure(40, "Superman", 4, false, "", 0),
++    CatalogFigure(41, "Unikitty", 26, false, "", 0),
++    CatalogFigure(42, "Wicked Witch of the West", 30, false, "", 0),
++    CatalogFigure(43, "Wonder Woman", 4, false, "", 0),
++    CatalogFigure(44, "Zane", 18, false, "", 0),
++    CatalogFigure(45, "Green Arrow", 4, false, "", 0),
++    CatalogFigure(46, "Supergirl", 4, false, "", 0),
++    CatalogFigure(47, "Abby Yates", 9, false, "", 0),
++    CatalogFigure(48, "Finn the Human", 1, false, "", 0),
++    CatalogFigure(49, "Ethan Hunt", 17, false, "", 0),
++    CatalogFigure(50, "Lumpy Space Princess", 1, false, "", 0),
++    CatalogFigure(51, "Jake the Dog", 1, false, "", 0),
++    CatalogFigure(52, "Harry Potter", 11, false, "", 0),
++    CatalogFigure(53, "Lord Voldemort", 11, false, "", 0),
++    CatalogFigure(54, "Michael Knight", 13, false, "", 0),
++    CatalogFigure(55, "B.A. Baracus", 23, false, "", 0),
++    CatalogFigure(56, "Newt Scamander", 7, false, "", 0),
++    CatalogFigure(57, "Sonic the Hedgehog", 21, false, "", 0),
++    CatalogFigure(59, "Gizmo", 10, false, "", 0),
++    CatalogFigure(60, "Stripe", 10, false, "", 0),
++    CatalogFigure(61, "E.T.", 6, false, "", 0),
++    CatalogFigure(62, "Tina Goldstein", 7, false, "", 0),
++    CatalogFigure(63, "Marceline the Vampire Queen", 1, false, "", 0),
++    CatalogFigure(64, "Batgirl", 25, false, "", 0),
++    CatalogFigure(65, "Robin", 25, false, "", 0),
++    CatalogFigure(66, "Sloth", 24, false, "", 0),
++    CatalogFigure(67, "Hermione Granger", 11, false, "", 0),
++    CatalogFigure(68, "Chase McCain", 15, false, "", 0),
++    CatalogFigure(69, "Excalibur Batman", 25, false, "", 0),
++    CatalogFigure(70, "Raven", 22, false, "", 0),
++    CatalogFigure(71, "Beast Boy", 22, false, "", 0),
++    CatalogFigure(72, "Betelgeuse", 3, false, "", 0),
++    CatalogFigure(74, "Blossom", 28, false, "", 0),
++    CatalogFigure(75, "Bubbles", 28, false, "", 0),
++    CatalogFigure(76, "Buttercup", 28, false, "", 0),
++    CatalogFigure(77, "Starfire", 22, false, "", 0),
++    CatalogFigure(769, "Supergirl Red Lantern", 4, false, "", 0),
++    CatalogFigure(1000, "Police Car", 26, true, "Police Car", 1),
++    CatalogFigure(1001, "Aerial Squad Car", 26, true, "Police Car", 2),
++    CatalogFigure(1002, "Missile Striker", 26, true, "Police Car", 3),
++    CatalogFigure(1003, "Gravity Sprinter", 29, true, "Gravity Sprinter", 1),
++    CatalogFigure(1004, "Street Shredder", 29, true, "Gravity Sprinter", 2),
++    CatalogFigure(1005, "Sky Clobberer", 29, true, "Gravity Sprinter", 3),
++    CatalogFigure(1006, "Batmobile", 4, true, "Batmobile", 1),
++    CatalogFigure(1007, "Batblaster", 4, true, "Batmobile", 2),
++    CatalogFigure(1008, "Sonic Batray", 4, true, "Batmobile", 3),
++    CatalogFigure(1009, "Benny's Spaceship", 26, true, "Benny's Spaceship", 1),
++    CatalogFigure(1010, "Lasercraft", 26, true, "Benny's Spaceship", 2),
++    CatalogFigure(1011, "The Annihilator", 26, true, "Benny's Spaceship", 3),
++    CatalogFigure(1012, "DeLorean Time Machine", 2, true, "DeLorean Time Machine", 1),
++    CatalogFigure(1013, "Electric Time Machine", 2, true, "DeLorean Time Machine", 2),
++    CatalogFigure(1014, "Ultra Time Machine", 2, true, "DeLorean Time Machine", 3),
++    CatalogFigure(1015, "Hoverboard", 2, true, "Hoverboard", 1),
++    CatalogFigure(1016, "Cyclone Board", 2, true, "Hoverboard", 2),
++    CatalogFigure(1017, "Ultimate Hoverjet", 2, true, "Hoverboard", 3),
++    CatalogFigure(1018, "Eagle Interceptor", 14, true, "Eagle Interceptor", 1),
++    CatalogFigure(1019, "Eagle Sky Blazer", 14, true, "Eagle Interceptor", 2),
++    CatalogFigure(1020, "Eagle Swoop Diver", 14, true, "Eagle Interceptor", 3),
++    CatalogFigure(1021, "Swamp Skimmer", 14, true, "Swamp Skimmer", 1),
++    CatalogFigure(1022, "Cragger's Fireship", 14, true, "Swamp Skimmer", 2),
++    CatalogFigure(1023, "Croc Command Sub", 14, true, "Swamp Skimmer", 3),
++    CatalogFigure(1024, "Cyber-Guard", 4, true, "Cyber-Guard", 1),
++    CatalogFigure(1025, "Cyber-Wrecker", 4, true, "Cyber-Guard", 2),
++    CatalogFigure(1026, "Laser Robot Walker", 4, true, "Cyber-Guard", 3),
++    CatalogFigure(1027, "K-9", 5, true, "K-9", 1),
++    CatalogFigure(1028, "K-9 Ruff Rover", 5, true, "K-9", 2),
++    CatalogFigure(1029, "K-9 Laser Cutter", 5, true, "K-9", 3),
++    CatalogFigure(1030, "TARDIS", 5, true, "TARDIS", 1),
++    CatalogFigure(1031, "Laser-Pulse TARDIS", 5, true, "TARDIS", 2),
++    CatalogFigure(1032, "Energy-Burst TARDIS", 5, true, "TARDIS", 3),
++    CatalogFigure(1033, "Emmet's Excavator", 26, true, "Emmet's Excavator", 1),
++    CatalogFigure(1034, "Destroy Dozer", 26, true, "Emmet's Excavator", 2),
++    CatalogFigure(1035, "Destruct-o-Mech", 26, true, "Emmet's Excavator", 3),
++    CatalogFigure(1036, "Winged Monkey", 30, true, "Winged Monkey", 1),
++    CatalogFigure(1037, "Battle Monkey", 30, true, "Winged Monkey", 2),
++    CatalogFigure(1038, "Commander Monkey", 30, true, "Winged Monkey", 3),
++    CatalogFigure(1039, "Axe Chariot", 27, true, "Axe Chariot", 1),
++    CatalogFigure(1040, "Axe Hurler", 27, true, "Axe Chariot", 2),
++    CatalogFigure(1041, "Soaring Chariot", 27, true, "Axe Chariot", 3),
++    CatalogFigure(1042, "Shelob the Great", 27, true, "Shelob the Great", 1),
++    CatalogFigure(1043, "8-Legged Stalker", 27, true, "Shelob the Great", 2),
++    CatalogFigure(1044, "Poison Slinger", 27, true, "Shelob the Great", 3),
++    CatalogFigure(1045, "Homer's Car", 29, true, "Homer's Car", 1),
++    CatalogFigure(1046, "The Homercraft", 29, true, "Homer's Car", 2),
++    CatalogFigure(1047, "The SubmaHomer", 29, true, "Homer's Car", 3),
++    CatalogFigure(1048, "Taunt-o-Vision", 29, true, "Taunt-O-Vision", 1),
++    CatalogFigure(1049, "Blast Cam", 29, true, "Taunt-O-Vision", 2),
++    CatalogFigure(1050, "The MechaHomer", 29, true, "Taunt-O-Vision", 3),
++    CatalogFigure(1051, "Velociraptor", 12, true, "Velociraptor", 1),
++    CatalogFigure(1052, "Spike Attack Raptor", 12, true, "Velociraptor", 2),
++    CatalogFigure(1053, "Venom Raptor", 12, true, "Velociraptor", 3),
++    CatalogFigure(1054, "Gyrosphere", 12, true, "Gyrosphere", 1),
++    CatalogFigure(1055, "Sonic Beam Gyrosphere", 12, true, "Gyrosphere", 2),
++    CatalogFigure(1056, "Gyrosphere", 12, true, "Gyrosphere", 1),
++    CatalogFigure(1057, "Clown Bike", 29, true, "Clown Bike", 1),
++    CatalogFigure(1058, "Cannon Bike", 29, true, "Clown Bike", 2),
++    CatalogFigure(1059, "Anti-Gravity Rocket Bike", 29, true, "Clown Bike", 3),
++    CatalogFigure(1060, "Mighty Lion Rider", 14, true, "Mighty Lion Rider", 1),
++    CatalogFigure(1061, "Lion Blazer", 14, true, "Mighty Lion Rider", 2),
++    CatalogFigure(1062, "Fire Lion", 14, true, "Mighty Lion Rider", 3),
++    CatalogFigure(1063, "Arrow Launcher", 27, true, "Arrow Launcher", 1),
++    CatalogFigure(1064, "Seeking Shooter", 27, true, "Arrow Launcher", 2),
++    CatalogFigure(1065, "Triple Ballista", 27, true, "Arrow Launcher", 3),
++    CatalogFigure(1066, "Mystery Machine", 20, true, "Mystery Machine", 1),
++    CatalogFigure(1067, "Mystery Tow & Go", 20, true, "Mystery Machine", 2),
++    CatalogFigure(1068, "Mystery Monster", 20, true, "Mystery Machine", 3),
++    CatalogFigure(1069, "Boulder Bomber", 18, true, "Boulder Bomber", 1),
++    CatalogFigure(1070, "Boulder Blaster", 18, true, "Boulder Bomber", 2),
++    CatalogFigure(1071, "Cyclone Jet", 18, true, "Boulder Bomber", 3),
++    CatalogFigure(1072, "Storm Fighter", 18, true, "Storm Fighter", 1),
++    CatalogFigure(1073, "Lightning Jet", 18, true, "Storm Fighter", 2),
++    CatalogFigure(1074, "Electro-Shooter", 18, true, "Storm Fighter", 3),
++    CatalogFigure(1075, "Blade Bike", 18, true, "Blade Bike", 1),
++    CatalogFigure(1076, "Flight Fire Bike", 18, true, "Blade Bike", 2),
++    CatalogFigure(1077, "Blades of Fire", 18, true, "Blade Bike", 3),
++    CatalogFigure(1078, "Samurai Mech", 18, true, "Samurai Mech", 1),
++    CatalogFigure(1079, "Samurai Shooter", 18, true, "Samurai Mech", 2),
++    CatalogFigure(1080, "Soaring Samurai Mech", 18, true, "Samurai Mech", 3),
++    CatalogFigure(1081, "Companion Cube", 19, true, "Companion Cube", 1),
++    CatalogFigure(1082, "Laser Deflector", 19, true, "Companion Cube", 2),
++    CatalogFigure(1083, "Gold Heart Emitter", 19, true, "Companion Cube", 3),
++    CatalogFigure(1084, "Sentry Turret", 19, true, "Sentry Turret", 1),
++    CatalogFigure(1085, "Turret Striker", 19, true, "Sentry Turret", 2),
++    CatalogFigure(1086, "Flight Turret Carrier", 19, true, "Sentry Turret", 3),
++    CatalogFigure(1087, "Scooby Snack", 20, true, "Scooby Snack", 1),
++    CatalogFigure(1088, "Scooby Fire Snack", 20, true, "Scooby Snack", 2),
++    CatalogFigure(1089, "Scooby Ghost Snack", 20, true, "Scooby Snack", 3),
++    CatalogFigure(1090, "Cloud Cuckoo Car", 26, true, "Cloud Cuckoo Car", 1),
++    CatalogFigure(1091, "X-Stream Soaker", 26, true, "Cloud Cuckoo Car", 2),
++    CatalogFigure(1092, "Rainbow Cannon", 26, true, "Cloud Cuckoo Car", 3),
++    CatalogFigure(1093, "Invisible Jet", 4, true, "Wonder Woman's Invisible Jet", 1),
++    CatalogFigure(1094, "Laser Shooter", 4, true, "Wonder Woman's Invisible Jet", 2),
++    CatalogFigure(1095, "Torpedo Bomber", 4, true, "Wonder Woman's Invisible Jet", 3),
++    CatalogFigure(1096, "NinjaCopter", 18, true, "NinjaCopter", 1),
++    CatalogFigure(1097, "Glaciator", 18, true, "NinjaCopter", 2),
++    CatalogFigure(1098, "Freeze Fighter", 18, true, "NinjaCopter", 3),
++    CatalogFigure(1099, "Travelling Time Train", 2, true, "Travelling Time Train", 1),
++    CatalogFigure(1100, "Flight Time Train", 2, true, "Travelling Time Train", 2),
++    CatalogFigure(1101, "Missile Blast Time Train", 2, true, "Travelling Time Train", 3),
++    CatalogFigure(1102, "Aqua Watercraft", 4, true, "Aqua Watercraft", 1),
++    CatalogFigure(1103, "Seven Seas Speeder", 4, true, "Aqua Watercraft", 2),
++    CatalogFigure(1104, "Trident of Fire", 4, true, "Aqua Watercraft", 3),
++    CatalogFigure(1105, "Drill Driver", 4, true, "Bane's Drill Diver", 1),
++    CatalogFigure(1106, "Bane Dig 'n' Drill", 4, true, "Bane's Drill Diver", 2),
++    CatalogFigure(1107, "Bane Drill 'n' Blast", 4, true, "Bane's Drill Diver", 3),
++    CatalogFigure(1108, "Quinn Mobile", 4, true, "Quinn Mobile", 1),
++    CatalogFigure(1109, "Quinn Ultra Racer", 4, true, "Quinn Mobile", 2),
++    CatalogFigure(1110, "Missile Launcher", 4, true, "Quinn Mobile", 3),
++    CatalogFigure(1111, "The Joker's Chopper", 4, true, "The Joker's Chopper", 1),
++    CatalogFigure(1112, "Mischievous Missile Blaster", 4, true, "The Joker's Chopper", 2),
++    CatalogFigure(1113, "Lock 'n' Laser Jet", 4, true, "The Joker's Chopper", 3),
++    CatalogFigure(1114, "Hover Pod", 4, true, "Superman's Hover Pod", 1),
++    CatalogFigure(1115, "Krypton Striker", 4, true, "Superman's Hover Pod", 2),
++    CatalogFigure(1116, "Super Stealth Pod", 4, true, "Superman's Hover Pod", 3),
++    CatalogFigure(1117, "Dalek", 5, true, "Dalek", 1),
++    CatalogFigure(1118, "Fire 'n' Ride Dalek", 5, true, "Dalek", 2),
++    CatalogFigure(1119, "Silver Shooter Dalek", 5, true, "Dalek", 3),
++    CatalogFigure(1120, "Ecto-1", 8, true, "Ecto-1", 1),
++    CatalogFigure(1121, "Ecto-1 Blaster", 8, true, "Ecto-1", 2),
++    CatalogFigure(1122, "Ecto-1 Water Diver", 8, true, "Ecto-1", 3),
++    CatalogFigure(1123, "Ghost Trap", 8, true, "Ghost Trap", 1),
++    CatalogFigure(1124, "Ghost Stun 'n' Trap", 8, true, "Ghost Trap", 2),
++    CatalogFigure(1125, "Proton Zapper", 8, true, "Ghost Trap", 3),
++    CatalogFigure(1132, "Lloyd's Golden Dragon", 18, true, "Lloyd's Golden Dragon", 1),
++    CatalogFigure(1133, "Sword Projector Dragon", 18, true, "Lloyd's Golden Dragon", 2),
++    CatalogFigure(1144, "Mega Flight Dragon", 18, true, "Lloyd's Golden Dragon", 3),
++    CatalogFigure(1155, "Flying White Dragon", 18, true, "Flying White Dragon", 1),
++    CatalogFigure(1156, "Golden Fire Dragon", 18, true, "Flying White Dragon", 2),
++    CatalogFigure(1157, "Ultra Destruction Dragon", 18, true, "Flying White Dragon", 3),
++    CatalogFigure(1158, "Arcade Machine", 16, true, "Arcade Machine", 1),
++    CatalogFigure(1159, "8-Bit Shooter", 16, true, "Arcade Machine", 2),
++    CatalogFigure(1160, "The Pixelator", 16, true, "Arcade Machine", 3),
++    CatalogFigure(1161, "G-6155 Spy Hunter", 16, true, "G-6155 Spy Hunter", 1),
++    CatalogFigure(1162, "Interdiver", 16, true, "G-6155 Spy Hunter", 2),
++    CatalogFigure(1163, "Aerial Spyhunter", 16, true, "G-6155 Spy Hunter", 3),
++    CatalogFigure(1164, "Slime Shooter", 8, true, "Slime Shooter", 1),
++    CatalogFigure(1165, "Slime Exploder", 8, true, "Slime Shooter", 2),
++    CatalogFigure(1166, "Slime Streamer", 8, true, "Slime Shooter", 3),
++    CatalogFigure(1167, "Terror Dog", 8, true, "Terror Dog", 1),
++    CatalogFigure(1168, "Terror Dog Destroyer", 8, true, "Terror Dog", 2),
++    CatalogFigure(1169, "Soaring Terror Dog", 8, true, "Terror Dog", 3),
++    CatalogFigure(1170, "Ancient Psychic Tandem War Elephant", 1, true, "Ancient Psychic Tandem War Elephant", 1),
++    CatalogFigure(1171, "Cosmic Squid", 1, true, "Ancient Psychic Tandem War Elephant", 2),
++    CatalogFigure(1172, "Psychic Submarine", 1, true, "Ancient Psychic Tandem War Elephant", 3),
++    CatalogFigure(1173, "BMO", 1, true, "BMO", 1),
++    CatalogFigure(1174, "DOGMO", 1, true, "BMO", 2),
++    CatalogFigure(1175, "SNAKEMO", 1, true, "BMO", 3),
++    CatalogFigure(1176, "Jakemobile", 1, true, "Jakemobile", 1),
++    CatalogFigure(1177, "Snail Dude Jake", 1, true, "Jakemobile", 2),
++    CatalogFigure(1178, "Hover Jake", 1, true, "Jakemobile", 3),
++    CatalogFigure(1179, "Lumpy Car", 1, true, "Lumpy Car", 1),
++    CatalogFigure(1180, "Lumpy Truck", 1, true, "Lumpy Car", 2),
++    CatalogFigure(1181, "Lumpy Land Whale", 1, true, "Lumpy Car", 3),
++    CatalogFigure(1182, "Lunatic Amp", 1, true, "Lunatic Amp", 1),
++    CatalogFigure(1183, "Shadow Scorpion", 1, true, "Lunatic Amp", 2),
++    CatalogFigure(1184, "Heavy Metal Monster", 1, true, "Lunatic Amp", 3),
++    CatalogFigure(1185, "B.A.'s Van", 23, true, "B. A. 's Van", 1),
++    CatalogFigure(1186, "Fool Smasher", 23, true, "B. A. 's Van", 2),
++    CatalogFigure(1187, "Pain Plane", 23, true, "B. A. 's Van", 3),
++    CatalogFigure(1188, "Phone Home", 6, true, "Phone Home", 1),
++    CatalogFigure(1189, "Mobile Uplink", 6, true, "Phone Home", 2),
++    CatalogFigure(1190, "Super-Charged Satellite", 6, true, "Phone Home", 3),
++    CatalogFigure(1191, "Niffler", 7, true, "Niffler", 1),
++    CatalogFigure(1192, "Sinister Scorpion", 7, true, "Niffler", 2),
++    CatalogFigure(1193, "Vicious Vulture", 7, true, "Niffler", 3),
++    CatalogFigure(1194, "Swooping Evil", 7, true, "Swooping Evil", 1),
++    CatalogFigure(1195, "Brutal Bloom", 7, true, "Swooping Evil", 2),
++    CatalogFigure(1196, "Crawling Creeper", 7, true, "Swooping Evil", 3),
++    CatalogFigure(1197, "Ecto-1 (2016)", 9, true, "Ecto-1 (2016)", 1),
++    CatalogFigure(1198, "Ectozer", 9, true, "Ecto-1 (2016)", 2),
++    CatalogFigure(1199, "PerfEcto", 9, true, "Ecto-1 (2016)", 3),
++    CatalogFigure(1200, "Flash 'n' Finish", 10, true, "Flash 'n' Finish", 1),
++    CatalogFigure(1201, "Rampage Record Player", 10, true, "Flash 'n' Finish", 2),
++    CatalogFigure(1202, "Stripe's Throne", 10, true, "Flash 'n' Finish", 3),
++    CatalogFigure(1203, "R.C. Racer", 10, true, "R.C. Racer", 1),
++    CatalogFigure(1204, "Gadget-O-Matic", 10, true, "R.C. Racer", 2),
++    CatalogFigure(1205, "Scarlet Scorpion", 10, true, "R.C. Racer", 3),
++    CatalogFigure(1206, "Hogwarts Express", 11, true, "Hogwarts Express", 1),
++    CatalogFigure(1207, "Soaring Steam Plane", 11, true, "Hogwarts Express", 2),
++    CatalogFigure(1208, "Steam Warrior", 11, true, "Hogwarts Express", 3),
++    CatalogFigure(1209, "Enchanted Car", 11, true, "Enchanted Car", 1),
++    CatalogFigure(1210, "Shark Sub", 11, true, "Enchanted Car", 2),
++    CatalogFigure(1211, "Monstrous Mouth", 11, true, "Enchanted Car", 3),
++    CatalogFigure(1212, "IMF Scrambler", 17, true, "IMF Scrambler", 1),
++    CatalogFigure(1213, "Shock Cycle", 17, true, "IMF Scrambler", 2),
++    CatalogFigure(1214, "IMF Covert Jet", 17, true, "IMF Scrambler", 3),
++    CatalogFigure(1215, "IMF Sports Car", 17, true, "IMF Sport Car", 1),
++    CatalogFigure(1216, "IMF Tank", 17, true, "IMF Sport Car", 2),
++    CatalogFigure(1217, "IMF Splorer", 17, true, "IMF Sport Car", 3),
++    CatalogFigure(1218, "Sonic Speedster", 21, true, "Sonic Speedster", 1),
++    CatalogFigure(1219, "Blue Typhoon", 21, true, "Sonic Speedster", 2),
++    CatalogFigure(1220, "Moto Bug", 21, true, "Sonic Speedster", 3),
++    CatalogFigure(1221, "The Tornado", 21, true, "The Tornado", 1),
++    CatalogFigure(1222, "Crabmeat", 21, true, "The Tornado", 2),
++    CatalogFigure(1223, "Eggcatcher", 21, true, "The Tornado", 3),
++    CatalogFigure(1224, "K.I.T.T.", 13, true, "K.I.T.T.", 1),
++    CatalogFigure(1225, "Goliath Armored Semi", 13, true, "K.I.T.T.", 2),
++    CatalogFigure(1226, "K.I.T.T. Jet", 13, true, "K.I.T.T.", 3),
++    CatalogFigure(1227, "Police Helicopter", 15, true, "Police Helicopter", 1),
++    CatalogFigure(1228, "Police Hovercraft", 15, true, "Police Helicopter", 2),
++    CatalogFigure(1229, "Police Plane", 15, true, "Police Helicopter", 3),
++    CatalogFigure(1230, "Bionic Steed", 25, true, "Bionic Steed", 1),
++    CatalogFigure(1231, "Bat-Raptor", 25, true, "Bionic Steed", 2),
++    CatalogFigure(1232, "Ultrabat", 25, true, "Bionic Steed", 3),
++    CatalogFigure(1233, "Batwing", 25, true, "Batwing", 1),
++    CatalogFigure(1234, "The Black Thunder", 25, true, "Batwing", 2),
++    CatalogFigure(1235, "Bat-Tank", 25, true, "Batwing", 3),
++    CatalogFigure(1236, "Skeleton Organ", 24, true, "Skeleton Organ", 1),
++    CatalogFigure(1237, "Skeleton Jukebox", 24, true, "Skeleton Organ", 2),
++    CatalogFigure(1238, "Skele-Turkey", 24, true, "Skeleton Organ", 3),
++    CatalogFigure(1239, "One-Eyed Willy's Pirate Ship", 24, true, "One Eyed Willy Pirate Ship", 1),
++    CatalogFigure(1240, "Fanged Fortune", 24, true, "One Eyed Willy Pirate Ship", 2),
++    CatalogFigure(1241, "Inferno Cannon", 24, true, "One Eyed Willy Pirate Ship", 3),
++    CatalogFigure(1242, "Buckbeak", 11, true, "Buckbeak", 1),
++    CatalogFigure(1243, "Giant Owl", 11, true, "Buckbeak", 2),
++    CatalogFigure(1244, "Fierce Falcon", 11, true, "Buckbeak", 3),
++    CatalogFigure(1245, "Saturn's Sandworm", 3, true, "Saturns Sandworm", 1),
++    CatalogFigure(1246, "Spooky Spider", 3, true, "Saturns Sandworm", 2),
++    CatalogFigure(1247, "Haunted Vacuum", 3, true, "Saturns Sandworm", 3),
++    CatalogFigure(1248, "PPG Smartphone", 28, true, "PPG Smartphone", 1),
++    CatalogFigure(1249, "PPG Hotline", 28, true, "PPG Smartphone", 2),
++    CatalogFigure(1250, "Powerpuff Mag-Net", 28, true, "PPG Smartphone", 3),
++    CatalogFigure(1251, "Ka-Pow Cannon", 28, true, "Mega Blast Bot", 3),
++    CatalogFigure(1252, "Slammin' Guitar", 28, true, "Mega Blast Bot", 2),
++    CatalogFigure(1253, "Mega Blast Bot", 28, true, "Mega Blast Bot", 1),
++    CatalogFigure(1254, "Octi", 28, true, "Octi", 1),
++    CatalogFigure(1255, "Super Skunk", 28, true, "Octi", 2),
++    CatalogFigure(1256, "Sonic Squid", 28, true, "Octi", 3),
++    CatalogFigure(1257, "T-Car", 22, true, "T-Car", 1),
++    CatalogFigure(1258, "T-Forklift", 22, true, "T-Car", 2),
++    CatalogFigure(1259, "T-Plane", 22, true, "T-Car", 3),
++    CatalogFigure(1260, "Spellbook of Azarath", 22, true, "Spellbook of Azarath", 1),
++    CatalogFigure(1261, "Raven Wings", 22, true, "Spellbook of Azarath", 2),
++    CatalogFigure(1262, "Giant Hand", 22, true, "Spellbook of Azarath", 3),
++    CatalogFigure(1263, "Titan Robot", 22, true, "Titan Robot", 1),
++    CatalogFigure(1264, "T-Rocket", 22, true, "Titan Robot", 2),
++    CatalogFigure(1265, "Robot Retriever", 22, true, "Titan Robot", 3),
++)
++
++val CATALOG_BY_ID: Map<Int, CatalogFigure> = CATALOG.associateBy { it.id }
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 new file mode 100644
-index 00000000..aa53a27f
+index 00000000..0e397e4d
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,325 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import android.content.Context
@@ -1308,7 +1704,13 @@ index 00000000..aa53a27f
 +    "https://raw.githubusercontent.com/skylandersNFC/LEGO-Dimensions-NFC/main/Dimensions_Images/images/Separate/Chteupnin%27s%20Assets/"
 +
 +/** Round head (character) or vehicle pictures from the community LEGO-Dimensions-NFC collection. */
-+val FigureImages = RemoteImageCache("figures", 256) { "$FIGURE_PICTURES_URL$it.png" }
++val FigureImages = RemoteImageCache("figures", 256) { id ->
++    val picture = if (id == 769) 46 else id // Supergirl Red Lantern uses Supergirl's picture
++    "$FIGURE_PICTURES_URL$picture.png"
++}
++
++/** Franchise logos (from the community LegoToypad project), by franchise index (1-based). */
++val FranchiseLogos = RemoteImageCache("logos", 400) { FRANCHISES.getOrNull(it - 1)?.logoUrl }
 +
 +/** Drawings of each character's Toy Tag from the LEGO Dimensions Wiki (characters only). */
 +private val TOY_TAG_URLS: Map<Int, String> = mapOf(
@@ -1395,13 +1797,18 @@ index 00000000..aa53a27f
 +
 +/** Figure numbers of installed figure files, read once per file. */
 +object FigureNumbers {
-+    private val byPath = ConcurrentHashMap<String, Int>()
++    private val byFile = ConcurrentHashMap<String, Int>()
 +
-+    fun forPath(path: String): Int = byPath.getOrPut(path) {
-+        try {
-+            NativeEmulatedUSBDevices.getDimensionsFigureNumber(path)
-+        } catch (_: Throwable) {
-+            -1
++    // keyed by the file's last change too: the game rewrites a vehicle's number when it's rebuilt
++    fun forPath(path: String): Int {
++        val file = File(path)
++        val key = "$path|${file.lastModified()}|${file.length()}"
++        return byFile.getOrPut(key) {
++            try {
++                NativeEmulatedUSBDevices.getDimensionsFigureNumber(path)
++            } catch (_: Throwable) {
++                -1
++            }
 +        }
 +    }
 +}
@@ -1421,6 +1828,9 @@ index 00000000..aa53a27f
 +
 +@Composable
 +fun rememberToyTagImage(id: Int): ImageBitmap? = rememberRemoteImage(ToyTagImages, id)
++
++@Composable
++fun rememberFranchiseLogo(index: Int): ImageBitmap? = rememberRemoteImage(FranchiseLogos, index)
 +
 +/** Optional picture behind the Toy Pad screen, chosen in the Emulated USB Devices settings. */
 +object ToyPadBackgroundImage {
@@ -1623,10 +2033,10 @@ index 00000000..1b23271a
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..156fd51d
+index 00000000..0382fe18
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,688 @@
+@@ -0,0 +1,917 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -1641,6 +2051,10 @@ index 00000000..156fd51d
 +import androidx.compose.foundation.clickable
 +import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Box
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.foundation.lazy.LazyRow
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.layout.Spacer
 +import androidx.compose.foundation.layout.BoxWithConstraints
 +import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.PaddingValues
@@ -1656,6 +2070,7 @@ index 00000000..156fd51d
 +import androidx.compose.foundation.lazy.grid.GridItemSpan
 +import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 +import androidx.compose.foundation.lazy.grid.items
++import androidx.compose.foundation.lazy.items as lazyRowItems
 +import androidx.compose.foundation.shape.CircleShape
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material3.Button
@@ -1704,7 +2119,19 @@ index 00000000..156fd51d
 +
 +private data class PadLightState(val rgb: Int, val mode: Int, val param1: Int, val param2: Int)
 +
-+private data class FigureEntry(val figure: NativeEmulatedUSBDevices.InstalledFigure, val number: Int)
++/** One figure in the collection: everything in the catalog, plus any figure file that isn't in it. */
++private data class FigureEntry(
++    val id: Int,
++    val name: String,
++    val franchise: Int,
++    val isVehicle: Boolean,
++    val family: String,
++    val build: Int,
++    val otherPath: String? = null, // only for figure files that aren't in the catalog
++)
++
++private val CATALOG_ENTRIES: List<FigureEntry> =
++    CATALOG.map { FigureEntry(it.id, it.name, it.franchise, it.isVehicle, it.family, it.build) }
 +
 +private fun readSlots(): List<SlotInfo?> =
 +    List(NativeEmulatedUSBDevices.MAX_DIMENSIONS_SLOTS) { index ->
@@ -1714,7 +2141,7 @@ index 00000000..156fd51d
 +        } catch (_: Throwable) {
 +            -1
 +        }
-+        SlotInfo(name, number)
++        SlotInfo(CATALOG_BY_ID[number]?.name ?: name, number)
 +    }
 +
 +private fun readLights(): List<PadLightState> {
@@ -1733,10 +2160,30 @@ index 00000000..156fd51d
 +    }
 +}
 +
-+private fun readFigures(): List<FigureEntry> =
-+    NativeEmulatedUSBDevices.getInstalledDimensionsMiniFigures()
-+        .map { FigureEntry(it, FigureNumbers.forPath(it.path)) }
-+        .sortedWith(compareBy({ it.number >= 1000 }, { it.figure.name.lowercase() }))
++/** Figure files on the device: figure number -> file (first one by name), plus files that aren't in the catalog. */
++private data class InstalledFigures(val pathById: Map<Int, String>, val others: List<FigureEntry>)
++
++private fun readInstalledFigures(): InstalledFigures {
++    val files = try {
++        NativeEmulatedUSBDevices.getInstalledDimensionsMiniFigures().sortedBy { it.name.lowercase() }
++    } catch (_: Throwable) {
++        emptyList()
++    }
++    val pathById = HashMap<Int, String>()
++    val others = ArrayList<FigureEntry>()
++    for (file in files) {
++        val id = FigureNumbers.forPath(file.path)
++        if (CATALOG_BY_ID.containsKey(id)) {
++            pathById.putIfAbsent(id, file.path)
++        } else {
++            others.add(FigureEntry(id, file.name, 0, id >= 1000, "", 0, otherPath = file.path))
++        }
++    }
++    return InstalledFigures(pathById, others)
++}
++
++/** Letters and digits only, lower case, so "Ka-Pow" matches "kapow". */
++private fun searchKey(text: String) = text.lowercase().filter { it.isLetterOrDigit() }
 +
 +// light index for a pad number: 1 = center -> 0, 2 = left -> 1, 3 = right -> 2
 +private fun lightIndexForPad(pad: Int) = (pad - 1).coerceIn(0, 2)
@@ -1745,11 +2192,14 @@ index 00000000..156fd51d
 +fun ToyPadScreen() {
 +    var slots by remember { mutableStateOf(readSlots()) }
 +    var lights by remember { mutableStateOf(readLights()) }
-+    var figures by remember { mutableStateOf(readFigures()) }
++    var installed by remember { mutableStateOf(readInstalledFigures()) }
 +    var selectedSlot by remember { mutableStateOf<Int?>(null) }
 +    var selectedFigure by remember { mutableStateOf<FigureEntry?>(null) }
 +    var moveSource by remember { mutableStateOf<Int?>(null) }
 +    var errorMessage by remember { mutableStateOf<String?>(null) }
++    var franchise by remember { mutableIntStateOf(0) } // 0 = all
++    var query by remember { mutableStateOf("") }
++    var typing by remember { mutableStateOf(false) }
 +
 +    LaunchedEffect(Unit) {
 +        var tick = 0
@@ -1757,7 +2207,7 @@ index 00000000..156fd51d
 +            slots = readSlots()
 +            lights = readLights()
 +            if (tick % 16 == 0) {
-+                figures = readFigures()
++                installed = readInstalledFigures()
 +            }
 +            tick++
 +            delay(250)
@@ -1773,9 +2223,34 @@ index 00000000..156fd51d
 +        selectedFigure = null
 +    }
 +
++    /** Path of the figure file for this entry, making the figure the first time it's used. */
++    fun pathFor(entry: FigureEntry): String? {
++        entry.otherPath?.let { return it }
++        installed.pathById[entry.id]?.let { return it }
++        val created = try {
++            NativeEmulatedUSBDevices.createDimensionsFigure(entry.id.toLong())
++        } catch (_: Throwable) {
++            false
++        }
++        if (!created) return null
++        installed = readInstalledFigures()
++        return installed.pathById[entry.id]
++    }
++
 +    fun loadFigure(entry: FigureEntry, index: Int) {
-+        val ok = NativeEmulatedUSBDevices.loadDimensionsFigure(entry.figure.path, SLOT_PADS[index], index)
-+        errorMessage = if (ok) null else "Couldn't place ${entry.figure.name}"
++        // a figure can only be in one place: if it's already on the pad, move it instead
++        val current = if (entry.id > 0) slots.indexOfFirst { it?.number == entry.id } else -1
++        if (current >= 0) {
++            if (current != index) {
++                NativeEmulatedUSBDevices.tempRemoveDimensionsFigure(current)
++                NativeEmulatedUSBDevices.moveDimensionsFigure(SLOT_PADS[index], index, SLOT_PADS[current], current)
++            }
++            errorMessage = null
++        } else {
++            val path = pathFor(entry)
++            val ok = path != null && NativeEmulatedUSBDevices.loadDimensionsFigure(path, SLOT_PADS[index], index)
++            errorMessage = if (ok) null else "Couldn't place ${entry.name}"
++        }
 +        clearSelection()
 +        refresh()
 +    }
@@ -1789,6 +2264,7 @@ index 00000000..156fd51d
 +
 +    fun onSlotTapped(index: Int) {
 +        errorMessage = null
++        typing = false
 +        val source = moveSource
 +        if (source != null) {
 +            if (source == index) {
@@ -1811,6 +2287,7 @@ index 00000000..156fd51d
 +
 +    fun onFigureTapped(entry: FigureEntry) {
 +        errorMessage = null
++        typing = false
 +        if (moveSource != null) return
 +        val slot = selectedSlot
 +        if (slot != null) {
@@ -1833,9 +2310,23 @@ index 00000000..156fd51d
 +        selectedFigure = null
 +    }
 +
-+    val onPadNumbers = slots.mapNotNull { it?.number }.toSet()
-+    val characters = figures.filter { it.number < 1000 }
-+    val vehicles = figures.filter { it.number >= 1000 }
++    val onPadNumbers = slots.mapNotNull { it?.number }.filter { it > 0 }.toSet()
++    val allEntries = remember(installed) { CATALOG_ENTRIES + installed.others }
++    val key = searchKey(query)
++    val shown = remember(allEntries, franchise, key) {
++        allEntries.filter { e ->
++            (franchise == 0 || e.franchise == franchise) &&
++                    (key.isEmpty() || searchKey(e.name).contains(key) ||
++                            searchKey(FRANCHISES.getOrNull(e.franchise - 1)?.name ?: "").contains(key))
++        }
++    }
++    val characters = remember(shown) { shown.filter { !it.isVehicle }.sortedBy { it.name.lowercase() } }
++    val vehicles = remember(shown, franchise) {
++        val list = shown.filter { it.isVehicle }
++        // inside a franchise keep each vehicle's three builds together; otherwise A to Z
++        if (franchise != 0) list.sortedWith(compareBy({ it.family.lowercase() }, { it.build }, { it.name.lowercase() }))
++        else list.sortedBy { it.name.lowercase() }
++    }
 +
 +    Box(modifier = Modifier.fillMaxSize()) {
 +        ToyPadBackground()
@@ -1846,80 +2337,92 @@ index 00000000..156fd51d
 +                .padding(horizontal = 12.dp, vertical = 10.dp),
 +            verticalArrangement = Arrangement.spacedBy(8.dp)
 +        ) {
-+            Row(verticalAlignment = Alignment.CenterVertically) {
-+                Text(
-+                    text = "LEGO Dimensions Toy Pad",
-+                    style = MaterialTheme.typography.titleMedium,
-+                    fontWeight = FontWeight.SemiBold,
-+                    color = TextOnBackground,
++            if (!typing) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text(
++                        text = "LEGO Dimensions Toy Pad",
++                        style = MaterialTheme.typography.titleMedium,
++                        fontWeight = FontWeight.SemiBold,
++                        color = TextOnBackground,
++                    )
++                }
++
++                // the pad
++                Row(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .weight(1.35f),
++                    horizontalArrangement = Arrangement.spacedBy(8.dp),
++                ) {
++                    SidePad(
++                        slotIndices = LEFT_SLOTS,
++                        innerOnRight = true,
++                        light = lights[lightIndexForPad(2)],
++                        slots = slots,
++                        selectedSlot = selectedSlot,
++                        moveSource = moveSource,
++                        onSlotTapped = ::onSlotTapped,
++                        modifier = Modifier
++                            .weight(1f)
++                            .fillMaxHeight(),
++                    )
++                    CenterPad(
++                        light = lights[lightIndexForPad(1)],
++                        slot = slots[CENTER_SLOT],
++                        isSelected = selectedSlot == CENTER_SLOT,
++                        isMoveSource = moveSource == CENTER_SLOT,
++                        onTap = { onSlotTapped(CENTER_SLOT) },
++                        modifier = Modifier
++                            .weight(0.95f)
++                            .fillMaxHeight(),
++                    )
++                    SidePad(
++                        slotIndices = RIGHT_SLOTS,
++                        innerOnRight = false,
++                        light = lights[lightIndexForPad(3)],
++                        slots = slots,
++                        selectedSlot = selectedSlot,
++                        moveSource = moveSource,
++                        onSlotTapped = ::onSlotTapped,
++                        modifier = Modifier
++                            .weight(1f)
++                            .fillMaxHeight(),
++                    )
++                }
++
++                // what to do next
++                ActionBar(
++                    slots = slots,
++                    selectedSlot = selectedSlot,
++                    selectedFigure = selectedFigure,
++                    moveSource = moveSource,
++                    errorMessage = errorMessage,
++                    onMove = ::onMove,
++                    onRemove = ::onRemove,
++                    onCancel = {
++                        if (moveSource != null) cancelMove() else clearSelection()
++                    },
 +                )
 +            }
 +
-+            // the pad
-+            Row(
-+                modifier = Modifier
-+                    .fillMaxWidth()
-+                    .weight(1.35f),
-+                horizontalArrangement = Arrangement.spacedBy(8.dp),
-+            ) {
-+                SidePad(
-+                    slotIndices = LEFT_SLOTS,
-+                    innerOnRight = true,
-+                    light = lights[lightIndexForPad(2)],
-+                    slots = slots,
-+                    selectedSlot = selectedSlot,
-+                    moveSource = moveSource,
-+                    onSlotTapped = ::onSlotTapped,
-+                    modifier = Modifier
-+                        .weight(1f)
-+                        .fillMaxHeight(),
-+                )
-+                CenterPad(
-+                    light = lights[lightIndexForPad(1)],
-+                    slot = slots[CENTER_SLOT],
-+                    isSelected = selectedSlot == CENTER_SLOT,
-+                    isMoveSource = moveSource == CENTER_SLOT,
-+                    onTap = { onSlotTapped(CENTER_SLOT) },
-+                    modifier = Modifier
-+                        .weight(0.95f)
-+                        .fillMaxHeight(),
-+                )
-+                SidePad(
-+                    slotIndices = RIGHT_SLOTS,
-+                    innerOnRight = false,
-+                    light = lights[lightIndexForPad(3)],
-+                    slots = slots,
-+                    selectedSlot = selectedSlot,
-+                    moveSource = moveSource,
-+                    onSlotTapped = ::onSlotTapped,
-+                    modifier = Modifier
-+                        .weight(1f)
-+                        .fillMaxHeight(),
-+                )
-+            }
-+
-+            // what to do next
-+            ActionBar(
-+                slots = slots,
-+                selectedSlot = selectedSlot,
-+                selectedFigure = selectedFigure,
-+                moveSource = moveSource,
-+                errorMessage = errorMessage,
-+                onMove = ::onMove,
-+                onRemove = ::onRemove,
-+                onCancel = {
-+                    if (moveSource != null) cancelMove() else clearSelection()
-+                },
++            SearchBox(
++                query = query,
++                typing = typing,
++                onTap = { typing = true },
++                onClear = { query = "" },
 +            )
 +
-+            // figure collection
-+            if (figures.isEmpty()) {
-+                Text(
-+                    text = "No figures yet. Create figures in the emulated USB devices menu in the game's menu.",
-+                    style = MaterialTheme.typography.bodyMedium,
-+                    color = TextOnBackground,
++            if (typing) {
++                OnScreenKeyboard(
++                    onKey = { query += it },
++                    onBackspace = { if (query.isNotEmpty()) query = query.dropLast(1) },
++                    onDone = { typing = false },
 +                )
++            } else {
++                FranchiseStrip(selected = franchise, onSelect = { franchise = it })
 +            }
++
++            // figure collection
 +            LazyVerticalGrid(
 +                columns = GridCells.Adaptive(minSize = 84.dp),
 +                modifier = Modifier
@@ -1931,29 +2434,165 @@ index 00000000..156fd51d
 +                horizontalArrangement = Arrangement.spacedBy(4.dp),
 +                verticalArrangement = Arrangement.spacedBy(6.dp),
 +            ) {
++                if (characters.isEmpty() && vehicles.isEmpty()) {
++                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Nothing matches \"$query\"") }
++                }
 +                if (characters.isNotEmpty()) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Characters (${characters.size})") }
-+                    items(characters, key = { it.figure.path }) { entry ->
++                    items(characters, key = { "c${it.id}${it.otherPath ?: ""}" }) { entry ->
 +                        FigureTile(
 +                            entry = entry,
 +                            isSelected = selectedFigure == entry,
-+                            isOnPad = entry.number > 0 && entry.number in onPadNumbers,
++                            isOnPad = entry.id in onPadNumbers,
 +                            onTap = { onFigureTapped(entry) },
 +                        )
 +                    }
 +                }
 +                if (vehicles.isNotEmpty()) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Vehicles and gadgets (${vehicles.size})") }
-+                    items(vehicles, key = { it.figure.path }) { entry ->
++                    items(vehicles, key = { "v${it.id}${it.otherPath ?: ""}" }) { entry ->
 +                        FigureTile(
 +                            entry = entry,
 +                            isSelected = selectedFigure == entry,
-+                            isOnPad = entry.number in onPadNumbers,
++                            isOnPad = entry.id in onPadNumbers,
 +                            onTap = { onFigureTapped(entry) },
 +                        )
 +                    }
 +                }
 +            }
++        }
++    }
++}
++
++@Composable
++private fun SearchBox(query: String, typing: Boolean, onTap: () -> Unit, onClear: () -> Unit) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .height(40.dp)
++            .clip(RoundedCornerShape(20.dp))
++            .background(Color(0x99060B1E))
++            .border(if (typing) 2.dp else 1.dp, if (typing) Color.White else Color(0x55FFFFFF), RoundedCornerShape(20.dp))
++            .clickable(onClick = onTap)
++            .padding(horizontal = 14.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Text(
++            text = when {
++                query.isNotEmpty() -> query + if (typing) "|" else ""
++                typing -> "|"
++                else -> "Search characters and vehicles"
++            },
++            color = if (query.isEmpty() && !typing) TextDim else TextOnBackground,
++            fontSize = 15.sp,
++            maxLines = 1,
++            overflow = TextOverflow.Ellipsis,
++            modifier = Modifier.weight(1f),
++        )
++        if (query.isNotEmpty()) {
++            Text(
++                text = "✕",
++                color = TextOnBackground,
++                fontSize = 16.sp,
++                modifier = Modifier
++                    .clip(CircleShape)
++                    .clickable(onClick = onClear)
++                    .padding(horizontal = 8.dp, vertical = 4.dp),
++            )
++        }
++    }
++}
++
++/** A small keyboard drawn on the Toy Pad screen itself, so typing never takes the controller away from the game. */
++@Composable
++private fun OnScreenKeyboard(onKey: (String) -> Unit, onBackspace: () -> Unit, onDone: () -> Unit) {
++    val rows = listOf("1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM")
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .clip(RoundedCornerShape(14.dp))
++            .background(Color(0xCC060B1E))
++            .padding(4.dp),
++        verticalArrangement = Arrangement.spacedBy(4.dp),
++    ) {
++        rows.forEachIndexed { rowIndex, row ->
++            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
++                if (rowIndex == 2) Spacer(Modifier.weight(0.5f))
++                for (c in row) {
++                    KeyboardKey(label = c.toString(), modifier = Modifier.weight(1f)) { onKey(c.toString()) }
++                }
++                if (rowIndex == 2) Spacer(Modifier.weight(0.5f))
++                if (rowIndex == 3) {
++                    KeyboardKey(label = "⌫", modifier = Modifier.weight(1.5f), onTap = onBackspace)
++                    KeyboardKey(label = "Done", modifier = Modifier.weight(1.5f), highlighted = true, onTap = onDone)
++                }
++            }
++        }
++        Row(modifier = Modifier.fillMaxWidth()) {
++            KeyboardKey(label = "space", modifier = Modifier.fillMaxWidth()) { onKey(" ") }
++        }
++    }
++}
++
++@Composable
++private fun KeyboardKey(label: String, modifier: Modifier = Modifier, highlighted: Boolean = false, onTap: () -> Unit) {
++    Box(
++        modifier = modifier
++            .height(38.dp)
++            .clip(RoundedCornerShape(8.dp))
++            .background(if (highlighted) Color(0xFF3D6BDB) else Color(0x33FFFFFF))
++            .clickable(onClick = onTap),
++        contentAlignment = Alignment.Center,
++    ) {
++        Text(text = label, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium)
++    }
++}
++
++/** "All" plus one logo per franchise; tap one to show only its characters and vehicles. */
++@Composable
++private fun FranchiseStrip(selected: Int, onSelect: (Int) -> Unit) {
++    LazyRow(
++        modifier = Modifier
++            .fillMaxWidth()
++            .height(52.dp),
++        horizontalArrangement = Arrangement.spacedBy(6.dp),
++    ) {
++        item(key = 0) {
++            FranchiseChip(index = 0, name = "All", isSelected = selected == 0, onTap = { onSelect(0) })
++        }
++        lazyRowItems(FRANCHISES, key = { it.index }) { f ->
++            FranchiseChip(index = f.index, name = f.name, isSelected = selected == f.index, onTap = { onSelect(if (selected == f.index) 0 else f.index) })
++        }
++    }
++}
++
++@Composable
++private fun FranchiseChip(index: Int, name: String, isSelected: Boolean, onTap: () -> Unit) {
++    val logo = if (index > 0) rememberFranchiseLogo(index) else null
++    val shape = RoundedCornerShape(12.dp)
++    Box(
++        modifier = Modifier
++            .width(if (index == 0) 64.dp else 112.dp)
++            .fillMaxHeight()
++            .clip(shape)
++            .background(if (isSelected) Color(0x993D6BDB) else Color(0x99060B1E))
++            .border(if (isSelected) 2.dp else 1.dp, if (isSelected) Color.White else Color(0x44FFFFFF), shape)
++            .clickable(onClick = onTap)
++            .padding(horizontal = 8.dp, vertical = 6.dp),
++        contentAlignment = Alignment.Center,
++    ) {
++        if (logo != null) {
++            Image(bitmap = logo, contentDescription = name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
++        } else {
++            Text(
++                text = name,
++                color = TextOnBackground,
++                fontSize = 11.sp,
++                fontWeight = FontWeight.SemiBold,
++                textAlign = TextAlign.Center,
++                maxLines = 2,
++                overflow = TextOverflow.Ellipsis,
++            )
 +        }
 +    }
 +}
@@ -2001,7 +2640,7 @@ index 00000000..156fd51d
 +            }
 +
 +            selectedFigure != null -> {
-+                prompt = "Tap a spot on the pad for ${selectedFigure.figure.name}"
++                prompt = "Tap a spot on the pad for ${selectedFigure.name}"
 +                showCancel = true
 +            }
 +
@@ -2284,8 +2923,8 @@ index 00000000..156fd51d
 +    ) {
 +        Box(modifier = Modifier.size(66.dp)) {
 +            Portrait(
-+                number = entry.number,
-+                name = entry.figure.name,
++                number = entry.id,
++                name = entry.name,
 +                ringColor = if (isSelected) Color.White else Bronze,
 +                ringWidth = if (isSelected) 3.dp else 2.dp,
 +                modifier = Modifier.fillMaxSize(),
@@ -2305,7 +2944,7 @@ index 00000000..156fd51d
 +            }
 +        }
 +        Text(
-+            text = entry.figure.name,
++            text = entry.name,
 +            color = if (isOnPad) OnPadColor else TextOnBackground,
 +            fontSize = 11.sp,
 +            lineHeight = 13.sp,
@@ -2578,7 +3217,7 @@ index 4c61cbd5..7ba12fd7 100644
              label = tr("Gamepad"),
              description = tr("Enable audio output for the Wii U Gamepad"),
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
-index 5325cb1e..e7486a84 100644
+index 5325cb1e..2e1fa933 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 @@ -1,13 +1,44 @@
@@ -2626,7 +3265,7 @@ index 5325cb1e..e7486a84 100644
      ScreenContent(
          appBarText = tr("Emulated USB Devices settings"),
          navigateBack = navigateBack,
-@@ -29,5 +60,33 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
+@@ -29,5 +60,34 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
              initialCheckedState = NativeSettings::isEmulateDimensionsToypadEnabled,
              onCheckedChanged = NativeSettings::setEmulateDimensionsToypadEnabled,
          )
@@ -2635,9 +3274,10 @@ index 5325cb1e..e7486a84 100644
 +
 +        Toggle(
 +            label = "Figure pictures",
-+            description = "Show pictures of your figures instead of their names, with characters standing on their " +
-+                    "Toy Tag. Each picture is downloaded once (figures from the community LEGO-Dimensions-NFC " +
-+                    "collection, Toy Tags from the LEGO Dimensions Wiki) and kept in the toypad folder.",
++            description = "Show pictures of figures instead of their names, with characters standing on their " +
++                    "Toy Tag, and franchise logos. Each picture is downloaded once (figures from the community " +
++                    "LEGO-Dimensions-NFC collection, Toy Tags from the LEGO Dimensions Wiki, logos from the " +
++                    "LegoToypad project) and kept in the toypad folder.",
 +            initialCheckedState = { ToyPadScreenSettings.figurePicturesEnabled(context) },
 +            onCheckedChanged = { ToyPadScreenSettings.setFigurePicturesEnabled(context, it) },
 +        )
