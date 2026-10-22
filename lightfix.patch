@@ -551,6 +551,186 @@ index 13ef6613..ac2d74cd 100644
  			cafeLogBuffer.lineLength = 0;
  		};
  
+diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
+index b23560f1..c8f20faf 100644
+--- a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
++++ b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
+@@ -575,6 +575,8 @@ namespace nsyshid
+ 		case 0xC7: // Flash All
+ 		case 0xC8: // Color All
+ 		{
++			// remember the requested colors so frontends can display them
++			g_dimensionstoypad.HandleLightCommand(buf);
+ 			// Send a blank response to acknowledge color has been sent to toypad
+ 			q_result = {0x55, 0x01, sequence};
+ 			q_result[3] = GenerateChecksum(q_result, 3);
+@@ -748,6 +750,132 @@ namespace nsyshid
+ 		return true;
+ 	}
+ 
++	// pad numbers used by the game: 0 = all pads, 1 = center, 2 = left, 3 = right
++	void DimensionsUSB::SetPadLight(uint8 pad, const PadLight& light)
++	{
++		std::lock_guard lock(m_lightsMutex);
++		if (pad == 0)
++		{
++			m_padLights.fill(light);
++			return;
++		}
++		if (pad >= 1 && pad <= 3)
++			m_padLights[pad - 1] = light;
++	}
++
++	std::array<DimensionsUSB::PadLight, 3> DimensionsUSB::GetPadLights()
++	{
++		std::lock_guard lock(m_lightsMutex);
++		return m_padLights;
++	}
++
++	void DimensionsUSB::HandleLightCommand(std::span<const uint8, 32> buf)
++	{
++		const uint8 command = buf[2];
++		auto rgbAt = [&buf](size_t i) -> uint32 { return ((uint32)buf[i] << 16) | ((uint32)buf[i + 1] << 8) | (uint32)buf[i + 2]; };
++		{
++			// diagnostic: log the first few light commands so the byte layout can be verified
++			static sint32 s_lightLogBudget = 40;
++			if (s_lightLogBudget > 0)
++			{
++				s_lightLogBudget--;
++				std::string hex;
++				for (size_t i = 0; i < 26; i++)
++					hex += fmt::format("{:02x} ", buf[i]);
++				cemuLog_log(LogType::Force, "[ToyPadLight] {}", hex);
++			}
++		}
++		switch (command)
++		{
++		case 0xC0: // Color: pad, r, g, b
++		{
++			PadLight light;
++			light.rgb = rgbAt(5);
++			SetPadLight(buf[4], light);
++			break;
++		}
++		case 0xC2: // Fade: pad, speed, count, r, g, b
++		{
++			PadLight light;
++			light.mode = 1;
++			light.param1 = buf[5];
++			light.count = buf[6];
++			light.rgb = rgbAt(7);
++			SetPadLight(buf[4], light);
++			break;
++		}
++		case 0xC3: // Flash: pad, on time, off time, count, r, g, b
++		{
++			PadLight light;
++			light.mode = 2;
++			light.param1 = buf[5];
++			light.param2 = buf[6];
++			light.count = buf[7];
++			light.rgb = rgbAt(8);
++			SetPadLight(buf[4], light);
++			break;
++		}
++		case 0xC4: // Fade random: pad, speed, count
++		{
++			PadLight light;
++			light.mode = 3;
++			light.param1 = buf[5];
++			light.count = buf[6];
++			light.rgb = 0xFFFFFF;
++			SetPadLight(buf[4], light);
++			break;
++		}
++		case 0xC6: // Fade all: for each pad (center, left, right): enable, speed, count, r, g, b
++		{
++			for (uint8 p = 0; p < 3; p++)
++			{
++				size_t o = 4 + p * 6;
++				if (buf[o] == 0)
++					continue;
++				PadLight light;
++				light.mode = 1;
++				light.param1 = buf[o + 1];
++				light.count = buf[o + 2];
++				light.rgb = rgbAt(o + 3);
++				SetPadLight(p + 1, light);
++			}
++			break;
++		}
++		case 0xC7: // Flash all: for each pad: enable, on time, off time, count, r, g, b
++		{
++			for (uint8 p = 0; p < 3; p++)
++			{
++				size_t o = 4 + p * 7;
++				if (o + 6 >= buf.size() || buf[o] == 0)
++					continue;
++				PadLight light;
++				light.mode = 2;
++				light.param1 = buf[o + 1];
++				light.param2 = buf[o + 2];
++				light.count = buf[o + 3];
++				light.rgb = rgbAt(o + 4);
++				SetPadLight(p + 1, light);
++			}
++			break;
++		}
++		case 0xC8: // Color all: for each pad: enable, r, g, b
++		{
++			for (uint8 p = 0; p < 3; p++)
++			{
++				size_t o = 4 + p * 4;
++				if (buf[o] == 0)
++					continue;
++				PadLight light;
++				light.rgb = rgbAt(o + 1);
++				SetPadLight(p + 1, light);
++			}
++			break;
++		}
++		default:
++			break;
++		}
++	}
++
+ 	bool DimensionsUSB::MoveFigure(uint8 pad, uint8 index, uint8 oldPad, uint8 oldIndex)
+ 	{
+ 		if (oldIndex == index)
+diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.h b/src/Cafe/OS/libs/nsyshid/Dimensions.h
+index 00ceff9e..a7433849 100644
+--- a/src/Cafe/OS/libs/nsyshid/Dimensions.h
++++ b/src/Cafe/OS/libs/nsyshid/Dimensions.h
+@@ -79,6 +79,17 @@ namespace nsyshid
+ 		static std::map<const uint32, const char*> GetListTokens();
+ 		std::string FindFigure(uint32 figNum);
+ 
++		// Toy Pad light state as last set by the game (index 0 = center, 1 = left, 2 = right)
++		struct PadLight
++		{
++			uint32 rgb = 0;	  // 0xRRGGBB
++			uint8 mode = 0;	  // 0 = solid, 1 = fade, 2 = flash, 3 = fade random
++			uint8 param1 = 0; // fade: speed, flash: on time
++			uint8 param2 = 0; // flash: off time
++			uint8 count = 0;  // number of pulses
++		};
++		std::array<PadLight, 3> GetPadLights();
++
+ 	  protected:
+ 		std::mutex m_dimensionsMutex;
+ 		std::array<DimensionsMini, 7> m_figures{};
+@@ -104,6 +115,11 @@ namespace nsyshid
+ 
+ 		bool m_isAwake = false;
+ 
++		void HandleLightCommand(std::span<const uint8, 32> buf);
++		void SetPadLight(uint8 pad, const PadLight& light);
++		std::mutex m_lightsMutex;
++		std::array<PadLight, 3> m_padLights{};
++
+ 		std::queue<std::array<uint8, 32>> m_figureAddedRemovedResponses;
+ 		std::queue<std::array<uint8, 32>> m_queries;
+ 	};
 diff --git a/src/Cafe/OS/libs/snd_core/ax_aux.cpp b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
 index a9176562..7fb96387 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_aux.cpp
@@ -1084,6 +1264,801 @@ index 3c1587e7..7430cfee 100644
          minSdk = 30
          targetSdk = 35
          versionName = getVersionName()
+diff --git a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
+index 1190bf43..cd79e27f 100644
+--- a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
++++ b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
+@@ -381,3 +381,21 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_moveDimensionsFigur
+ 		oldSlot = std::nullopt;
+ 	}
+ }
++
++extern "C" JNIEXPORT jintArray JNICALL
++Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsPadLights(JNIEnv* env, [[maybe_unused]] jclass clazz)
++{
++	// 4 values per pad (center, left, right): rgb, mode, param1 | param2 << 8, count
++	auto lights = nsyshid::g_dimensionstoypad.GetPadLights();
++	jint values[12];
++	for (size_t i = 0; i < 3; i++)
++	{
++		values[i * 4 + 0] = (jint)lights[i].rgb;
++		values[i * 4 + 1] = (jint)lights[i].mode;
++		values[i * 4 + 2] = (jint)lights[i].param1 | ((jint)lights[i].param2 << 8);
++		values[i * 4 + 3] = (jint)lights[i].count;
++	}
++	jintArray result = env->NewIntArray(12);
++	env->SetIntArrayRegion(result, 0, 12, values);
++	return result;
++}
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
+index 29a5c740..824d90f8 100644
+--- a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
+@@ -25,6 +25,7 @@ import info.cemu.cemu.emulation.input.DeviceMotionHandler
+ import info.cemu.cemu.emulation.input.HotkeyManager
+ import info.cemu.cemu.emulation.input.InputHandler
+ import info.cemu.cemu.emulation.input.NativeInputDeviceListener
++import info.cemu.cemu.emulation.toypadscreen.ToyPadSecondScreen
+ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.launch
+@@ -68,6 +69,7 @@ private class InputDelegateManager(context: Context) {
+ 
+ class EmulationActivity : AppCompatActivity() {
+     private lateinit var inputManager: InputDelegateManager
++    private lateinit var toyPadSecondScreen: ToyPadSecondScreen
+     private var processInputEvents = true
+ 
+     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+@@ -116,6 +118,7 @@ class EmulationActivity : AppCompatActivity() {
+         super.onCreate(savedInstanceState)
+ 
+         inputManager = InputDelegateManager(this)
++        toyPadSecondScreen = ToyPadSecondScreen(this)
+ 
+         setupHotkeys()
+ 
+@@ -139,6 +142,18 @@ class EmulationActivity : AppCompatActivity() {
+         }
+     }
+ 
++    override fun onStart() {
++        super.onStart()
++
++        toyPadSecondScreen.start()
++    }
++
++    override fun onStop() {
++        toyPadSecondScreen.stop()
++
++        super.onStop()
++    }
++
+     override fun onPause() {
+         super.onPause()
+ 
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
+new file mode 100644
+index 00000000..11637a2e
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
+@@ -0,0 +1,542 @@
++package info.cemu.cemu.emulation.toypadscreen
++
++import androidx.compose.animation.core.LinearEasing
++import androidx.compose.animation.core.RepeatMode
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.animation.core.infiniteRepeatable
++import androidx.compose.animation.core.rememberInfiniteTransition
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.aspectRatio
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
++import androidx.compose.foundation.lazy.grid.items
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.Shape
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.min
++import androidx.compose.ui.unit.sp
++import info.cemu.cemu.nativeinterface.NativeEmulatedUSBDevices
++import kotlinx.coroutines.delay
++
++// slot index -> pad number used by the emulated Toy Pad (1 = center, 2 = left, 3 = right)
++private val SLOT_PADS = intArrayOf(2, 1, 3, 2, 2, 3, 3)
++
++// slots of each side pad, from top to bottom (the middle one sits closer to the center pad)
++private val LEFT_SLOTS = intArrayOf(0, 4, 3)
++private val RIGHT_SLOTS = intArrayOf(2, 5, 6)
++private const val CENTER_SLOT = 1
++
++private data class PadLightState(val rgb: Int, val mode: Int, val param1: Int, val param2: Int)
++
++private fun readSlots(): Array<String?> =
++    Array(NativeEmulatedUSBDevices.MAX_DIMENSIONS_SLOTS) { NativeEmulatedUSBDevices.getDimensionsFigureSlot(it) }
++
++private fun readLights(): List<PadLightState> {
++    val raw = try {
++        NativeEmulatedUSBDevices.getDimensionsPadLights()
++    } catch (_: Throwable) {
++        IntArray(12)
++    }
++    return List(3) { i ->
++        PadLightState(
++            rgb = raw.getOrElse(i * 4) { 0 },
++            mode = raw.getOrElse(i * 4 + 1) { 0 },
++            param1 = raw.getOrElse(i * 4 + 2) { 0 } and 0xFF,
++            param2 = (raw.getOrElse(i * 4 + 2) { 0 } shr 8) and 0xFF,
++        )
++    }
++}
++
++// light index for a pad number: 1 = center -> 0, 2 = left -> 1, 3 = right -> 2
++private fun lightIndexForPad(pad: Int) = (pad - 1).coerceIn(0, 2)
++
++@Composable
++fun ToyPadScreen() {
++    var slots by remember { mutableStateOf(readSlots()) }
++    var lights by remember { mutableStateOf(readLights()) }
++    var figures by remember {
++        mutableStateOf(NativeEmulatedUSBDevices.getInstalledDimensionsMiniFigures())
++    }
++    var selectedSlot by remember { mutableStateOf<Int?>(null) }
++    var selectedFigure by remember { mutableStateOf<NativeEmulatedUSBDevices.InstalledFigure?>(null) }
++    var moveSource by remember { mutableStateOf<Int?>(null) }
++    var errorMessage by remember { mutableStateOf<String?>(null) }
++
++    LaunchedEffect(Unit) {
++        var tick = 0
++        while (true) {
++            slots = readSlots()
++            lights = readLights()
++            if (tick % 16 == 0) {
++                figures = NativeEmulatedUSBDevices.getInstalledDimensionsMiniFigures()
++            }
++            tick++
++            delay(250)
++        }
++    }
++
++    fun refresh() {
++        slots = readSlots()
++    }
++
++    fun clearSelection() {
++        selectedSlot = null
++        selectedFigure = null
++    }
++
++    fun loadFigure(figure: NativeEmulatedUSBDevices.InstalledFigure, index: Int) {
++        val ok = NativeEmulatedUSBDevices.loadDimensionsFigure(figure.path, SLOT_PADS[index], index)
++        errorMessage = if (ok) null else "Couldn't place ${figure.name}"
++        clearSelection()
++        refresh()
++    }
++
++    fun cancelMove() {
++        moveSource?.let { NativeEmulatedUSBDevices.cancelRemoveDimensionsFigure(it) }
++        moveSource = null
++        clearSelection()
++        refresh()
++    }
++
++    fun onSlotTapped(index: Int) {
++        errorMessage = null
++        val source = moveSource
++        if (source != null) {
++            if (source == index) {
++                cancelMove()
++            } else {
++                NativeEmulatedUSBDevices.moveDimensionsFigure(SLOT_PADS[index], index, SLOT_PADS[source], source)
++                moveSource = null
++                clearSelection()
++                refresh()
++            }
++            return
++        }
++        val figure = selectedFigure
++        if (figure != null) {
++            loadFigure(figure, index)
++            return
++        }
++        selectedSlot = if (selectedSlot == index) null else index
++    }
++
++    fun onFigureTapped(figure: NativeEmulatedUSBDevices.InstalledFigure) {
++        errorMessage = null
++        if (moveSource != null) return
++        val slot = selectedSlot
++        if (slot != null) {
++            loadFigure(figure, slot)
++            return
++        }
++        selectedFigure = if (selectedFigure == figure) null else figure
++    }
++
++    fun onRemove(index: Int) {
++        NativeEmulatedUSBDevices.clearDimensionsFigure(SLOT_PADS[index], index)
++        clearSelection()
++        refresh()
++    }
++
++    fun onMove(index: Int) {
++        NativeEmulatedUSBDevices.tempRemoveDimensionsFigure(index)
++        moveSource = index
++        selectedSlot = null
++        selectedFigure = null
++    }
++
++    Column(
++        modifier = Modifier
++            .fillMaxSize()
++            .padding(12.dp),
++        verticalArrangement = Arrangement.spacedBy(10.dp)
++    ) {
++        Text(
++            text = "LEGO Dimensions Toy Pad",
++            style = MaterialTheme.typography.titleMedium,
++            fontWeight = FontWeight.SemiBold,
++        )
++
++        // the pad
++        Row(
++            modifier = Modifier
++                .fillMaxWidth()
++                .weight(1.1f),
++            horizontalArrangement = Arrangement.spacedBy(10.dp),
++        ) {
++            SidePad(
++                slotIndices = LEFT_SLOTS,
++                innerAlignment = Alignment.End,
++                light = lights[lightIndexForPad(2)],
++                slots = slots,
++                selectedSlot = selectedSlot,
++                moveSource = moveSource,
++                onSlotTapped = ::onSlotTapped,
++                modifier = Modifier
++                    .weight(1f)
++                    .fillMaxHeight(),
++            )
++            CenterPad(
++                light = lights[lightIndexForPad(1)],
++                name = slots[CENTER_SLOT],
++                isSelected = selectedSlot == CENTER_SLOT,
++                isMoveSource = moveSource == CENTER_SLOT,
++                onTap = { onSlotTapped(CENTER_SLOT) },
++                modifier = Modifier
++                    .weight(1.1f)
++                    .fillMaxHeight(),
++            )
++            SidePad(
++                slotIndices = RIGHT_SLOTS,
++                innerAlignment = Alignment.Start,
++                light = lights[lightIndexForPad(3)],
++                slots = slots,
++                selectedSlot = selectedSlot,
++                moveSource = moveSource,
++                onSlotTapped = ::onSlotTapped,
++                modifier = Modifier
++                    .weight(1f)
++                    .fillMaxHeight(),
++            )
++        }
++
++        // what to do next
++        ActionBar(
++            slots = slots,
++            selectedSlot = selectedSlot,
++            selectedFigure = selectedFigure,
++            moveSource = moveSource,
++            errorMessage = errorMessage,
++            onMove = ::onMove,
++            onRemove = ::onRemove,
++            onCancel = {
++                if (moveSource != null) cancelMove() else clearSelection()
++            },
++        )
++
++        // figure collection
++        Text(
++            text = "Your figures (${figures.size})",
++            style = MaterialTheme.typography.titleSmall,
++        )
++        if (figures.isEmpty()) {
++            Text(
++                text = "No figures yet. Create figures in the emulated USB devices menu in the game's menu.",
++                style = MaterialTheme.typography.bodyMedium,
++            )
++        }
++        LazyVerticalGrid(
++            columns = GridCells.Adaptive(minSize = 130.dp),
++            modifier = Modifier
++                .fillMaxWidth()
++                .weight(1f),
++            horizontalArrangement = Arrangement.spacedBy(8.dp),
++            verticalArrangement = Arrangement.spacedBy(8.dp),
++        ) {
++            items(figures, key = { it.path }) { figure ->
++                FigureChip(
++                    name = figure.name,
++                    isSelected = selectedFigure == figure,
++                    isOnPad = slots.any { it != null && it == figure.name },
++                    onTap = { onFigureTapped(figure) },
++                )
++            }
++        }
++    }
++}
++
++@Composable
++private fun ActionBar(
++    slots: Array<String?>,
++    selectedSlot: Int?,
++    selectedFigure: NativeEmulatedUSBDevices.InstalledFigure?,
++    moveSource: Int?,
++    errorMessage: String?,
++    onMove: (Int) -> Unit,
++    onRemove: (Int) -> Unit,
++    onCancel: () -> Unit,
++) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .height(52.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(8.dp),
++    ) {
++        val prompt: String
++        var showCancel = false
++        var occupiedSlot: Int? = null
++        when {
++            errorMessage != null -> prompt = errorMessage
++            moveSource != null -> {
++                prompt = "Tap where to put ${slots[moveSource] ?: "the figure"}"
++                showCancel = true
++            }
++
++            selectedFigure != null -> {
++                prompt = "Tap a spot on the pad for ${selectedFigure.name}"
++                showCancel = true
++            }
++
++            selectedSlot != null && slots[selectedSlot] == null -> {
++                prompt = "Pick a figure below for this spot"
++                showCancel = true
++            }
++
++            selectedSlot != null -> {
++                prompt = slots[selectedSlot] ?: ""
++                occupiedSlot = selectedSlot
++            }
++
++            else -> prompt = "Tap a spot on the pad, or a figure below"
++        }
++        Text(
++            text = prompt,
++            modifier = Modifier.weight(1f),
++            maxLines = 2,
++            overflow = TextOverflow.Ellipsis,
++            style = MaterialTheme.typography.bodyLarge,
++        )
++        val actionSlot: Int? = occupiedSlot
++        if (actionSlot != null) {
++            Button(onClick = { onMove(actionSlot) }) { Text("Move") }
++            OutlinedButton(onClick = { onRemove(actionSlot) }) { Text("Remove") }
++            OutlinedButton(onClick = onCancel) { Text("Done") }
++        } else if (showCancel) {
++            OutlinedButton(onClick = onCancel) { Text("Cancel") }
++        }
++    }
++}
++
++@Composable
++private fun lightColor(light: PadLightState): Color {
++    val base = if (light.rgb == 0) Color(0xFF2A2A2A) else Color(0xFF000000.toInt() or light.rgb)
++    return when (light.mode) {
++        2 -> {
++            // flash: blink using the on/off times (assumed ~10 ms units, clamped to something visible)
++            val onMs = (light.param1 * 10).coerceIn(80, 1000)
++            val offMs = (light.param2 * 10).coerceIn(80, 1000)
++            val transition = rememberInfiniteTransition(label = "flash")
++            val phase by transition.animateFloat(
++                initialValue = 0f,
++                targetValue = 1f,
++                animationSpec = infiniteRepeatable(tween(onMs + offMs, easing = LinearEasing), RepeatMode.Restart),
++                label = "flashPhase",
++            )
++            if (phase * (onMs + offMs) < onMs) base else Color(0xFF2A2A2A)
++        }
++
++        3 -> {
++            // random fade: cycle through colors
++            val transition = rememberInfiniteTransition(label = "random")
++            val hue by transition.animateFloat(
++                initialValue = 0f,
++                targetValue = 360f,
++                animationSpec = infiniteRepeatable(tween(3000, easing = LinearEasing), RepeatMode.Restart),
++                label = "randomHue",
++            )
++            Color.hsv(hue, 0.8f, 1f)
++        }
++
++        else -> base
++    }
++}
++
++@Composable
++private fun PadBackground(
++    light: PadLightState,
++    shape: Shape,
++    modifier: Modifier = Modifier,
++    content: @Composable () -> Unit,
++) {
++    val glow = lightColor(light)
++    val isLit = light.rgb != 0 || light.mode == 3
++    Box(
++        modifier = modifier
++            .clip(shape)
++            .background(Color(0xFF151515))
++            .background(if (isLit) glow.copy(alpha = 0.35f) else Color.Transparent)
++            .border(3.dp, if (isLit) glow else Color(0xFF444444), shape)
++            .padding(8.dp),
++        contentAlignment = Alignment.Center,
++    ) {
++        content()
++    }
++}
++
++@Composable
++private fun SidePad(
++    slotIndices: IntArray,
++    innerAlignment: Alignment.Horizontal,
++    light: PadLightState,
++    slots: Array<String?>,
++    selectedSlot: Int?,
++    moveSource: Int?,
++    onSlotTapped: (Int) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    PadBackground(light = light, shape = RoundedCornerShape(18.dp), modifier = modifier) {
++        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
++            val slotSize = min(maxWidth * 0.62f, maxHeight / 3.3f)
++            Column(
++                modifier = Modifier.fillMaxSize(),
++                verticalArrangement = Arrangement.SpaceEvenly,
++            ) {
++                slotIndices.forEachIndexed { position, index ->
++                    val alignment = if (position == 1) innerAlignment else
++                        if (innerAlignment == Alignment.End) Alignment.Start else Alignment.End
++                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = if (alignment == Alignment.Start) Alignment.CenterStart else Alignment.CenterEnd) {
++                        SlotTile(
++                            name = slots[index],
++                            isSelected = selectedSlot == index,
++                            isMoveSource = moveSource == index,
++                            shape = RoundedCornerShape(12.dp),
++                            onTap = { onSlotTapped(index) },
++                            modifier = Modifier.size(slotSize),
++                        )
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun CenterPad(
++    light: PadLightState,
++    name: String?,
++    isSelected: Boolean,
++    isMoveSource: Boolean,
++    onTap: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    PadBackground(light = light, shape = RoundedCornerShape(24.dp), modifier = modifier) {
++        BoxWithConstraints(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
++            val slotSize = min(maxWidth * 0.9f, maxHeight * 0.75f)
++            SlotTile(
++                name = name,
++                isSelected = isSelected,
++                isMoveSource = isMoveSource,
++                shape = CircleShape,
++                onTap = onTap,
++                modifier = Modifier.size(slotSize),
++            )
++        }
++    }
++}
++
++@Composable
++private fun SlotTile(
++    name: String?,
++    isSelected: Boolean,
++    isMoveSource: Boolean,
++    shape: Shape,
++    onTap: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val borderColor = when {
++        isMoveSource -> Color(0xFFFFC107)
++        isSelected -> MaterialTheme.colorScheme.primary
++        name != null -> Color(0xFFBBBBBB)
++        else -> Color(0xFF555555)
++    }
++    val background = when {
++        isMoveSource -> Color(0x66FFC107)
++        name != null -> Color(0xCC303030)
++        else -> Color(0x66000000)
++    }
++    Box(
++        modifier = modifier
++            .aspectRatio(1f)
++            .clip(shape)
++            .background(background)
++            .border(if (isSelected || isMoveSource) 4.dp else 2.dp, borderColor, shape)
++            .clickable(onClick = onTap)
++            .padding(6.dp),
++        contentAlignment = Alignment.Center,
++    ) {
++        Text(
++            text = name ?: "+",
++            color = Color.White,
++            textAlign = TextAlign.Center,
++            fontSize = if (name == null) 28.sp else 14.sp,
++            fontWeight = if (name == null) FontWeight.Light else FontWeight.Medium,
++            maxLines = 3,
++            overflow = TextOverflow.Ellipsis,
++        )
++    }
++}
++
++@Composable
++private fun FigureChip(
++    name: String,
++    isSelected: Boolean,
++    isOnPad: Boolean,
++    onTap: () -> Unit,
++) {
++    val shape = RoundedCornerShape(10.dp)
++    Box(
++        modifier = Modifier
++            .fillMaxWidth()
++            .height(56.dp)
++            .clip(shape)
++            .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
++            .border(
++                if (isSelected) 3.dp else 1.dp,
++                if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
++                shape
++            )
++            .clickable(onClick = onTap)
++            .padding(horizontal = 10.dp),
++        contentAlignment = Alignment.CenterStart,
++    ) {
++        Column {
++            Text(
++                text = name,
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++                style = MaterialTheme.typography.bodyMedium,
++                fontWeight = FontWeight.Medium,
++                color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++            if (isOnPad) {
++                Text(
++                    text = "on the pad",
++                    style = MaterialTheme.typography.labelSmall,
++                    color = MaterialTheme.colorScheme.primary,
++                )
++            }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
+new file mode 100644
+index 00000000..457ffbf6
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
+@@ -0,0 +1,153 @@
++package info.cemu.cemu.emulation.toypadscreen
++
++import android.app.Presentation
++import android.hardware.display.DisplayManager
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.view.Display
++import android.view.KeyEvent
++import android.view.MotionEvent
++import android.view.WindowManager
++import androidx.activity.ComponentActivity
++import androidx.compose.ui.platform.ComposeView
++import androidx.lifecycle.setViewTreeLifecycleOwner
++import androidx.lifecycle.setViewTreeViewModelStoreOwner
++import androidx.savedstate.setViewTreeSavedStateRegistryOwner
++import info.cemu.cemu.common.ui.components.ActivityContent
++import info.cemu.cemu.common.ui.localization.TranslatableContent
++import info.cemu.cemu.nativeinterface.NativeLogging
++import info.cemu.cemu.nativeinterface.NativeSettings
++
++/**
++ * Shows the LEGO Dimensions Toy Pad on a second display (for example the bottom screen of a dual-screen handheld)
++ * while the game keeps running on the main display.
++ */
++class ToyPadSecondScreen(private val activity: ComponentActivity) : DisplayManager.DisplayListener {
++    private val displayManager = activity.getSystemService(DisplayManager::class.java)
++    private var presentation: ToyPadPresentation? = null
++    private var started = false
++    private var loggedDisplays = false
++
++    fun start() {
++        if (started) return
++        started = true
++        displayManager.registerDisplayListener(this, Handler(Looper.getMainLooper()))
++        showIfPossible()
++    }
++
++    fun stop() {
++        if (!started) return
++        started = false
++        displayManager.unregisterDisplayListener(this)
++        dismiss()
++    }
++
++    private fun log(message: String) {
++        try {
++            NativeLogging.log("[ToyPadScreen] $message")
++        } catch (_: Throwable) {
++        }
++    }
++
++    private fun ownDisplayId(): Int {
++        return try {
++            activity.display?.displayId ?: Display.DEFAULT_DISPLAY
++        } catch (_: Throwable) {
++            Display.DEFAULT_DISPLAY
++        }
++    }
++
++    private fun findTargetDisplay(): Display? {
++        val ownId = ownDisplayId()
++        val displays = displayManager.displays
++        if (!loggedDisplays) {
++            loggedDisplays = true
++            log("game is on display $ownId, found ${displays.size} display(s)")
++            for (d in displays) {
++                log("display id=${d.displayId} name='${d.name}' flags=0x${Integer.toHexString(d.flags)} state=${d.state} size=${d.mode.physicalWidth}x${d.mode.physicalHeight}")
++            }
++        }
++        return displays.firstOrNull { it.displayId != ownId }
++    }
++
++    private fun showIfPossible() {
++        if (!started || presentation != null) return
++        val enabled = try {
++            NativeSettings.isEmulateDimensionsToypadEnabled()
++        } catch (_: Throwable) {
++            false
++        }
++        if (!enabled) {
++            log("emulated Toy Pad is turned off, not using the second screen")
++            return
++        }
++        val display = findTargetDisplay() ?: return
++        try {
++            val p = ToyPadPresentation(activity, display)
++            p.show()
++            presentation = p
++            log("showing Toy Pad on display ${display.displayId}")
++        } catch (e: Throwable) {
++            log("could not show Toy Pad on display ${display.displayId}: ${e.javaClass.simpleName}: ${e.message}")
++            presentation = null
++        }
++    }
++
++    private fun dismiss() {
++        try {
++            presentation?.dismiss()
++        } catch (_: Throwable) {
++        }
++        presentation = null
++    }
++
++    override fun onDisplayAdded(displayId: Int) {
++        showIfPossible()
++    }
++
++    override fun onDisplayRemoved(displayId: Int) {
++        if (presentation?.display?.displayId == displayId) {
++            log("display $displayId was removed")
++            dismiss()
++        }
++    }
++
++    override fun onDisplayChanged(displayId: Int) {
++    }
++}
++
++private class ToyPadPresentation(
++    private val activity: ComponentActivity,
++    display: Display,
++) : Presentation(activity, display) {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        // never take controller/keyboard focus away from the game on the main screen; touch still works
++        window?.addFlags(
++            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
++        )
++        val composeView = ComposeView(context).apply {
++            setViewTreeLifecycleOwner(activity)
++            setViewTreeViewModelStoreOwner(activity)
++            setViewTreeSavedStateRegistryOwner(activity)
++            setContent {
++                TranslatableContent {
++                    ActivityContent {
++                        ToyPadScreen()
++                    }
++                }
++            }
++        }
++        setContentView(composeView)
++    }
++
++    // if this window ever does receive controller input, hand it to the game
++    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
++        return activity.dispatchKeyEvent(event)
++    }
++
++    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
++        return activity.dispatchGenericMotionEvent(event)
++    }
++}
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
+index 5c178c2f..65a84043 100644
+--- a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
++++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
+@@ -85,6 +85,10 @@ object NativeEmulatedUSBDevices {
+     @JvmStatic
+     external fun getDimensionsFigureSlot(slot: Int): String?
+ 
++    // 4 values per pad (center, left, right): rgb, mode, param1 | (param2 << 8), count
++    @JvmStatic
++    external fun getDimensionsPadLights(): IntArray
++
+     @JvmStatic
+     external fun clearDimensionsFigure(pad: Int, index: Int)
+ 
 diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
 index 053d3be8..1455fa33 100644
 --- a/src/android/app/src/main/res/values/strings.xml

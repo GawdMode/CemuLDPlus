@@ -51,6 +51,18 @@ The fix works at the game's native **1280x720** resolution. In **Graphic packs**
 *LEGO Dimensions → Resolution* to **1280x720 (Default)**, or leave it off. Higher resolutions may still
 have broken or missing lighting. Support for those may come in a later build.
 
+## Toy Pad on the second screen (dual-screen devices)
+
+On devices with a second screen (for example the AYN Thor's bottom screen), Cemu Light Fix shows the emulated
+LEGO Dimensions Toy Pad there while you play:
+
+- The three pads with the figure on each spot, glowing in the colors the game sets (like the real pad's lights).
+- Tap an empty spot, then a figure from your collection, to place it. Or tap a figure first, then a spot.
+- Tap a figure on the pad for **Move** (then tap where it should go) or **Remove**.
+
+It only appears when **emulated Toy Pad** is turned on in Cemu's settings. Your controller keeps controlling the game
+while you use the touch screen. This feature is new and experimental.
+
 ## Moving your save from regular Cemu
 
 Copying leaves the originals in place, so you won't lose anything.
