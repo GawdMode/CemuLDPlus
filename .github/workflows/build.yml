@@ -2,6 +2,8 @@ name: Build Cemu Light Fix APK
 
 # Downloads SSimco's Cemu Android port at a fixed commit, applies lightfix.patch,
 # builds the APK and publishes it as a GitHub release for direct download on the device.
+# While BUILD_CONTROL is on, it also builds "Cemu Control": the same Cemu with no fixes
+# (only a separate app id), to compare against.
 
 on:
   push:
@@ -16,7 +18,6 @@ permissions:
 env:
   CEMU_REPO: https://github.com/SSimco/Cemu.git
   CEMU_COMMIT: 8759323e5b72594665b55e02f99db3c1e1e7de8a
-  VCPKG_ROOT: "${{ github.workspace }}/cemu/dependencies/vcpkg"
   VCPKG_BINARY_SOURCES: "clear;files,/home/runner/vcpkg-binary-cache,readwrite"
   VCPKG_FORCE_DOWNLOADED_BINARIES: true
   # throwaway test signing key, kept fixed so newer test builds install over older ones
@@ -26,6 +27,18 @@ jobs:
   build-android:
     runs-on: ubuntu-24.04
     timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: lightfix
+            patch: lightfix.patch
+            apk: Cemu-LightFix.apk
+          - variant: control
+            patch: control.patch
+            apk: Cemu-Control-test.apk
+    env:
+      VCPKG_ROOT: "${{ github.workspace }}/cemu/dependencies/vcpkg"
 
     steps:
       - name: Checkout this repo
@@ -33,13 +46,13 @@ jobs:
         with:
           path: lightfix
 
-      - name: Download Cemu source and apply the fix
+      - name: Download Cemu source and apply the patch
         run: |
           git clone "$CEMU_REPO" cemu
           cd cemu
           git checkout "$CEMU_COMMIT"
           git submodule update --init --recursive
-          git apply --verbose ../lightfix/lightfix.patch
+          git apply --verbose "../lightfix/${{ matrix.patch }}"
 
       - name: Install system dependencies
         run: |
@@ -61,8 +74,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /home/runner/vcpkg-binary-cache
-          key: vcpkg-android-${{ env.CEMU_COMMIT }}-${{ github.run_id }}
+          key: vcpkg-android-${{ env.CEMU_COMMIT }}-${{ matrix.variant }}-${{ github.run_id }}
           restore-keys: |
+            vcpkg-android-${{ env.CEMU_COMMIT }}-${{ matrix.variant }}-
             vcpkg-android-${{ env.CEMU_COMMIT }}-
             vcpkg-android-
 
@@ -91,20 +105,30 @@ jobs:
           mkdir -p out
           APK=$(find cemu/src/android/app/build/outputs/apk -name "*.apk" | head -n 1)
           echo "Found $APK"
-          cp "$APK" out/Cemu-LightFix.apk
+          cp "$APK" "out/${{ matrix.apk }}"
           ls -la out
 
       - name: Check the APK is signed with the fixed key
         run: |
           APKSIGNER=$(ls -d $ANDROID_HOME/build-tools/*/ | sort -V | tail -n 1)apksigner
-          "$APKSIGNER" verify --print-certs out/Cemu-LightFix.apk | tee signer.txt
+          "$APKSIGNER" verify --print-certs "out/${{ matrix.apk }}" | tee signer.txt
           grep -qi "SHA-256 digest: 70921a61c17e664a1cf7d4f6aa810097b40029b6d17e7a19a3d17b3c8977d3f2" signer.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Cemu-LightFix
-          path: out/Cemu-LightFix.apk
+          name: ${{ matrix.variant }}
+          path: out/${{ matrix.apk }}
+
+  publish:
+    needs: build-android
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -123,5 +147,7 @@ jobs:
             - To move your save and Toy Pad figures from regular Cemu, see the [README](https://github.com/${{ github.repository }}#moving-your-save-from-regular-cemu).
             - Problems? Open an [Issue](https://github.com/${{ github.repository }}/issues) and attach your log (game list menu → **Share log file**).
 
+            `Cemu-Control-test.apk` (if present) is only for testing: the same Cemu with **no** fixes, installed as a separate "Cemu Control" app, used to compare against Cemu Light Fix. Most people don't need it.
+
             Not affiliated with SSimco or the Cemu team. Based on SSimco/Cemu commit `${{ env.CEMU_COMMIT }}`. Licensed under MPL-2.0.
-          files: out/Cemu-LightFix.apk
+          files: out/*.apk

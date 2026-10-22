@@ -1,5 +1,5 @@
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 4445fb26..6612b6a2 100644
+index 4445fb26..5b128b10 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 @@ -500,11 +500,18 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
@@ -21,7 +21,7 @@ index 4445fb26..6612b6a2 100644
  		LatteTexture* baseTexture = texRel->baseTexture;
  		LatteTexture* subTexture = texRel->subTexture;
  		for (sint32 cMipIndex = 0; cMipIndex < texRel->mipCount; cMipIndex++)
-@@ -730,6 +737,292 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
+@@ -730,6 +737,312 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
  	}
  }
  
@@ -34,7 +34,10 @@ index 4445fb26..6612b6a2 100644
 +// copies data between the two (sub <-> its row range in the base) whenever one of them is used and the other has newer data.
 +// ---------------------------------------------------------------------------------------------------------------------
 +
-+static sint32 s_offsetRelLogBudget = 300;
++static sint32 s_offsetRelLogBudget = 0; // set above 0 to log offset relation decisions (diagnostics)
++
++// verification results are cached per texture-shape pair, since the same pairs are re-checked whenever textures get recreated
++static std::unordered_map<uint64, bool> s_offsetRelVerifyCache;
 +
 +static uint32 _LatteTexture_NormalizeSwizzle(uint32 swizzle)
 +{
@@ -77,6 +80,10 @@ index 4445fb26..6612b6a2 100644
 +	const uint32 pitch = (uint32)baseTexture->pitch;
 +	const sint32 w = subTexture->width;
 +	const sint32 h = subTexture->height;
++	// sample a limited grid of texels (plus the edges) so verification stays cheap for large textures
++	auto oddStep = [](sint32 size, sint32 minStep) -> sint32 { sint32 s = std::max(minStep, size / 48); return s | 1; };
++	const sint32 stepY = oddStep(h, 7);
++	const sint32 stepX = oddStep(w, 5);
 +	auto checkTexel = [&](sint32 x, sint32 y) -> bool
 +	{
 +		uint32 offSub, offBase;
@@ -86,10 +93,9 @@ index 4445fb26..6612b6a2 100644
 +			return false;
 +		return (offSub + byteOffset) == offBase;
 +	};
-+	// sample a grid of texels plus the edges
-+	for (sint32 y = 0; y < h; y += 7)
++	for (sint32 y = 0; y < h; y += stepY)
 +	{
-+		for (sint32 x = 0; x < w; x += 5)
++		for (sint32 x = 0; x < w; x += stepX)
 +		{
 +			if (!checkTexel(x, y))
 +				return false;
@@ -97,7 +103,7 @@ index 4445fb26..6612b6a2 100644
 +		if (!checkTexel(w - 1, y))
 +			return false;
 +	}
-+	for (sint32 x = 0; x < w; x += 3)
++	for (sint32 x = 0; x < w; x += stepX)
 +	{
 +		if (!checkTexel(x, h - 1))
 +			return false;
@@ -209,17 +215,31 @@ index 4445fb26..6612b6a2 100644
 +		logResult("rejected (sub does not fit inside base)", yOffset);
 +		return;
 +	}
-+	// verify that the memory layouts really line up
++	// verify that the memory layouts really line up (cached per shape pair)
 +	const char* acceptReason = "accepted";
-+	if (!_LatteTexture_VerifyOffsetMapping(baseTexture, baseSwizzle, subTexture, subSwizzle, byteOffset, yOffset))
++	uint64 cacheKey = 0xcbf29ce484222325ull;
++	auto mixKey = [&cacheKey](uint64 v) { cacheKey ^= v; cacheKey *= 0x100000001b3ull; };
++	mixKey(baseTexture->width); mixKey(baseTexture->height); mixKey((uint64)baseTexture->format); mixKey((uint64)baseInfo->tileMode); mixKey(baseInfo->pitch); mixKey(baseSwizzle);
++	mixKey(subTexture->width); mixKey(subTexture->height); mixKey((uint64)subTexture->format); mixKey((uint64)subInfo->tileMode); mixKey(subSwizzle);
++	mixKey(byteOffset); mixKey(bpp);
++	bool layoutMatches;
++	auto cacheIt = s_offsetRelVerifyCache.find(cacheKey);
++	if (cacheIt != s_offsetRelVerifyCache.end())
++		layoutMatches = cacheIt->second;
++	else
 +	{
++		layoutMatches = _LatteTexture_VerifyOffsetMapping(baseTexture, baseSwizzle, subTexture, subSwizzle, byteOffset, yOffset);
 +		// the swizzle stored for a texture is not always reliable, retry while ignoring it
-+		if (!_LatteTexture_VerifyOffsetMapping(baseTexture, 0, subTexture, 0, byteOffset, yOffset))
-+		{
-+			logResult("rejected (layout mismatch)", yOffset);
-+			return;
-+		}
-+		acceptReason = "accepted (swizzle ignored)";
++		if (!layoutMatches)
++			layoutMatches = _LatteTexture_VerifyOffsetMapping(baseTexture, 0, subTexture, 0, byteOffset, yOffset);
++		if (s_offsetRelVerifyCache.size() > 4096)
++			s_offsetRelVerifyCache.clear();
++		s_offsetRelVerifyCache.emplace(cacheKey, layoutMatches);
++	}
++	if (!layoutMatches)
++	{
++		logResult("rejected (layout mismatch)", yOffset);
++		return;
 +	}
 +	logResult(acceptReason, yOffset);
 +
@@ -293,7 +313,7 @@ index 4445fb26..6612b6a2 100644
 +	else
 +		copied = _LatteTexture_CopyRegion(baseTexture, rel->baseSliceIndex, subTexture, 0, 0, rel->yOffset, 0, 0, subTexture->width, subTexture->height);
 +
-+	static sint32 s_syncLogBudget = 40;
++	static sint32 s_syncLogBudget = 0; // set above 0 to log syncs (diagnostics)
 +	if (s_syncLogBudget > 0)
 +	{
 +		s_syncLogBudget--;
@@ -314,7 +334,7 @@ index 4445fb26..6612b6a2 100644
  void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  {
  	for (sint32 mipIndex = 0; mipIndex < texture->mipLevels; mipIndex++)
-@@ -768,6 +1061,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
+@@ -768,6 +1081,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  						else
  						{
  							LatteTexture_TrackDataOverlap(texture, sliceMipInfo, occupancy);
@@ -338,28 +358,6 @@ index 6c09e840..9d95036f 100644
  };
  
  // used if external modules want to retrieve texture cache information
-diff --git a/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp b/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp
-index 4c11e57c..eb79ccf7 100644
---- a/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp
-+++ b/src/Cafe/HW/Latte/Core/LatteTextureLegacy.cpp
-@@ -74,6 +74,17 @@ LatteTextureView* LatteTexture_CreateTexture(Latte::E_DIM dim, MPTR physAddress,
- {
- 	const auto tex = g_renderer->texture_createTextureEx(dim, physAddress, physMipAddress, format, width, height, depth, pitch, mipLevels, swizzle, tileMode, isDepth);
- 
-+	// diagnostic: log the first few hundred distinct texture shapes so lighting/shadow buffers can be identified from log.txt
-+	{
-+		static std::unordered_set<uint64> s_loggedTexShapes;
-+		uint64 key = ((uint64)width) | ((uint64)height << 14) | ((uint64)depth << 28) | ((uint64)format << 40) | ((uint64)(isDepth ? 1 : 0) << 52) | ((uint64)tileMode << 53);
-+		if (s_loggedTexShapes.size() < 400 && !s_loggedTexShapes.contains(key))
-+		{
-+			s_loggedTexShapes.insert(key);
-+			cemuLog_log(LogType::Force, "[TexCreate] {:08x} {}x{}x{} pitch {} fmt {:04x} tm {} swz {:x} depth {} dim {} mips {}", physAddress, width, height, depth, pitch, (uint32)format, (uint32)tileMode, swizzle, isDepth ? 1 : 0, (uint32)dim, mipLevels);
-+		}
-+	}
-+
- 	// init slice/mip info array
- 	LatteTexture_InitSliceAndMipInfo(tex);
- 	LatteTexture_RegisterTextureMemoryOccupancy(tex);
 diff --git a/src/Cafe/HW/Latte/Renderer/Renderer.h b/src/Cafe/HW/Latte/Renderer/Renderer.h
 index 01a6d3b2..61c893d4 100644
 --- a/src/Cafe/HW/Latte/Renderer/Renderer.h
@@ -490,252 +488,6 @@ index e3e42012..198fb98f 100644
  // called whenever a texture is destroyed
  // it is guaranteed that the texture is not in use and all associated resources (descriptor sets, framebuffers) can be destroyed safely
  void VulkanRenderer::surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture)
-diff --git a/src/Cafe/IOSU/fsa/iosu_fsa.cpp b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-index 1429d083..70e446cf 100644
---- a/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-+++ b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-@@ -165,7 +165,20 @@ namespace iosu
- 		FSCVirtualFile* __FSAOpenNode(FSAClient* client, std::string_view path, FSC_ACCESS_FLAG accessFlags, sint32& fscStatus)
- 		{
- 			std::string translatedPath = __FSATranslatePath(client, path);
--			return fsc_open(translatedPath.c_str(), accessFlags, &fscStatus);
-+			FSCVirtualFile* fscFile = fsc_open(translatedPath.c_str(), accessFlags, &fscStatus);
-+			if (!fscFile)
-+			{
-+				// diagnostic: log paths the game asked for that don't exist (each path once, capped)
-+				static std::mutex s_missingMutex;
-+				static std::unordered_set<std::string> s_loggedMissing;
-+				std::unique_lock _l(s_missingMutex);
-+				if (s_loggedMissing.size() < 500 && !s_loggedMissing.contains(translatedPath))
-+				{
-+					s_loggedMissing.insert(translatedPath);
-+					cemuLog_log(LogType::Force, "[FileMissing] {} (status {})", translatedPath, fscStatus);
-+				}
-+			}
-+			return fscFile;
- 		}
- 
- 		class _FSAHandleTable {
-diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
-index 13ef6613..ac2d74cd 100644
---- a/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
-+++ b/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
-@@ -552,7 +552,13 @@ namespace coreinit
- 		// once a line is full or \n is written it will be posted to log
- 		auto flushLine = [](CafeLogBuffer& cafeLogBuffer, std::string_view cafeLogName) -> void
- 		{
--			cemuLog_log(LogType::CoreinitLogging, "[{0}] {1}", cafeLogName, std::basic_string_view(cafeLogBuffer.lineBuffer.data(), cafeLogBuffer.lineLength));
-+			// cap the number of game debug lines so log.txt stays small
-+			static sint32 s_cafeLogLineBudget = 5000;
-+			if (s_cafeLogLineBudget > 0)
-+			{
-+				s_cafeLogLineBudget--;
-+				cemuLog_log(LogType::CoreinitLogging, "[{0}] {1}", cafeLogName, std::basic_string_view(cafeLogBuffer.lineBuffer.data(), cafeLogBuffer.lineLength));
-+			}
- 			cafeLogBuffer.lineLength = 0;
- 		};
- 
-diff --git a/src/Cafe/OS/libs/snd_core/ax_aux.cpp b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
-index a9176562..7fb96387 100644
---- a/src/Cafe/OS/libs/snd_core/ax_aux.cpp
-+++ b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
-@@ -145,6 +145,7 @@ namespace snd_core
- 			return r;
- 		if (auxBusIndex >= AX_AUX_BUS_COUNT)
- 			return -5;
-+		cemuLog_log(LogType::Force, "[AXDiag] AXRegisterAuxCallback device {} index {} bus {} func {:08x}", device, deviceIndex, auxBusIndex, funcMPTR);
- 		if (device == AX_DEV_TV)
- 		{
- 			__AXAuxTVCallbackFunc[auxBusIndex] = funcMPTR;
-@@ -283,6 +284,14 @@ namespace snd_core
- 			return r;
- 		if (auxBus >= AX_AUX_BUS_COUNT)
- 			return -5;
-+		{
-+			static sint32 s_logBudget = 30;
-+			if (s_logBudget > 0)
-+			{
-+				s_logBudget--;
-+				cemuLog_log(LogType::Force, "[AXDiag] AXSetAuxReturnVolume device {} index {} bus {} volume {:04x}", device, deviceIndex, auxBus, volume);
-+			}
-+		}
- 		if( device == AX_DEV_TV )
- 		{ 
- 			__AXTVAuxReturnVolume[auxBus] = volume;
-diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a44..0a32e9d5 100644
---- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-+++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-@@ -804,24 +804,123 @@ namespace snd_core
- 		// todo
- 	}
- 
--	void AXMix_ProcessVoices(AXVPBInternal_t* firstVoice)
-+	// ---- diagnostic: track long/looping voices (music, dialogue) and log how they are set up and how long they play ----
-+	struct AXVoiceDiagState
-+	{
-+		bool active{};
-+		bool tracked{};
-+		uint32 endOffset{};
-+		uint32 startOffset{};
-+		uint32 lastOffset{};
-+		uint32 frames{};
-+		float peakDecoded{};
-+		float peakAfterVolume{};
-+		float peakAfterFilters{};
-+	};
-+	static AXVoiceDiagState s_voiceDiag[AX_MAX_VOICES];
-+	static sint32 s_voiceDiagLogBudget = 3000;
-+
-+	static float _AXDiagPeak(const float* samples, size_t count)
-+	{
-+		float p = 0.0f;
-+		for (size_t i = 0; i < count; i++)
-+			p = std::max(p, std::fabs(samples[i]));
-+		return p / 256.0f; // in 16-bit sample units
-+	}
-+
-+	static void _AXDiagLogEnd(sint32 idx, const char* reason)
-+	{
-+		AXVoiceDiagState& st = s_voiceDiag[idx];
-+		if (st.tracked && s_voiceDiagLogBudget > 0)
-+		{
-+			s_voiceDiagLogBudget--;
-+			cemuLog_log(LogType::Force, "[AXVoice] end v{} ({}) after {}ms, advanced {} of {} | peak decoded {:.0f} after-volume {:.0f} after-filters {:.0f}",
-+				idx, reason, st.frames * 3, (sint64)st.lastOffset - (sint64)st.startOffset, (sint64)st.endOffset - (sint64)st.startOffset, st.peakDecoded, st.peakAfterVolume, st.peakAfterFilters);
-+		}
-+		st = {};
-+	}
-+
-+	static void _AXDiagLogStart(sint32 idx, AXVPBInternal_t* v)
- 	{
--		if (firstVoice == nullptr)
-+		if (s_voiceDiagLogBudget <= 0)
- 			return;
-+		s_voiceDiagLogBudget--;
-+		auto vol = [v](sint32 bus, sint32 ch) -> uint32 { return _swapEndianU16(v->deviceMixTV[ch * 4 + bus].vol); };
-+		std::string auxInfo;
-+		for (sint32 bus = 1; bus < AX_BUS_COUNT; bus++)
-+		{
-+			uint32 mask = _swapEndianU16(v->deviceMixMaskTV[bus]);
-+			if (mask == 0)
-+				continue;
-+			auxInfo += fmt::format(" aux{}[mask {:03x} vol {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}]", bus - 1, mask, vol(bus, 0), vol(bus, 1), vol(bus, 2), vol(bus, 3), vol(bus, 4), vol(bus, 5));
-+		}
-+		uint32 drcMask = 0;
-+		for (sint32 i = 0; i < 8; i++)
-+			drcMask |= _swapEndianU16(v->deviceMixMaskDRC[i]);
-+		cemuLog_log(LogType::Force, "[AXVoice] start v{} fmt {} loop {} len {} src {:08x} filter {} ve {:04x} lpf {}[{:04x} {:04x}] biquad {} | TV main[mask {:03x} vol {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}]{} | DRC mask {:x}",
-+			idx, _swapEndianU16(v->internalOffsets.format), _swapEndianU16(v->internalOffsets.loopFlag),
-+			(sint64)v->internalOffsets.GetEndOffset32() - (sint64)v->internalOffsets.GetCurrentOffset32(),
-+			v->src.GetSrcRatio32(), _swapEndianU16(v->srcFilterMode), (uint32)v->veVolume,
-+			_swapEndianU16(v->lpf.on), _swapEndianU16(v->lpf.a0), _swapEndianU16(v->lpf.b0), _swapEndianU16(v->biquad.on),
-+			_swapEndianU16(v->deviceMixMaskTV[0]), vol(0, 0), vol(0, 1), vol(0, 2), vol(0, 3), vol(0, 4), vol(0, 5), auxInfo, drcMask);
-+	}
-+
-+	void AXMix_ProcessVoices(AXVPBInternal_t* firstVoice)
-+	{
-+		bool voiceSeen[AX_MAX_VOICES] = {};
-+		if (firstVoice != nullptr)
-+		{
- 		size_t sampleCount = AXGetInputSamplesPerFrame();
- 		AXVPBInternal_t* internalVoice = firstVoice;
- 		cemu_assert_debug(sndGeneric.initParam.frameLength == 0);
- 		float tmpSampleBuffer[AX_SAMPLES_MAX];
- 		while (internalVoice)
- 		{
-+			sint32 idx = (sint32)(uint16)internalVoice->index;
-+			AXVoiceDiagState* st = (idx >= 0 && idx < AX_MAX_VOICES) ? &s_voiceDiag[idx] : nullptr;
-+			if (st)
-+			{
-+				voiceSeen[idx] = true;
-+				uint32 endOffset = internalVoice->internalOffsets.GetEndOffset32();
-+				uint32 curOffset = internalVoice->internalOffsets.GetCurrentOffset32();
-+				bool voiceLoops = _swapEndianU16(internalVoice->internalOffsets.loopFlag) != 0;
-+				if (st->active && st->endOffset != endOffset && !voiceLoops)
-+					_AXDiagLogEnd(idx, "replaced");
-+				if (!st->active)
-+				{
-+					st->active = true;
-+					st->endOffset = endOffset;
-+					st->startOffset = curOffset;
-+					st->tracked = voiceLoops || ((sint64)endOffset - (sint64)curOffset) > 40000;
-+					if (st->tracked)
-+						_AXDiagLogStart(idx, internalVoice);
-+				}
-+			}
- 			AXVoiceMix_DecodeSamples(internalVoice, tmpSampleBuffer, sampleCount);
-+			if (st && st->tracked)
-+				st->peakDecoded = std::max(st->peakDecoded, _AXDiagPeak(tmpSampleBuffer, sampleCount));
- 			AXVoiceMix_ApplyADSR(internalVoice, tmpSampleBuffer, sampleCount);
-+			if (st && st->tracked)
-+				st->peakAfterVolume = std::max(st->peakAfterVolume, _AXDiagPeak(tmpSampleBuffer, sampleCount));
- 			AXVoiceMix_ApplyBiquad(internalVoice, tmpSampleBuffer, sampleCount);
- 			AXVoiceMix_ApplyLowPass(internalVoice, tmpSampleBuffer, sampleCount);
-+			if (st && st->tracked)
-+			{
-+				st->peakAfterFilters = std::max(st->peakAfterFilters, _AXDiagPeak(tmpSampleBuffer, sampleCount));
-+				st->frames++;
-+				st->lastOffset = internalVoice->internalOffsets.GetCurrentOffset32();
-+			}
- 			AXVoiceMix_MixIntoBuses(internalVoice, tmpSampleBuffer, sampleCount, sampleCount);
- 			// next
- 			internalVoice = internalVoice->nextToProcess.GetPtr();
- 		}
-+		}
-+		// voices that were active last frame but not processed anymore have stopped
-+		for (sint32 i = 0; i < AX_MAX_VOICES; i++)
-+		{
-+			if (s_voiceDiag[i].active && !voiceSeen[i])
-+				_AXDiagLogEnd(i, "stopped");
-+		}
- 	}
- 
- 	void AXMix_MergeBusSamples(float* input, sint32* output, sint32 sampleCount, uint16& volume, sint16 delta)
-diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-index d4e562e0..f6e13e0f 100644
---- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-+++ b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-@@ -369,6 +369,15 @@ namespace snd_core
- 				while (voiceItr->next)
- 					voiceItr = voiceItr->next.GetPtr();
- 				cemuLog_logDebug(LogType::Force, "Dropped voice {}", (uint32)voiceItr->index);
-+				{
-+					// diagnostic: log the first few voice drops
-+					static sint32 s_dropLogBudget = 40;
-+					if (s_dropLogBudget > 0)
-+					{
-+						s_dropLogBudget--;
-+						cemuLog_log(LogType::Force, "[AXDiag] dropped voice {} (priority {}) to make room for a voice with priority {}", (uint32)voiceItr->index, i, priority);
-+					}
-+				}
- 				// drop voice
- 				if (voiceItr->playbackState != 0)
- 				{
-@@ -409,6 +418,12 @@ namespace snd_core
- 			if (!vpb)
- 			{
- 				// no voice available
-+				static sint32 s_acquireFailLogBudget = 40;
-+				if (s_acquireFailLogBudget > 0)
-+				{
-+					s_acquireFailLogBudget--;
-+					cemuLog_log(LogType::Force, "[AXDiag] AXAcquireVoice failed, no free voice (requested priority {})", priority);
-+				}
- 				__AXVoiceListSpinlock.unlock();
- 				return nullptr;
- 			}
-diff --git a/src/Cemu/Logging/CemuLogging.cpp b/src/Cemu/Logging/CemuLogging.cpp
-index f2d9ac05..28555c35 100644
---- a/src/Cemu/Logging/CemuLogging.cpp
-+++ b/src/Cemu/Logging/CemuLogging.cpp
-@@ -264,4 +264,6 @@ std::unique_lock<decltype(LogContext.log_mutex)> cemuLog_acquire()
- void cemuLog_setActiveLoggingFlags(uint64 flagMask)
- {
- 	s_loggingFlagMask = flagMask | cemuLog_getFlag(LogType::Force);
-+	// Light Fix diagnostic build: always record unsupported OS calls and the game's own debug messages
-+	s_loggingFlagMask |= cemuLog_getFlag(LogType::UnsupportedAPI) | cemuLog_getFlag(LogType::CoreinitLogging);
- }
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
 index 3c1587e7..7430cfee 100644
 --- a/src/android/app/build.gradle.kts

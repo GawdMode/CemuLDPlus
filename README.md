@@ -31,8 +31,9 @@ copy the save back. Build 3 and later can all be installed as normal updates.
 ## Known issues
 
 - Some NPC voice lines (for example the mini-quest characters) don't play, and their text may not appear until
-  you tap. This also happens in regular Cemu, on Android and PC. Build 4 tried a fix that didn't work and made other
-  audio crunchy, so **build 5 removes it** and instead logs more detail to track down the real cause.
+  you tap. This also happens in regular Cemu, on Android and PC, and is still being looked into.
+- Builds 1–5 had audio stutter and a crunchy/rumbling sound in busy areas that regular Cemu doesn't have.
+  Build 6 removes all the extra diagnostic logging and makes the lighting fix's checks cheaper, to track this down.
 
 ## Important: play at 720p
 
@@ -69,11 +70,7 @@ of the larger texture was ever filled in. That's why lighting only worked in a s
 
 [`lightfix.patch`](lightfix.patch) adds tracking and copying for these "offset" textures. A pair is only
 linked after checking with Cemu's address math that both memory layouts really line up. It also adds
-depth↔color copies with offsets on Vulkan. The patch writes `[TexCreate]` and `[OffsetTexSync]` lines to
-`log.txt` to help with diagnosing problems. It also logs missing game files (`[FileMissing]`), sound voice
-problems (`[AXDiag]`), unsupported system calls and the game's own debug messages, to help track down the
-missing NPC voice lines (a long-standing Cemu issue with LEGO Dimensions that isn't fixed yet). Long or looping
-sounds such as music and dialogue are logged as `[AXVoice]` lines showing how each one is set up and how long it plays.
+depth↔color copies with offsets on Vulkan. It only links two textures after checking that their memory layouts really line up, and caches those checks.
 
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.

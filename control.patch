@@ -1,0 +1,25 @@
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 3c1587e7..7430cfee 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -45,7 +45,8 @@ android {
+     compileSdk = 36
+     ndkVersion = "29.0.14206865"
+     defaultConfig {
+-        applicationId = "info.cemu.cemu"
++        // Control test build: plain Cemu with its own app id, for comparing against Cemu Light Fix
++        applicationId = "info.cemu.cemu.control"
+         minSdk = 30
+         targetSdk = 35
+         versionName = getVersionName()
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 053d3be8..1455fa33 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -1,5 +1,5 @@
+ <resources>
+-    <string name="app_name" translatable="false">Cemu</string>
++    <string name="app_name" translatable="false">Cemu Control</string>
+     <string name="cemu_original_authors" translatable="false">Exzap, Petergov</string>
+     <string name="cemu_website" translatable="false">https://cemu.info</string>
+     <string name="cemu_online_guide" translatable="false">https://cemu.info/online-guide</string>
