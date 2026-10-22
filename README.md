@@ -32,8 +32,18 @@ copy the save back. Build 3 and later can all be installed as normal updates.
 
 - Some NPC voice lines (for example the mini-quest characters) don't play, and their text may not appear until
   you tap. This also happens in regular Cemu, on Android and PC, and is still being looked into.
-- Builds 1–5 had audio stutter and a crunchy/rumbling sound in busy areas that regular Cemu doesn't have.
-  Build 6 removes all the extra diagnostic logging and makes the lighting fix's checks cheaper, to track this down.
+
+## Important: game profile settings (fixes stuttering, crunchy audio)
+
+Cemu Light Fix is a separate app, so it starts with its own default settings. With the defaults, LEGO Dimensions
+audio can stutter and sound crunchy or rumbly, especially in the hub, even though the frame rate is fine.
+
+On the game list, **long-press LEGO Dimensions → Edit game profile** and set:
+
+- **CPU mode:** Single-core recompiler
+- **Thread quantum:** 100000
+
+These are tested on an AYN Thor. If you use a custom GPU driver in your regular Cemu, pick the same one here too.
 
 ## Important: play at 720p
 

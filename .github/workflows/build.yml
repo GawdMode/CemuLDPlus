@@ -2,8 +2,8 @@ name: Build Cemu Light Fix APK
 
 # Downloads SSimco's Cemu Android port at a fixed commit, applies lightfix.patch,
 # builds the APK and publishes it as a GitHub release for direct download on the device.
-# While BUILD_CONTROL is on, it also builds "Cemu Control": the same Cemu with no fixes
-# (only a separate app id), to compare against.
+# It can also build "Cemu Control" (the same Cemu with no fixes, only a separate app id) for comparison tests,
+# see the commented-out matrix entry below.
 
 on:
   push:
@@ -34,9 +34,10 @@ jobs:
           - variant: lightfix
             patch: lightfix.patch
             apk: Cemu-LightFix.apk
-          - variant: control
-            patch: control.patch
-            apk: Cemu-Control-test.apk
+          # "Cemu Control" = same Cemu with no fixes, for comparison tests. Uncomment to build it again.
+          # - variant: control
+          #   patch: control.patch
+          #   apk: Cemu-Control-test.apk
     env:
       VCPKG_ROOT: "${{ github.workspace }}/cemu/dependencies/vcpkg"
 
