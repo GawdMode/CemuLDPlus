@@ -552,7 +552,7 @@ index 13ef6613..ac2d74cd 100644
  		};
  
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
-index b23560f1..c8f20faf 100644
+index b23560f1..5c1efa06 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 @@ -575,6 +575,8 @@ namespace nsyshid
@@ -697,14 +697,29 @@ index b23560f1..c8f20faf 100644
  	bool DimensionsUSB::MoveFigure(uint8 pad, uint8 index, uint8 oldPad, uint8 oldIndex)
  	{
  		if (oldIndex == index)
+@@ -1016,6 +1144,11 @@ namespace nsyshid
+ 		return (uint32&)modelNumber[0];
+ 	}
+ 
++	uint32 DimensionsUSB::GetFigureIdFromData(const std::array<uint8, 0x2D * 0x04>& buf)
++	{
++		return GetFigureId(buf);
++	}
++
+ 	DimensionsUSB::DimensionsMini&
+ 	DimensionsUSB::GetFigureByIndex(uint8 index)
+ 	{
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.h b/src/Cafe/OS/libs/nsyshid/Dimensions.h
-index 00ceff9e..a7433849 100644
+index 00ceff9e..69a3ff24 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.h
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.h
-@@ -79,6 +79,17 @@ namespace nsyshid
+@@ -78,6 +78,19 @@ namespace nsyshid
+ 		static std::map<const uint32, const char*> GetListMinifigs();
  		static std::map<const uint32, const char*> GetListTokens();
  		std::string FindFigure(uint32 figNum);
- 
++		// figure number stored in a figure's data (characters < 1000, vehicles and gadgets >= 1000)
++		uint32 GetFigureIdFromData(const std::array<uint8, 0x2D * 0x04>& buf);
++
 +		// Toy Pad light state as last set by the game (index 0 = center, 1 = left, 2 = right)
 +		struct PadLight
 +		{
@@ -715,11 +730,10 @@ index 00ceff9e..a7433849 100644
 +			uint8 count = 0;  // number of pulses
 +		};
 +		std::array<PadLight, 3> GetPadLights();
-+
+ 
  	  protected:
  		std::mutex m_dimensionsMutex;
- 		std::array<DimensionsMini, 7> m_figures{};
-@@ -104,6 +115,11 @@ namespace nsyshid
+@@ -104,6 +117,11 @@ namespace nsyshid
  
  		bool m_isAwake = false;
  
@@ -731,6 +745,21 @@ index 00ceff9e..a7433849 100644
  		std::queue<std::array<uint8, 32>> m_figureAddedRemovedResponses;
  		std::queue<std::array<uint8, 32>> m_queries;
  	};
+diff --git a/src/Cafe/OS/libs/snd_core/ax.h b/src/Cafe/OS/libs/snd_core/ax.h
+index 0861e6a7..c1c44e4f 100644
+--- a/src/Cafe/OS/libs/snd_core/ax.h
++++ b/src/Cafe/OS/libs/snd_core/ax.h
+@@ -391,6 +391,9 @@ namespace snd_core
+ 	void AXOut_reset();
+ 	void AXOut_update();
+ 
++	// diagnostics: mark a moment in the log (from the app) and log sound levels for the next 20 seconds
++	void AXDiag_Mark(const char* note);
++
+ 	COSModule* GetModuleSndCore1();
+ 	COSModule* GetModuleSndCore2();
+ }
+\ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_aux.cpp b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
 index a9176562..7fb96387 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_aux.cpp
@@ -774,7 +803,7 @@ index cb7c153e..4e84d9bc 100644
  }
 \ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a44..8112fcc5 100644
+index 31a24a44..1f8fd15a 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 @@ -751,15 +751,24 @@ namespace snd_core
@@ -807,7 +836,7 @@ index 31a24a44..8112fcc5 100644
  	}
  
  	// mix audio generated from voice into main bus and aux buses
-@@ -804,24 +813,165 @@ namespace snd_core
+@@ -804,24 +813,297 @@ namespace snd_core
  		// todo
  	}
  
@@ -850,8 +879,7 @@ index 31a24a44..8112fcc5 100644
 +	}
 +
 +	static float _AXDiagPeak(const float* samples, size_t count)
- 	{
--		if (firstVoice == nullptr)
++	{
 +		float p = 0.0f;
 +		for (size_t i = 0; i < count; i++)
 +			p = std::max(p, std::fabs(samples[i]));
@@ -886,7 +914,8 @@ index 31a24a44..8112fcc5 100644
 +	}
 +
 +	static void _AXDiagLogStart(sint32 idx, AXVPBInternal_t* v, uint32 samplesAddr)
-+	{
+ 	{
+-		if (firstVoice == nullptr)
 +		if (s_voiceDiagLogBudget <= 0)
  			return;
 +		s_voiceDiagLogBudget--;
@@ -911,9 +940,139 @@ index 31a24a44..8112fcc5 100644
 +			_swapEndianU16(v->deviceMixMaskTV[0]), vol(0, 0), vol(0, 1), vol(0, 2), vol(0, 3), vol(0, 4), vol(0, 5), auxInfo, drcMask);
 +	}
 +
++	// ---- diagnostic: after the user taps "Mark" in the app, log what is playing and how loud for 20 seconds ----
++	static std::atomic<uint64> s_markUntilMs{0};
++	struct AXLevelAcc
++	{
++		double mainEnergy{}; // energy reaching TV main bus channel 0+1 (16-bit units squared, summed)
++		double auxEnergy{};  // energy sent to aux buses (channel 0+1)
++		double rawEnergy{};  // energy after filters, before mixing
++		uint32 samples{};
++		uint16 format{};
++		bool used{};
++	};
++	static AXLevelAcc s_levelVoice[AX_MAX_VOICES];
++	static double s_levelOutEnergy[3]{}; // L, R, center
++	static uint32 s_levelOutSamples = 0;
++	static uint32 s_levelFrames = 0;
++
++	static uint64 _AXDiagMarkNowMs()
++	{
++		return (uint64)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++	}
++
++	static bool _AXDiagMarking()
++	{
++		return _AXDiagMarkNowMs() < s_markUntilMs.load();
++	}
++
++	static std::string _AXDiagDb(double energy, uint32 samples)
++	{
++		if (samples == 0 || energy <= 0.0)
++			return "-inf";
++		double rms = std::sqrt(energy / (double)samples);
++		return fmt::format("{:.1f}", 20.0 * std::log10(std::max(rms, 1e-9) / 32768.0));
++	}
++
++	void AXDiag_Mark(const char* note)
++	{
++		cemuLog_log(LogType::Force, "[Marker] {} -- logging sound levels for 20 seconds", note ? note : "");
++		// snapshot of all voices the game currently has running
++		for (sint32 i = 0; __AXVPBArrayPtr != nullptr && i < AX_MAX_VOICES; i++)
++		{
++			AXVPB* vpb = __AXVPBArrayPtr + i;
++			AXVPBInternal_t* internal = __AXVPBInternalVoiceArray + i;
++			uint32 state = (uint32)vpb->playbackState;
++			if (state == 0)
++				continue;
++			auto vol = [internal](sint32 bus, sint32 ch) -> uint32 { return _swapEndianU16(internal->deviceMixTV[ch * 4 + bus].vol); };
++			cemuLog_log(LogType::Force, "[Marker] running v{} prio {} fmt {} loop {} samples {:08x} cur {:x} end {:x} | ve {:04x} lpf {}[{:04x} {:04x}] | TV main {:04x} {:04x} {:04x} {:04x} {:04x} {:04x} aux0 {:04x} {:04x}",
++				i, (uint32)vpb->priority, _swapEndianU16(vpb->offsets.format), _swapEndianU16(vpb->offsets.loopFlag), _swapEndianU32(vpb->offsets.samples),
++				_swapEndianU32(vpb->offsets.currentOffset), _swapEndianU32(vpb->offsets.endOffset),
++				(uint32)internal->veVolume, _swapEndianU16(internal->lpf.on), _swapEndianU16(internal->lpf.a0), _swapEndianU16(internal->lpf.b0),
++				vol(0, 0), vol(0, 1), vol(0, 2), vol(0, 3), vol(0, 4), vol(0, 5), vol(1, 0), vol(1, 1));
++		}
++		for (auto& v : s_levelVoice)
++			v = {};
++		s_levelOutEnergy[0] = s_levelOutEnergy[1] = s_levelOutEnergy[2] = 0.0;
++		s_levelOutSamples = 0;
++		s_levelFrames = 0;
++		s_markUntilMs = _AXDiagMarkNowMs() + 20000;
++	}
++
++	static void _AXDiagLevelAccumulateVoice(sint32 idx, AXVPBInternal_t* v, const float* samples, size_t count)
++	{
++		double e = 0.0;
++		for (size_t i = 0; i < count; i++)
++		{
++			double s16 = (double)samples[i] / 256.0;
++			e += s16 * s16;
++		}
++		auto gain = [v](sint32 bus, sint32 ch) -> double {
++			if (((_swapEndianU16(v->deviceMixMaskTV[bus]) >> (ch * 2)) & 3) == 0)
++				return 0.0;
++			return (double)_swapEndianU16(v->deviceMixTV[ch * 4 + bus].vol) / 32768.0;
++		};
++		double gMain = (gain(0, 0) * gain(0, 0) + gain(0, 1) * gain(0, 1)) * 0.5;
++		double gAux = 0.0;
++		for (sint32 bus = 1; bus < AX_BUS_COUNT; bus++)
++			gAux += (gain(bus, 0) * gain(bus, 0) + gain(bus, 1) * gain(bus, 1)) * 0.5;
++		AXLevelAcc& acc = s_levelVoice[idx];
++		acc.used = true;
++		acc.format = _swapEndianU16(v->internalOffsets.format);
++		acc.rawEnergy += e;
++		acc.mainEnergy += e * gMain;
++		acc.auxEnergy += e * gAux;
++		acc.samples += (uint32)count;
++	}
++
++	static void _AXDiagLevelAccumulateOutput()
++	{
++		size_t sampleCount = AXGetInputSamplesPerFrame();
++		const sint32* out = __AXTVOutputBuffer.GetPtr();
++		const sint32 channels[3] = {0, 1, 4};
++		for (sint32 c = 0; c < 3; c++)
++		{
++			const sint32* p = out + channels[c] * sampleCount;
++			double e = 0.0;
++			for (size_t i = 0; i < sampleCount; i++)
++			{
++				double s16 = (double)_swapEndianS32(p[i]);
++				e += s16 * s16;
++			}
++			s_levelOutEnergy[c] += e;
++		}
++		s_levelOutSamples += (uint32)sampleCount;
++		s_levelFrames++;
++		if (s_levelFrames < 83) // about 250ms
++			return;
++		// report: overall output and the loudest voices
++		std::vector<sint32> order;
++		for (sint32 i = 0; i < AX_MAX_VOICES; i++)
++			if (s_levelVoice[i].used && s_levelVoice[i].samples > 0)
++				order.push_back(i);
++		std::sort(order.begin(), order.end(), [](sint32 a, sint32 b) {
++			return s_levelVoice[a].mainEnergy + s_levelVoice[a].auxEnergy > s_levelVoice[b].mainEnergy + s_levelVoice[b].auxEnergy;
++		});
++		std::string line = fmt::format("[AXLevel] out L {} R {} C {} dB |", _AXDiagDb(s_levelOutEnergy[0], s_levelOutSamples), _AXDiagDb(s_levelOutEnergy[1], s_levelOutSamples), _AXDiagDb(s_levelOutEnergy[2], s_levelOutSamples));
++		for (size_t k = 0; k < order.size() && k < 6; k++)
++		{
++			const AXLevelAcc& a = s_levelVoice[order[k]];
++			// voice levels are averaged over the whole 250ms window so they compare directly with the output level
++			line += fmt::format(" v{} fmt{} main {} aux {} (raw {})", order[k], a.format, _AXDiagDb(a.mainEnergy, s_levelOutSamples), _AXDiagDb(a.auxEnergy, s_levelOutSamples), _AXDiagDb(a.rawEnergy, a.samples));
++		}
++		cemuLog_log(LogType::Force, "{}", line);
++		for (auto& v : s_levelVoice)
++			v = {};
++		s_levelOutEnergy[0] = s_levelOutEnergy[1] = s_levelOutEnergy[2] = 0.0;
++		s_levelOutSamples = 0;
++		s_levelFrames = 0;
++	}
++
 +	void AXMix_ProcessVoices(AXVPBInternal_t* firstVoice)
 +	{
 +		bool voiceSeen[AX_MAX_VOICES] = {};
++		const bool marking = _AXDiagMarking();
 +		if (firstVoice != nullptr)
 +		{
  		size_t sampleCount = AXGetInputSamplesPerFrame();
@@ -961,6 +1120,8 @@ index 31a24a44..8112fcc5 100644
 +				st->frames++;
 +				st->lastOffset = internalVoice->internalOffsets.GetCurrentOffset32();
 +			}
++			if (marking && idx >= 0 && idx < AX_MAX_VOICES)
++				_AXDiagLevelAccumulateVoice(idx, internalVoice, tmpSampleBuffer, sampleCount);
  			AXVoiceMix_MixIntoBuses(internalVoice, tmpSampleBuffer, sampleCount, sampleCount);
  			// next
  			internalVoice = internalVoice->nextToProcess.GetPtr();
@@ -975,6 +1136,15 @@ index 31a24a44..8112fcc5 100644
  	}
  
  	void AXMix_MergeBusSamples(float* input, sint32* output, sint32 sampleCount, uint16& volume, sint16 delta)
+@@ -977,6 +1259,8 @@ namespace snd_core
+ 
+ 		// merge main and aux buses
+ 		AXMix_mergeTVBuses();
++		if (_AXDiagMarking())
++			_AXDiagLevelAccumulateOutput();
+ 		AXMix_mergeDRC0Buses();
+ 
+ 		AXAux_incrementBufferIndex();
 diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 index d4e562e0..793ea1ee 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
@@ -1265,13 +1435,36 @@ index 3c1587e7..7430cfee 100644
          targetSdk = 35
          versionName = getVersionName()
 diff --git a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
-index 1190bf43..cd79e27f 100644
+index 1190bf43..e956b930 100644
 --- a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 +++ b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
-@@ -381,3 +381,21 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_moveDimensionsFigur
+@@ -381,3 +381,44 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_moveDimensionsFigur
  		oldSlot = std::nullopt;
  	}
  }
++
++extern "C" JNIEXPORT jint JNICALL
++Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsFigureSlotNumber([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jint slot)
++{
++	if (slot < 0 || slot >= (jint)NativeEmulatedUSBDevices::g_dimensionSlots.size())
++		return -1;
++	if (const auto& opt = NativeEmulatedUSBDevices::g_dimensionSlots.at(slot))
++		return (jint)opt->number;
++	return -1;
++}
++
++extern "C" JNIEXPORT jint JNICALL
++Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsFigureNumber(JNIEnv* env, [[maybe_unused]] jclass clazz, jstring path)
++{
++	// read only the figure's data to find which character/vehicle it is
++	std::unique_ptr<FileStream> file(FileStream::openFile2(JNIUtils::FromJString(env, path), false));
++	if (!file)
++		return -1;
++	std::array<uint8, 0x2D * 0x04> data{};
++	if (file->readData(data.data(), data.size()) != data.size())
++		return -1;
++	return (jint)nsyshid::g_dimensionstoypad.GetFigureIdFromData(data);
++}
 +
 +extern "C" JNIEXPORT jintArray JNICALL
 +Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsPadLights(JNIEnv* env, [[maybe_unused]] jclass clazz)
@@ -1290,6 +1483,34 @@ index 1190bf43..cd79e27f 100644
 +	env->SetIntArrayRegion(result, 0, 12, values);
 +	return result;
 +}
+diff --git a/src/android/app/src/main/cpp/NativeLogging.cpp b/src/android/app/src/main/cpp/NativeLogging.cpp
+index 19a75475..7487fa57 100644
+--- a/src/android/app/src/main/cpp/NativeLogging.cpp
++++ b/src/android/app/src/main/cpp/NativeLogging.cpp
+@@ -1,10 +1,22 @@
+ #include "Common/ExceptionHandler/ExceptionHandler.h"
+ #include "JNIUtils.h"
+ 
++namespace snd_core
++{
++	void AXDiag_Mark(const char* note); // ax_mix.cpp
++}
++
+ extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+ Java_info_cemu_cemu_nativeinterface_NativeLogging_log(JNIEnv* env, [[maybe_unused]] jclass clazz, jstring message)
+ {
+-	cemuLog_log(LogType::Force, JNIUtils::FromJString(env, message));
++	std::string text = JNIUtils::FromJString(env, message);
++	// "[Marker] ..." comes from the Mark button on the Toy Pad screen: also log what is playing and how loud
++	if (text.rfind("[Marker]", 0) == 0)
++	{
++		snd_core::AXDiag_Mark(text.c_str() + 8);
++		return;
++	}
++	cemuLog_log(LogType::Force, text);
+ }
+ 
+ extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
 index 29a5c740..824d90f8 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
@@ -1337,12 +1558,381 @@ index 29a5c740..824d90f8 100644
      override fun onPause() {
          super.onPause()
  
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
+new file mode 100644
+index 00000000..2c6b675d
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
+@@ -0,0 +1,210 @@
++package info.cemu.cemu.emulation.toypadscreen
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.net.Uri
++import android.util.LruCache
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.graphics.ImageBitmap
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.platform.LocalContext
++import info.cemu.cemu.nativeinterface.NativeEmulatedUSBDevices
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.sync.withPermit
++import kotlinx.coroutines.withContext
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.URL
++import java.util.concurrent.ConcurrentHashMap
++
++/** Settings for the Toy Pad on the second screen. */
++object ToyPadScreenSettings {
++    private const val PREFS = "toypad_screen"
++    private const val KEY_FIGURE_PICTURES = "figure_pictures"
++
++    fun figurePicturesEnabled(context: Context): Boolean =
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_FIGURE_PICTURES, true)
++
++    fun setFigurePicturesEnabled(context: Context, enabled: Boolean) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_FIGURE_PICTURES, enabled).apply()
++    }
++
++    /** Folder shown as "toypad" inside the app's folder (the one "Open Cemu folder" opens). */
++    fun folder(context: Context): File = File(context.getExternalFilesDir(null) ?: context.filesDir, "toypad")
++}
++
++private fun decodeScaled(file: File, maxSize: Int): Bitmap? {
++    return try {
++        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++        BitmapFactory.decodeFile(file.path, bounds)
++        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
++        var sample = 1
++        while (bounds.outWidth / (sample * 2) >= maxSize && bounds.outHeight / (sample * 2) >= maxSize) sample *= 2
++        BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
++    } catch (_: Throwable) {
++        null
++    }
++}
++
++/**
++ * Pictures of figures, by figure number. A picture is taken from the "toypad/figures" folder if one is there
++ * (named like 1.png for Batman, 1000.png for the Police Car). Otherwise it is downloaded once from the community
++ * LEGO-Dimensions-NFC collection and kept in that folder. Nothing is bundled with the app.
++ */
++object FigureImages {
++    private const val BASE_URL =
++        "https://raw.githubusercontent.com/skylandersNFC/LEGO-Dimensions-NFC/main/Dimensions_Images/images/Separate/Chteupnin%27s%20Assets/"
++    private const val RETRY_AFTER_MS = 60_000L
++
++    private val memory = LruCache<Int, ImageBitmap>(240)
++    private val missing = ConcurrentHashMap.newKeySet<Int>() // not in the collection
++    private val failedAt = ConcurrentHashMap<Int, Long>() // download failed (offline?), retry later
++    private val locks = ConcurrentHashMap<Int, Mutex>()
++    private val downloads = Semaphore(4)
++
++    fun folder(context: Context): File = File(ToyPadScreenSettings.folder(context), "figures")
++
++    fun cached(id: Int): ImageBitmap? = if (id > 0) memory.get(id) else null
++
++    suspend fun load(context: Context, id: Int): ImageBitmap? {
++        if (id <= 0) return null
++        memory.get(id)?.let { return it }
++        val lock = locks.getOrPut(id) { Mutex() }
++        return lock.withLock {
++            memory.get(id) ?: withContext(Dispatchers.IO) {
++                val dir = folder(context)
++                val local = listOf("png", "webp", "jpg", "jpeg")
++                    .map { File(dir, "$id.$it") }
++                    .firstOrNull { it.isFile && it.length() > 0 }
++                val file = local ?: if (ToyPadScreenSettings.figurePicturesEnabled(context)) download(dir, id) else null
++                file?.let { decodeScaled(it, 256) }?.asImageBitmap()?.also { memory.put(id, it) }
++            }
++        }
++    }
++
++    private suspend fun download(dir: File, id: Int): File? {
++        if (id in missing) return null
++        val lastFail = failedAt[id]
++        if (lastFail != null && System.currentTimeMillis() - lastFail < RETRY_AFTER_MS) return null
++        return downloads.withPermit {
++            try {
++                dir.mkdirs()
++                val connection = URL("$BASE_URL$id.png").openConnection() as HttpURLConnection
++                connection.connectTimeout = 8000
++                connection.readTimeout = 15000
++                try {
++                    when (connection.responseCode) {
++                        200 -> {
++                            val part = File(dir, "$id.png.part")
++                            connection.inputStream.use { input -> part.outputStream().use { input.copyTo(it) } }
++                            val out = File(dir, "$id.png")
++                            if (part.length() > 0 && part.renameTo(out)) {
++                                failedAt.remove(id)
++                                out
++                            } else {
++                                part.delete()
++                                failedAt[id] = System.currentTimeMillis()
++                                null
++                            }
++                        }
++
++                        404 -> {
++                            missing.add(id)
++                            null
++                        }
++
++                        else -> {
++                            failedAt[id] = System.currentTimeMillis()
++                            null
++                        }
++                    }
++                } finally {
++                    connection.disconnect()
++                }
++            } catch (_: Throwable) {
++                failedAt[id] = System.currentTimeMillis()
++                null
++            }
++        }
++    }
++}
++
++/** Figure numbers of installed figure files, read once per file. */
++object FigureNumbers {
++    private val byPath = ConcurrentHashMap<String, Int>()
++
++    fun forPath(path: String): Int = byPath.getOrPut(path) {
++        try {
++            NativeEmulatedUSBDevices.getDimensionsFigureNumber(path)
++        } catch (_: Throwable) {
++            -1
++        }
++    }
++}
++
++@Composable
++fun rememberFigureImage(id: Int): ImageBitmap? {
++    val context = LocalContext.current.applicationContext
++    val image = remember(id) { mutableStateOf(FigureImages.cached(id)) }
++    LaunchedEffect(id) {
++        if (image.value == null && id > 0) image.value = FigureImages.load(context, id)
++    }
++    return image.value
++}
++
++/** Optional picture behind the Toy Pad screen, chosen in the Emulated USB Devices settings. */
++object ToyPadBackgroundImage {
++    private const val MAX_SIZE = 1600
++
++    // bumped whenever the picture changes so screens reload it
++    var version by mutableIntStateOf(0)
++        private set
++
++    private fun file(context: Context) = File(ToyPadScreenSettings.folder(context), "background.jpg")
++
++    fun exists(context: Context) = file(context).isFile
++
++    fun load(context: Context): ImageBitmap? {
++        val f = file(context)
++        if (!f.isFile) return null
++        return decodeScaled(f, MAX_SIZE)?.asImageBitmap()
++    }
++
++    suspend fun save(context: Context, uri: Uri): Boolean = withContext(Dispatchers.IO) {
++        try {
++            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++            context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
++            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withContext false
++            var sample = 1
++            while (bounds.outWidth / (sample * 2) >= MAX_SIZE && bounds.outHeight / (sample * 2) >= MAX_SIZE) sample *= 2
++            val bitmap = context.contentResolver.openInputStream(uri)?.use {
++                BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
++            } ?: return@withContext false
++            val target = file(context)
++            target.parentFile?.mkdirs()
++            val part = File(target.path + ".part")
++            part.outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 92, it) }
++            bitmap.recycle()
++            val ok = part.renameTo(target)
++            withContext(Dispatchers.Main) { version++ }
++            ok
++        } catch (_: Throwable) {
++            false
++        }
++    }
++
++    fun clear(context: Context) {
++        file(context).delete()
++        version++
++    }
++}
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt
+new file mode 100644
+index 00000000..1b23271a
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt
+@@ -0,0 +1,147 @@
++package info.cemu.cemu.emulation.toypadscreen
++
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawWithCache
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import kotlin.math.cos
++import kotlin.math.min
++import kotlin.math.sin
++import kotlin.random.Random
++
++/** The picture behind the Toy Pad: the one chosen in settings, or a drawn star map. */
++@Composable
++fun ToyPadBackground(modifier: Modifier = Modifier) {
++    val context = LocalContext.current.applicationContext
++    val version = ToyPadBackgroundImage.version
++    val custom = remember(version) { ToyPadBackgroundImage.load(context) }
++    Box(modifier = modifier.fillMaxSize()) {
++        if (custom != null) {
++            Image(
++                bitmap = custom,
++                contentDescription = null,
++                contentScale = ContentScale.Crop,
++                modifier = Modifier.fillMaxSize(),
++            )
++            // keep text and pads readable on bright pictures
++            Box(
++                modifier = Modifier
++                    .fillMaxSize()
++                    .background(
++                        Brush.verticalGradient(
++                            0f to Color(0x66000000),
++                            0.5f to Color(0x33000000),
++                            1f to Color(0x99000000),
++                        )
++                    )
++            )
++        } else {
++            StarMap(Modifier.fillMaxSize())
++        }
++    }
++}
++
++private class Star(val x: Float, val y: Float, val radius: Float, val alpha: Float)
++private class Constellation(val points: List<Offset>, val edges: List<Pair<Int, Int>>)
++
++@Composable
++private fun StarMap(modifier: Modifier = Modifier) {
++    val stars = remember {
++        val random = Random(23)
++        List(220) {
++            val big = random.nextFloat() < 0.08f
++            Star(
++                x = random.nextFloat(),
++                y = random.nextFloat(),
++                radius = if (big) 1.6f + random.nextFloat() * 1.4f else 0.5f + random.nextFloat() * 0.9f,
++                alpha = 0.25f + random.nextFloat() * 0.75f,
++            )
++        }
++    }
++    val constellations = remember {
++        val random = Random(7)
++        List(9) {
++            val cx = random.nextFloat()
++            val cy = random.nextFloat()
++            val count = 4 + random.nextInt(4)
++            val points = List(count) {
++                Offset(
++                    (cx + (random.nextFloat() - 0.5f) * 0.32f).coerceIn(0.02f, 0.98f),
++                    (cy + (random.nextFloat() - 0.5f) * 0.32f).coerceIn(0.02f, 0.98f),
++                )
++            }
++            val edges = buildList {
++                for (i in 1 until count) add(Pair(i - 1, i))
++                if (count > 4 && random.nextBoolean()) add(Pair(0, count - 1))
++            }
++            Constellation(points, edges)
++        }
++    }
++    Box(
++        modifier = modifier.drawWithCache {
++            val w = size.width
++            val h = size.height
++            val base = Brush.verticalGradient(
++                0f to Color(0xFF040714),
++                0.55f to Color(0xFF081233),
++                1f to Color(0xFF03050F),
++            )
++            val glowRight = Brush.radialGradient(
++                colors = listOf(Color(0x8A2B7BFF), Color(0x302B5BFF), Color.Transparent),
++                center = Offset(w * 1.02f, h * 0.42f),
++                radius = min(w, h) * 0.75f,
++            )
++            val glowLeft = Brush.radialGradient(
++                colors = listOf(Color(0x40613DFF), Color.Transparent),
++                center = Offset(w * 0.08f, h * 0.12f),
++                radius = min(w, h) * 0.6f,
++            )
++            val lineColor = Color(0x5576B8FF)
++            val nodeColor = Color(0xAA9FD0FF)
++            val ringColor = Color(0x2A6FA8FF)
++            onDrawBehind {
++                drawRect(base)
++                drawRect(glowLeft)
++                drawRect(glowRight)
++                // faint star-chart rings
++                val ringCenters = listOf(Offset(w * 0.62f, h * 0.30f), Offset(w * 0.22f, h * 0.78f))
++                ringCenters.forEachIndexed { i, c ->
++                    val r = min(w, h) * (if (i == 0) 0.22f else 0.30f)
++                    drawCircle(ringColor, r, c, style = Stroke(1.2f))
++                    drawCircle(ringColor, r * 0.62f, c, style = Stroke(1f))
++                    for (k in 0 until 12) {
++                        val a = (k / 12f) * 2f * Math.PI.toFloat()
++                        drawLine(ringColor, c + Offset(cos(a) * r * 0.62f, sin(a) * r * 0.62f), c + Offset(cos(a) * r, sin(a) * r), 0.8f)
++                    }
++                }
++                // stars
++                for (s in stars) {
++                    drawCircle(Color.White.copy(alpha = s.alpha), s.radius * density, Offset(s.x * w, s.y * h))
++                }
++                // constellations
++                for (con in constellations) {
++                    for ((a, b) in con.edges) {
++                        val p1 = Offset(con.points[a].x * w, con.points[a].y * h)
++                        val p2 = Offset(con.points[b].x * w, con.points[b].y * h)
++                        drawLine(lineColor, p1, p2, 1.2f * density)
++                    }
++                    for (p in con.points) {
++                        val o = Offset(p.x * w, p.y * h)
++                        drawCircle(Color(0x334FA3FF), 5f * density, o)
++                        drawCircle(nodeColor, 2.2f * density, o)
++                    }
++                }
++            }
++        }
++    )
++}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..11637a2e
+index 00000000..4e1c6a1f
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,542 @@
+@@ -0,0 +1,715 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -1351,6 +1941,7 @@ index 00000000..11637a2e
 +import androidx.compose.animation.core.infiniteRepeatable
 +import androidx.compose.animation.core.rememberInfiniteTransition
 +import androidx.compose.animation.core.tween
++import androidx.compose.foundation.Image
 +import androidx.compose.foundation.background
 +import androidx.compose.foundation.border
 +import androidx.compose.foundation.clickable
@@ -1358,41 +1949,50 @@ index 00000000..11637a2e
 +import androidx.compose.foundation.layout.Box
 +import androidx.compose.foundation.layout.BoxWithConstraints
 +import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
 +import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.aspectRatio
++import androidx.compose.foundation.layout.Spacer
 +import androidx.compose.foundation.layout.fillMaxHeight
 +import androidx.compose.foundation.layout.fillMaxSize
 +import androidx.compose.foundation.layout.fillMaxWidth
 +import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.offset
 +import androidx.compose.foundation.layout.padding
 +import androidx.compose.foundation.layout.size
 +import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.GridItemSpan
 +import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 +import androidx.compose.foundation.lazy.grid.items
 +import androidx.compose.foundation.shape.CircleShape
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material3.Button
++import androidx.compose.material3.ButtonDefaults
 +import androidx.compose.material3.MaterialTheme
 +import androidx.compose.material3.OutlinedButton
 +import androidx.compose.material3.Text
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
 +import androidx.compose.runtime.setValue
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
 +import androidx.compose.ui.graphics.Color
 +import androidx.compose.ui.graphics.Shape
++import androidx.compose.ui.layout.ContentScale
 +import androidx.compose.ui.text.font.FontWeight
 +import androidx.compose.ui.text.style.TextAlign
 +import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.Dp
 +import androidx.compose.ui.unit.dp
 +import androidx.compose.ui.unit.min
 +import androidx.compose.ui.unit.sp
 +import info.cemu.cemu.nativeinterface.NativeEmulatedUSBDevices
++import info.cemu.cemu.nativeinterface.NativeLogging
 +import kotlinx.coroutines.delay
 +
 +// slot index -> pad number used by the emulated Toy Pad (1 = center, 2 = left, 3 = right)
@@ -1403,10 +2003,28 @@ index 00000000..11637a2e
 +private val RIGHT_SLOTS = intArrayOf(2, 5, 6)
 +private const val CENTER_SLOT = 1
 +
++private val TextOnBackground = Color(0xFFF2F5FF)
++private val TextDim = Color(0xFFB8C3E6)
++private val Bronze = Color(0xFFD9893A)
++private val Amber = Color(0xFFFFC107)
++private val OnPadColor = Color(0xFF43E0B0)
++
++private data class SlotInfo(val name: String, val number: Int)
++
 +private data class PadLightState(val rgb: Int, val mode: Int, val param1: Int, val param2: Int)
 +
-+private fun readSlots(): Array<String?> =
-+    Array(NativeEmulatedUSBDevices.MAX_DIMENSIONS_SLOTS) { NativeEmulatedUSBDevices.getDimensionsFigureSlot(it) }
++private data class FigureEntry(val figure: NativeEmulatedUSBDevices.InstalledFigure, val number: Int)
++
++private fun readSlots(): List<SlotInfo?> =
++    List(NativeEmulatedUSBDevices.MAX_DIMENSIONS_SLOTS) { index ->
++        val name = NativeEmulatedUSBDevices.getDimensionsFigureSlot(index) ?: return@List null
++        val number = try {
++            NativeEmulatedUSBDevices.getDimensionsFigureSlotNumber(index)
++        } catch (_: Throwable) {
++            -1
++        }
++        SlotInfo(name, number)
++    }
 +
 +private fun readLights(): List<PadLightState> {
 +    val raw = try {
@@ -1424,6 +2042,11 @@ index 00000000..11637a2e
 +    }
 +}
 +
++private fun readFigures(): List<FigureEntry> =
++    NativeEmulatedUSBDevices.getInstalledDimensionsMiniFigures()
++        .map { FigureEntry(it, FigureNumbers.forPath(it.path)) }
++        .sortedWith(compareBy({ it.number >= 1000 }, { it.figure.name.lowercase() }))
++
 +// light index for a pad number: 1 = center -> 0, 2 = left -> 1, 3 = right -> 2
 +private fun lightIndexForPad(pad: Int) = (pad - 1).coerceIn(0, 2)
 +
@@ -1431,11 +2054,9 @@ index 00000000..11637a2e
 +fun ToyPadScreen() {
 +    var slots by remember { mutableStateOf(readSlots()) }
 +    var lights by remember { mutableStateOf(readLights()) }
-+    var figures by remember {
-+        mutableStateOf(NativeEmulatedUSBDevices.getInstalledDimensionsMiniFigures())
-+    }
++    var figures by remember { mutableStateOf(readFigures()) }
 +    var selectedSlot by remember { mutableStateOf<Int?>(null) }
-+    var selectedFigure by remember { mutableStateOf<NativeEmulatedUSBDevices.InstalledFigure?>(null) }
++    var selectedFigure by remember { mutableStateOf<FigureEntry?>(null) }
 +    var moveSource by remember { mutableStateOf<Int?>(null) }
 +    var errorMessage by remember { mutableStateOf<String?>(null) }
 +
@@ -1445,7 +2066,7 @@ index 00000000..11637a2e
 +            slots = readSlots()
 +            lights = readLights()
 +            if (tick % 16 == 0) {
-+                figures = NativeEmulatedUSBDevices.getInstalledDimensionsMiniFigures()
++                figures = readFigures()
 +            }
 +            tick++
 +            delay(250)
@@ -1461,9 +2082,9 @@ index 00000000..11637a2e
 +        selectedFigure = null
 +    }
 +
-+    fun loadFigure(figure: NativeEmulatedUSBDevices.InstalledFigure, index: Int) {
-+        val ok = NativeEmulatedUSBDevices.loadDimensionsFigure(figure.path, SLOT_PADS[index], index)
-+        errorMessage = if (ok) null else "Couldn't place ${figure.name}"
++    fun loadFigure(entry: FigureEntry, index: Int) {
++        val ok = NativeEmulatedUSBDevices.loadDimensionsFigure(entry.figure.path, SLOT_PADS[index], index)
++        errorMessage = if (ok) null else "Couldn't place ${entry.figure.name}"
 +        clearSelection()
 +        refresh()
 +    }
@@ -1497,15 +2118,15 @@ index 00000000..11637a2e
 +        selectedSlot = if (selectedSlot == index) null else index
 +    }
 +
-+    fun onFigureTapped(figure: NativeEmulatedUSBDevices.InstalledFigure) {
++    fun onFigureTapped(entry: FigureEntry) {
 +        errorMessage = null
 +        if (moveSource != null) return
 +        val slot = selectedSlot
 +        if (slot != null) {
-+            loadFigure(figure, slot)
++            loadFigure(entry, slot)
 +            return
 +        }
-+        selectedFigure = if (selectedFigure == figure) null else figure
++        selectedFigure = if (selectedFigure == entry) null else entry
 +    }
 +
 +    fun onRemove(index: Int) {
@@ -1521,111 +2142,182 @@ index 00000000..11637a2e
 +        selectedFigure = null
 +    }
 +
-+    Column(
-+        modifier = Modifier
-+            .fillMaxSize()
-+            .padding(12.dp),
-+        verticalArrangement = Arrangement.spacedBy(10.dp)
-+    ) {
-+        Text(
-+            text = "LEGO Dimensions Toy Pad",
-+            style = MaterialTheme.typography.titleMedium,
-+            fontWeight = FontWeight.SemiBold,
-+        )
++    val onPadNumbers = slots.mapNotNull { it?.number }.toSet()
++    val characters = figures.filter { it.number < 1000 }
++    val vehicles = figures.filter { it.number >= 1000 }
 +
-+        // the pad
-+        Row(
++    Box(modifier = Modifier.fillMaxSize()) {
++        ToyPadBackground()
++
++        Column(
 +            modifier = Modifier
-+                .fillMaxWidth()
-+                .weight(1.1f),
-+            horizontalArrangement = Arrangement.spacedBy(10.dp),
++                .fillMaxSize()
++                .padding(horizontal = 12.dp, vertical = 10.dp),
++            verticalArrangement = Arrangement.spacedBy(8.dp)
 +        ) {
-+            SidePad(
-+                slotIndices = LEFT_SLOTS,
-+                innerAlignment = Alignment.End,
-+                light = lights[lightIndexForPad(2)],
-+                slots = slots,
-+                selectedSlot = selectedSlot,
-+                moveSource = moveSource,
-+                onSlotTapped = ::onSlotTapped,
-+                modifier = Modifier
-+                    .weight(1f)
-+                    .fillMaxHeight(),
-+            )
-+            CenterPad(
-+                light = lights[lightIndexForPad(1)],
-+                name = slots[CENTER_SLOT],
-+                isSelected = selectedSlot == CENTER_SLOT,
-+                isMoveSource = moveSource == CENTER_SLOT,
-+                onTap = { onSlotTapped(CENTER_SLOT) },
-+                modifier = Modifier
-+                    .weight(1.1f)
-+                    .fillMaxHeight(),
-+            )
-+            SidePad(
-+                slotIndices = RIGHT_SLOTS,
-+                innerAlignment = Alignment.Start,
-+                light = lights[lightIndexForPad(3)],
-+                slots = slots,
-+                selectedSlot = selectedSlot,
-+                moveSource = moveSource,
-+                onSlotTapped = ::onSlotTapped,
-+                modifier = Modifier
-+                    .weight(1f)
-+                    .fillMaxHeight(),
-+            )
-+        }
-+
-+        // what to do next
-+        ActionBar(
-+            slots = slots,
-+            selectedSlot = selectedSlot,
-+            selectedFigure = selectedFigure,
-+            moveSource = moveSource,
-+            errorMessage = errorMessage,
-+            onMove = ::onMove,
-+            onRemove = ::onRemove,
-+            onCancel = {
-+                if (moveSource != null) cancelMove() else clearSelection()
-+            },
-+        )
-+
-+        // figure collection
-+        Text(
-+            text = "Your figures (${figures.size})",
-+            style = MaterialTheme.typography.titleSmall,
-+        )
-+        if (figures.isEmpty()) {
-+            Text(
-+                text = "No figures yet. Create figures in the emulated USB devices menu in the game's menu.",
-+                style = MaterialTheme.typography.bodyMedium,
-+            )
-+        }
-+        LazyVerticalGrid(
-+            columns = GridCells.Adaptive(minSize = 130.dp),
-+            modifier = Modifier
-+                .fillMaxWidth()
-+                .weight(1f),
-+            horizontalArrangement = Arrangement.spacedBy(8.dp),
-+            verticalArrangement = Arrangement.spacedBy(8.dp),
-+        ) {
-+            items(figures, key = { it.path }) { figure ->
-+                FigureChip(
-+                    name = figure.name,
-+                    isSelected = selectedFigure == figure,
-+                    isOnPad = slots.any { it != null && it == figure.name },
-+                    onTap = { onFigureTapped(figure) },
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    text = "LEGO Dimensions Toy Pad",
++                    style = MaterialTheme.typography.titleMedium,
++                    fontWeight = FontWeight.SemiBold,
++                    color = TextOnBackground,
 +                )
++                Spacer(Modifier.weight(1f))
++                MarkButton()
++            }
++
++            // the pad
++            Row(
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .weight(1.35f),
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                SidePad(
++                    slotIndices = LEFT_SLOTS,
++                    innerOnRight = true,
++                    light = lights[lightIndexForPad(2)],
++                    slots = slots,
++                    selectedSlot = selectedSlot,
++                    moveSource = moveSource,
++                    onSlotTapped = ::onSlotTapped,
++                    modifier = Modifier
++                        .weight(1f)
++                        .fillMaxHeight(),
++                )
++                CenterPad(
++                    light = lights[lightIndexForPad(1)],
++                    slot = slots[CENTER_SLOT],
++                    isSelected = selectedSlot == CENTER_SLOT,
++                    isMoveSource = moveSource == CENTER_SLOT,
++                    onTap = { onSlotTapped(CENTER_SLOT) },
++                    modifier = Modifier
++                        .weight(0.95f)
++                        .fillMaxHeight(),
++                )
++                SidePad(
++                    slotIndices = RIGHT_SLOTS,
++                    innerOnRight = false,
++                    light = lights[lightIndexForPad(3)],
++                    slots = slots,
++                    selectedSlot = selectedSlot,
++                    moveSource = moveSource,
++                    onSlotTapped = ::onSlotTapped,
++                    modifier = Modifier
++                        .weight(1f)
++                        .fillMaxHeight(),
++                )
++            }
++
++            // what to do next
++            ActionBar(
++                slots = slots,
++                selectedSlot = selectedSlot,
++                selectedFigure = selectedFigure,
++                moveSource = moveSource,
++                errorMessage = errorMessage,
++                onMove = ::onMove,
++                onRemove = ::onRemove,
++                onCancel = {
++                    if (moveSource != null) cancelMove() else clearSelection()
++                },
++            )
++
++            // figure collection
++            if (figures.isEmpty()) {
++                Text(
++                    text = "No figures yet. Create figures in the emulated USB devices menu in the game's menu.",
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = TextOnBackground,
++                )
++            }
++            LazyVerticalGrid(
++                columns = GridCells.Adaptive(minSize = 84.dp),
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .weight(1f)
++                    .clip(RoundedCornerShape(16.dp))
++                    .background(Color(0x66040818)),
++                contentPadding = PaddingValues(8.dp),
++                horizontalArrangement = Arrangement.spacedBy(4.dp),
++                verticalArrangement = Arrangement.spacedBy(6.dp),
++            ) {
++                if (characters.isNotEmpty()) {
++                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Characters (${characters.size})") }
++                    items(characters, key = { it.figure.path }) { entry ->
++                        FigureTile(
++                            entry = entry,
++                            isSelected = selectedFigure == entry,
++                            isOnPad = entry.number > 0 && entry.number in onPadNumbers,
++                            onTap = { onFigureTapped(entry) },
++                        )
++                    }
++                }
++                if (vehicles.isNotEmpty()) {
++                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Vehicles and gadgets (${vehicles.size})") }
++                    items(vehicles, key = { it.figure.path }) { entry ->
++                        FigureTile(
++                            entry = entry,
++                            isSelected = selectedFigure == entry,
++                            isOnPad = entry.number in onPadNumbers,
++                            onTap = { onFigureTapped(entry) },
++                        )
++                    }
++                }
 +            }
 +        }
 +    }
 +}
 +
 +@Composable
++private fun MarkButton() {
++    var marks by remember { mutableIntStateOf(0) }
++    var justMarked by remember { mutableStateOf(false) }
++    LaunchedEffect(marks) {
++        if (marks > 0) {
++            justMarked = true
++            delay(2500)
++            justMarked = false
++        }
++    }
++    Box(
++        modifier = Modifier
++            .clip(RoundedCornerShape(50))
++            .background(if (justMarked) Color(0xCC2E7D32) else Color(0x66FFFFFF))
++            .clickable {
++                marks++
++                try {
++                    NativeLogging.log("[Marker] Mark #$marks tapped on the Toy Pad screen")
++                } catch (_: Throwable) {
++                }
++            }
++            .padding(horizontal = 12.dp, vertical = 6.dp),
++    ) {
++        Text(
++            text = if (justMarked) "Marked #$marks" else "Mark",
++            color = Color.White,
++            fontSize = 13.sp,
++            fontWeight = FontWeight.Medium,
++        )
++    }
++}
++
++@Composable
++private fun SectionLabel(text: String) {
++    Text(
++        text = text,
++        color = TextDim,
++        fontSize = 13.sp,
++        fontWeight = FontWeight.SemiBold,
++        modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 2.dp),
++    )
++}
++
++@Composable
 +private fun ActionBar(
-+    slots: Array<String?>,
++    slots: List<SlotInfo?>,
 +    selectedSlot: Int?,
-+    selectedFigure: NativeEmulatedUSBDevices.InstalledFigure?,
++    selectedFigure: FigureEntry?,
 +    moveSource: Int?,
 +    errorMessage: String?,
 +    onMove: (Int) -> Unit,
@@ -1635,7 +2327,10 @@ index 00000000..11637a2e
 +    Row(
 +        modifier = Modifier
 +            .fillMaxWidth()
-+            .height(52.dp),
++            .height(48.dp)
++            .clip(RoundedCornerShape(14.dp))
++            .background(Color(0x99060B1E))
++            .padding(horizontal = 10.dp),
 +        verticalAlignment = Alignment.CenterVertically,
 +        horizontalArrangement = Arrangement.spacedBy(8.dp),
 +    ) {
@@ -1645,12 +2340,12 @@ index 00000000..11637a2e
 +        when {
 +            errorMessage != null -> prompt = errorMessage
 +            moveSource != null -> {
-+                prompt = "Tap where to put ${slots[moveSource] ?: "the figure"}"
++                prompt = "Tap where to put ${slots[moveSource]?.name ?: "the figure"}"
 +                showCancel = true
 +            }
 +
 +            selectedFigure != null -> {
-+                prompt = "Tap a spot on the pad for ${selectedFigure.name}"
++                prompt = "Tap a spot on the pad for ${selectedFigure.figure.name}"
 +                showCancel = true
 +            }
 +
@@ -1660,7 +2355,7 @@ index 00000000..11637a2e
 +            }
 +
 +            selectedSlot != null -> {
-+                prompt = slots[selectedSlot] ?: ""
++                prompt = slots[selectedSlot]?.name ?: ""
 +                occupiedSlot = selectedSlot
 +            }
 +
@@ -1672,14 +2367,16 @@ index 00000000..11637a2e
 +            maxLines = 2,
 +            overflow = TextOverflow.Ellipsis,
 +            style = MaterialTheme.typography.bodyLarge,
++            color = TextOnBackground,
 +        )
 +        val actionSlot: Int? = occupiedSlot
++        val outlinedColors = ButtonDefaults.outlinedButtonColors(contentColor = TextOnBackground)
 +        if (actionSlot != null) {
 +            Button(onClick = { onMove(actionSlot) }) { Text("Move") }
-+            OutlinedButton(onClick = { onRemove(actionSlot) }) { Text("Remove") }
-+            OutlinedButton(onClick = onCancel) { Text("Done") }
++            OutlinedButton(onClick = { onRemove(actionSlot) }, colors = outlinedColors) { Text("Remove") }
++            OutlinedButton(onClick = onCancel, colors = outlinedColors) { Text("Done") }
 +        } else if (showCancel) {
-+            OutlinedButton(onClick = onCancel) { Text("Cancel") }
++            OutlinedButton(onClick = onCancel, colors = outlinedColors) { Text("Cancel") }
 +        }
 +    }
 +}
@@ -1730,48 +2427,63 @@ index 00000000..11637a2e
 +    Box(
 +        modifier = modifier
 +            .clip(shape)
-+            .background(Color(0xFF151515))
-+            .background(if (isLit) glow.copy(alpha = 0.35f) else Color.Transparent)
-+            .border(3.dp, if (isLit) glow else Color(0xFF444444), shape)
-+            .padding(8.dp),
++            .background(Color(0xB30A1028))
++            .background(
++                if (isLit) Brush.radialGradient(listOf(glow.copy(alpha = 0.55f), glow.copy(alpha = 0.18f)))
++                else Brush.radialGradient(listOf(Color.Transparent, Color.Transparent))
++            )
++            .border(3.dp, if (isLit) glow else Color(0x55FFFFFF), shape)
++            .padding(6.dp),
 +        contentAlignment = Alignment.Center,
 +    ) {
 +        content()
 +    }
 +}
 +
++/** Biggest circle size for three spots in a zig-zag (two on the outer edge, one in the middle on the inner edge). */
++private fun sideSlotSize(width: Float, height: Float, gap: Float = 4f): Float {
++    var size = kotlin.math.min((height - gap) / 2f, width)
++    while (size > 12f) {
++        val dx = width - size
++        val dy = height / 2f - size / 2f
++        if (dx * dx + dy * dy >= (size + gap) * (size + gap)) break
++        size -= 1f
++    }
++    return size
++}
++
 +@Composable
 +private fun SidePad(
 +    slotIndices: IntArray,
-+    innerAlignment: Alignment.Horizontal,
++    innerOnRight: Boolean,
 +    light: PadLightState,
-+    slots: Array<String?>,
++    slots: List<SlotInfo?>,
 +    selectedSlot: Int?,
 +    moveSource: Int?,
 +    onSlotTapped: (Int) -> Unit,
 +    modifier: Modifier = Modifier,
 +) {
-+    PadBackground(light = light, shape = RoundedCornerShape(18.dp), modifier = modifier) {
++    PadBackground(light = light, shape = RoundedCornerShape(20.dp), modifier = modifier) {
 +        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-+            val slotSize = min(maxWidth * 0.62f, maxHeight / 3.3f)
-+            Column(
-+                modifier = Modifier.fillMaxSize(),
-+                verticalArrangement = Arrangement.SpaceEvenly,
-+            ) {
-+                slotIndices.forEachIndexed { position, index ->
-+                    val alignment = if (position == 1) innerAlignment else
-+                        if (innerAlignment == Alignment.End) Alignment.Start else Alignment.End
-+                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = if (alignment == Alignment.Start) Alignment.CenterStart else Alignment.CenterEnd) {
-+                        SlotTile(
-+                            name = slots[index],
-+                            isSelected = selectedSlot == index,
-+                            isMoveSource = moveSource == index,
-+                            shape = RoundedCornerShape(12.dp),
-+                            onTap = { onSlotTapped(index) },
-+                            modifier = Modifier.size(slotSize),
-+                        )
-+                    }
-+                }
++            val size: Dp = sideSlotSize(maxWidth.value, maxHeight.value).dp
++            val outerX: Dp = if (innerOnRight) 0.dp else maxWidth - size
++            val innerX: Dp = if (innerOnRight) maxWidth - size else 0.dp
++            val positions = listOf(
++                outerX to 0.dp,
++                innerX to (maxHeight - size) / 2,
++                outerX to maxHeight - size,
++            )
++            slotIndices.forEachIndexed { position, index ->
++                val (x, y) = positions[position]
++                SlotTile(
++                    slot = slots[index],
++                    isSelected = selectedSlot == index,
++                    isMoveSource = moveSource == index,
++                    onTap = { onSlotTapped(index) },
++                    modifier = Modifier
++                        .offset(x = x, y = y)
++                        .size(size),
++                )
 +            }
 +        }
 +    }
@@ -1780,22 +2492,69 @@ index 00000000..11637a2e
 +@Composable
 +private fun CenterPad(
 +    light: PadLightState,
-+    name: String?,
++    slot: SlotInfo?,
 +    isSelected: Boolean,
 +    isMoveSource: Boolean,
 +    onTap: () -> Unit,
 +    modifier: Modifier = Modifier,
 +) {
-+    PadBackground(light = light, shape = RoundedCornerShape(24.dp), modifier = modifier) {
++    PadBackground(light = light, shape = RoundedCornerShape(28.dp), modifier = modifier) {
 +        BoxWithConstraints(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-+            val slotSize = min(maxWidth * 0.9f, maxHeight * 0.75f)
++            val size = min(maxWidth * 0.96f, maxHeight * 0.86f)
 +            SlotTile(
-+                name = name,
++                slot = slot,
 +                isSelected = isSelected,
 +                isMoveSource = isMoveSource,
-+                shape = CircleShape,
 +                onTap = onTap,
-+                modifier = Modifier.size(slotSize),
++                modifier = Modifier.size(size),
++            )
++        }
++    }
++}
++
++@Composable
++private fun Portrait(
++    number: Int,
++    name: String?,
++    ringColor: Color,
++    ringWidth: Dp,
++    modifier: Modifier = Modifier,
++    emptyLabel: String? = null,
++) {
++    val image = if (number > 0) rememberFigureImage(number) else null
++    Box(
++        modifier = modifier
++            .clip(CircleShape)
++            .background(Brush.radialGradient(listOf(Color(0xFF2A4785), Color(0xFF0B1430))))
++            .border(ringWidth, ringColor, CircleShape),
++        contentAlignment = Alignment.Center,
++    ) {
++        when {
++            name == null -> Text(
++                text = emptyLabel ?: "+",
++                color = Color(0xCCFFFFFF),
++                fontSize = 30.sp,
++                fontWeight = FontWeight.Light,
++            )
++
++            image != null -> Image(
++                bitmap = image,
++                contentDescription = name,
++                contentScale = ContentScale.Fit,
++                modifier = Modifier
++                    .fillMaxSize()
++                    .padding(ringWidth + 3.dp),
++            )
++
++            else -> Text(
++                text = name,
++                color = Color.White,
++                textAlign = TextAlign.Center,
++                fontSize = 12.sp,
++                fontWeight = FontWeight.Medium,
++                maxLines = 3,
++                overflow = TextOverflow.Ellipsis,
++                modifier = Modifier.padding(6.dp),
 +            )
 +        }
 +    }
@@ -1803,86 +2562,90 @@ index 00000000..11637a2e
 +
 +@Composable
 +private fun SlotTile(
-+    name: String?,
++    slot: SlotInfo?,
 +    isSelected: Boolean,
 +    isMoveSource: Boolean,
-+    shape: Shape,
 +    onTap: () -> Unit,
 +    modifier: Modifier = Modifier,
 +) {
-+    val borderColor = when {
-+        isMoveSource -> Color(0xFFFFC107)
-+        isSelected -> MaterialTheme.colorScheme.primary
-+        name != null -> Color(0xFFBBBBBB)
-+        else -> Color(0xFF555555)
-+    }
-+    val background = when {
-+        isMoveSource -> Color(0x66FFC107)
-+        name != null -> Color(0xCC303030)
-+        else -> Color(0x66000000)
++    val ringColor = when {
++        isMoveSource -> Amber
++        isSelected -> Color.White
++        slot != null -> Bronze
++        else -> Color(0x66FFFFFF)
 +    }
 +    Box(
 +        modifier = modifier
-+            .aspectRatio(1f)
-+            .clip(shape)
-+            .background(background)
-+            .border(if (isSelected || isMoveSource) 4.dp else 2.dp, borderColor, shape)
-+            .clickable(onClick = onTap)
-+            .padding(6.dp),
++            .clip(CircleShape)
++            .clickable(onClick = onTap),
 +        contentAlignment = Alignment.Center,
 +    ) {
-+        Text(
-+            text = name ?: "+",
-+            color = Color.White,
-+            textAlign = TextAlign.Center,
-+            fontSize = if (name == null) 28.sp else 14.sp,
-+            fontWeight = if (name == null) FontWeight.Light else FontWeight.Medium,
-+            maxLines = 3,
-+            overflow = TextOverflow.Ellipsis,
++        Portrait(
++            number = slot?.number ?: -1,
++            name = slot?.name,
++            ringColor = ringColor,
++            ringWidth = if (isSelected || isMoveSource) 4.dp else 3.dp,
++            modifier = Modifier.fillMaxSize(),
 +        )
++        if (isMoveSource) {
++            Box(
++                modifier = Modifier
++                    .fillMaxSize()
++                    .clip(CircleShape)
++                    .background(Color(0x55FFC107))
++            )
++        }
 +    }
 +}
 +
 +@Composable
-+private fun FigureChip(
-+    name: String,
++private fun FigureTile(
++    entry: FigureEntry,
 +    isSelected: Boolean,
 +    isOnPad: Boolean,
 +    onTap: () -> Unit,
 +) {
-+    val shape = RoundedCornerShape(10.dp)
-+    Box(
++    Column(
 +        modifier = Modifier
 +            .fillMaxWidth()
-+            .height(56.dp)
-+            .clip(shape)
-+            .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
-+            .border(
-+                if (isSelected) 3.dp else 1.dp,
-+                if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
-+                shape
-+            )
++            .clip(RoundedCornerShape(14.dp))
++            .background(if (isSelected) Color(0x663D8BFF) else Color.Transparent)
 +            .clickable(onClick = onTap)
-+            .padding(horizontal = 10.dp),
-+        contentAlignment = Alignment.CenterStart,
++            .padding(vertical = 4.dp, horizontal = 2.dp),
++        horizontalAlignment = Alignment.CenterHorizontally,
++        verticalArrangement = Arrangement.spacedBy(3.dp),
 +    ) {
-+        Column {
-+            Text(
-+                text = name,
-+                maxLines = 1,
-+                overflow = TextOverflow.Ellipsis,
-+                style = MaterialTheme.typography.bodyMedium,
-+                fontWeight = FontWeight.Medium,
-+                color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
++        Box(modifier = Modifier.size(66.dp)) {
++            Portrait(
++                number = entry.number,
++                name = entry.figure.name,
++                ringColor = if (isSelected) Color.White else Bronze,
++                ringWidth = if (isSelected) 3.dp else 2.dp,
++                modifier = Modifier.fillMaxSize(),
 +            )
 +            if (isOnPad) {
-+                Text(
-+                    text = "on the pad",
-+                    style = MaterialTheme.typography.labelSmall,
-+                    color = MaterialTheme.colorScheme.primary,
-+                )
++                Box(
++                    modifier = Modifier
++                        .align(Alignment.BottomEnd)
++                        .size(20.dp)
++                        .clip(CircleShape)
++                        .background(OnPadColor)
++                        .border(2.dp, Color(0xFF0B1430), CircleShape),
++                    contentAlignment = Alignment.Center,
++                ) {
++                    Text(text = "✓", color = Color(0xFF0B1430), fontSize = 11.sp, fontWeight = FontWeight.Bold)
++                }
 +            }
 +        }
++        Text(
++            text = entry.figure.name,
++            color = if (isOnPad) OnPadColor else TextOnBackground,
++            fontSize = 11.sp,
++            lineHeight = 13.sp,
++            textAlign = TextAlign.Center,
++            maxLines = 2,
++            overflow = TextOverflow.Ellipsis,
++        )
 +    }
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
@@ -2045,13 +2808,21 @@ index 00000000..457ffbf6
 +    }
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
-index 5c178c2f..65a84043 100644
+index 5c178c2f..3d1bfb75 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
-@@ -85,6 +85,10 @@ object NativeEmulatedUSBDevices {
+@@ -85,6 +85,18 @@ object NativeEmulatedUSBDevices {
      @JvmStatic
      external fun getDimensionsFigureSlot(slot: Int): String?
  
++    // figure number of the figure in a Toy Pad slot, or -1 if the slot is empty
++    @JvmStatic
++    external fun getDimensionsFigureSlotNumber(slot: Int): Int
++
++    // figure number stored in a figure file (characters < 1000, vehicles/gadgets >= 1000), or -1
++    @JvmStatic
++    external fun getDimensionsFigureNumber(path: String): Int
++
 +    // 4 values per pad (center, left, right): rgb, mode, param1 | (param2 << 8), count
 +    @JvmStatic
 +    external fun getDimensionsPadLights(): IntArray
@@ -2059,6 +2830,88 @@ index 5c178c2f..65a84043 100644
      @JvmStatic
      external fun clearDimensionsFigure(pad: Int, index: Int)
  
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
+index 5325cb1e..ec5c921f 100644
+--- a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
++++ b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
+@@ -1,13 +1,44 @@
+ package info.cemu.cemu.settings.emulatedusbdevices
+ 
++import android.widget.Toast
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++import info.cemu.cemu.common.ui.components.Button
++import info.cemu.cemu.common.ui.components.Header
+ import info.cemu.cemu.common.ui.components.ScreenContent
+ import info.cemu.cemu.common.ui.components.Toggle
+ import info.cemu.cemu.common.ui.localization.tr
++import info.cemu.cemu.emulation.toypadscreen.ToyPadBackgroundImage
++import info.cemu.cemu.emulation.toypadscreen.ToyPadScreenSettings
+ import info.cemu.cemu.nativeinterface.NativeSettings
++import kotlinx.coroutines.launch
+ 
+ @Composable
+ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
++    val context = LocalContext.current
++    val coroutineScope = rememberCoroutineScope()
++    var hasCustomBackground by remember { mutableStateOf(ToyPadBackgroundImage.exists(context)) }
++
++    val backgroundPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++        if (uri == null) return@rememberLauncherForActivityResult
++        coroutineScope.launch {
++            val ok = ToyPadBackgroundImage.save(context, uri)
++            hasCustomBackground = ToyPadBackgroundImage.exists(context)
++            Toast.makeText(
++                context,
++                if (ok) "Toy Pad background saved" else "Couldn't use that picture",
++                Toast.LENGTH_SHORT
++            ).show()
++        }
++    }
++
+     ScreenContent(
+         appBarText = tr("Emulated USB Devices settings"),
+         navigateBack = navigateBack,
+@@ -29,5 +60,32 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
+             initialCheckedState = NativeSettings::isEmulateDimensionsToypadEnabled,
+             onCheckedChanged = NativeSettings::setEmulateDimensionsToypadEnabled,
+         )
++
++        Header("Toy Pad on the second screen")
++
++        Toggle(
++            label = "Figure pictures",
++            description = "Show pictures of your figures instead of their names. Each picture is downloaded once " +
++                    "from the community LEGO-Dimensions-NFC collection and kept in the toypad folder.",
++            initialCheckedState = { ToyPadScreenSettings.figurePicturesEnabled(context) },
++            onCheckedChanged = { ToyPadScreenSettings.setFigurePicturesEnabled(context, it) },
++        )
++
++        Button(
++            label = "Choose background picture",
++            description = if (hasCustomBackground) "Using your picture" else "Using the built-in star map",
++            onClick = { backgroundPicker.launch(arrayOf("image/*")) },
++        )
++
++        if (hasCustomBackground) {
++            Button(
++                label = "Use the built-in star map",
++                description = "Remove your background picture",
++                onClick = {
++                    ToyPadBackgroundImage.clear(context)
++                    hasCustomBackground = false
++                },
++            )
++        }
+     }
+ }
 diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
 index 053d3be8..1455fa33 100644
 --- a/src/android/app/src/main/res/values/strings.xml

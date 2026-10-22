@@ -57,11 +57,27 @@ On devices with a second screen (for example the AYN Thor's bottom screen), Cemu
 LEGO Dimensions Toy Pad there while you play:
 
 - The three pads with the figure on each spot, glowing in the colors the game sets (like the real pad's lights).
+- Your figures as round character and vehicle pictures, split into **Characters** and **Vehicles and gadgets**.
+  Figures that are on the pad get a green check.
 - Tap an empty spot, then a figure from your collection, to place it. Or tap a figure first, then a spot.
 - Tap a figure on the pad for **Move** (then tap where it should go) or **Remove**.
 
 It only appears when **emulated Toy Pad** is turned on in Cemu's settings. Your controller keeps controlling the game
-while you use the touch screen. This feature is new and experimental.
+while you use the touch screen.
+
+**Pictures and background** (Settings → Emulated USB Devices → *Toy Pad on the second screen*):
+
+- **Figure pictures:** the app doesn't include any game artwork. The first time a figure is shown, its picture is
+  downloaded from the community [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) collection
+  and kept in the `toypad/figures` folder inside the Cemu Light Fix folder. Without internet the figure's name is shown
+  instead. To use your own picture for a figure, put it in that folder named by figure number (for example `1.png`
+  for Batman, `1000.png` for the Police Car). You can turn the downloads off with the **Figure pictures** switch.
+- **Background:** tap **Choose background picture** to use any picture on your device behind the Toy Pad, or keep the
+  built-in star map.
+
+**Mark** button (top right): tap it at the moment something goes wrong, for example right when you talk to an NPC whose
+voice doesn't play. It writes a marker into the log and records sound levels for the next 20 seconds, which makes the
+log much easier to read.
 
 ## Moving your save from regular Cemu
 
@@ -104,7 +120,8 @@ LEGO Dimensions uses this filter on most of its sounds. It now works as a proper
 
 These builds also write extra lines to `log.txt` to help track down the missing NPC dialogue and the long intro:
 opened files (`[FileOpen]`), missing files (`[FileMissing]`), how long sounds are set up and why they stop
-(`[AXVoice]`, `[AXHist]`), unsupported system calls and the game's own debug messages.
+(`[AXVoice]`, `[AXHist]`), sound levels after you tap **Mark** (`[Marker]`, `[AXLevel]`), unsupported system calls and
+the game's own debug messages.
 
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.
@@ -120,6 +137,8 @@ build is SSimco's code at that commit plus the patch in this repo.
 - [Cemu](https://github.com/cemu-project/Cemu) by the Cemu team
 - [Android port](https://github.com/SSimco/Cemu) by SSimco
 - Lighting fix by GawdMode
+- Figure pictures (downloaded on your device, not included here) from the
+  [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) community collection (Chteupnin's assets)
 
 Cemu is licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/MPL/2.0/), and the changes in
 `lightfix.patch` are offered under the same license.
