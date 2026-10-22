@@ -45,6 +45,12 @@ On the game list, **long-press LEGO Dimensions → Edit game profile** and set:
 
 These are tested on an AYN Thor. If you use a custom GPU driver in your regular Cemu, pick the same one here too.
 
+## Too quiet? Use the volume boost
+
+LEGO Dimensions mixes its sound very quietly, so even at full volume it can be hard to hear on a handheld. In
+**Settings → Audio**, first make sure **TV volume** is at 100%, then raise **TV volume boost (Cemu Light Fix)**
+(+3 to +18 dB). A soft limiter keeps loud moments from crackling. Start with +12 dB.
+
 ## Important: play at 720p
 
 The fix works at the game's native **1280x720** resolution. In **Graphic packs**, set
@@ -69,7 +75,8 @@ while you use the touch screen.
 
 - **Figure pictures:** the app doesn't include any game artwork. The first time a figure is shown, its picture is
   downloaded from the community [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) collection
-  and kept in the `toypad/figures` folder inside the Cemu Light Fix folder. Without internet the figure's name is shown
+  and kept in the `toypad/figures` folder inside the Cemu Light Fix folder. Characters stand on a drawing of their
+  Toy Tag from the [LEGO Dimensions Wiki](https://lego-dimensions.fandom.com/wiki/Toy_Tag), kept in `toypad/tags`. Without internet the figure's name is shown
   instead. To use your own picture for a figure, put it in that folder named by figure number (for example `1.png`
   for Batman, `1000.png` for the Police Car). You can turn the downloads off with the **Figure pictures** switch.
 - **Background:** tap **Choose background picture** to use any picture on your device behind the Toy Pad, or keep the
@@ -120,7 +127,7 @@ LEGO Dimensions uses this filter on most of its sounds. It now works as a proper
 
 These builds also write extra lines to `log.txt` to help track down the missing NPC dialogue and the long intro:
 opened files (`[FileOpen]`), missing files (`[FileMissing]`), how long sounds are set up and why they stop
-(`[AXVoice]`, `[AXHist]`), sound levels after you tap **Mark** (`[Marker]`, `[AXLevel]`), unsupported system calls and
+(`[AXVoice]`, `[AXHist]`), sound levels and file reads after you tap **Mark** (`[Marker]`, `[AXLevel]`, `[FileRead]`), unsupported system calls and
 the game's own debug messages.
 
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
@@ -139,6 +146,8 @@ build is SSimco's code at that commit plus the patch in this repo.
 - Lighting fix by GawdMode
 - Figure pictures (downloaded on your device, not included here) from the
   [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) community collection (Chteupnin's assets)
+- Toy Tag drawings (downloaded on your device, not included here) from the
+  [LEGO Dimensions Wiki](https://lego-dimensions.fandom.com/wiki/Toy_Tag) community
 
 Cemu is licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/MPL/2.0/), and the changes in
 `lightfix.patch` are offered under the same license.

@@ -489,10 +489,33 @@ index e3e42012..198fb98f 100644
  // it is guaranteed that the texture is not in use and all associated resources (descriptor sets, framebuffers) can be destroyed safely
  void VulkanRenderer::surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture)
 diff --git a/src/Cafe/IOSU/fsa/iosu_fsa.cpp b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-index 1429d083..81e78211 100644
+index 1429d083..0d04989d 100644
 --- a/src/Cafe/IOSU/fsa/iosu_fsa.cpp
 +++ b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-@@ -165,7 +165,20 @@ namespace iosu
+@@ -9,6 +9,22 @@
+ 
+ #include "Cafe/HW/MMU/MMU.h"
+ 
++namespace snd_core
++{
++	bool AXDiag_IsMarking(); // true for 20 seconds after "Mark" is tapped in the app
++}
++
++// diagnostic: remember which path each open file handle belongs to, for read logging
++static std::mutex s_diagHandleMutex;
++static std::unordered_map<sint32, std::string> s_diagHandlePath;
++
++static std::string _FSADiag_PathForHandle(sint32 handle)
++{
++	std::unique_lock _l(s_diagHandleMutex);
++	auto it = s_diagHandlePath.find(handle);
++	return it != s_diagHandlePath.end() ? it->second : fmt::format("handle {:x}", (uint32)handle);
++}
++
+ using namespace iosu::kernel;
+ 
+ namespace iosu
+@@ -165,7 +181,20 @@ namespace iosu
  		FSCVirtualFile* __FSAOpenNode(FSAClient* client, std::string_view path, FSC_ACCESS_FLAG accessFlags, sint32& fscStatus)
  		{
  			std::string translatedPath = __FSATranslatePath(client, path);
@@ -514,10 +537,15 @@ index 1429d083..81e78211 100644
  		}
  
  		class _FSAHandleTable {
-@@ -300,6 +313,17 @@ namespace iosu
+@@ -300,6 +329,22 @@ namespace iosu
  			}
  			*fileHandle = fsFileHandle;
  			cemuLog_log(LogType::CoreinitFile, "Open file {} (access: {} result: ok handle: 0x{})", path, accessModifierStr, (uint32)*fileHandle);
++			{
++				std::unique_lock _l(s_diagHandleMutex);
++				if (s_diagHandlePath.size() < 20000)
++					s_diagHandlePath[(sint32)fsFileHandle] = std::string(path);
++			}
 +			{
 +				// diagnostic: log each opened file path once (capped), with the time it was first opened
 +				static std::mutex s_openedMutex;
@@ -531,6 +559,30 @@ index 1429d083..81e78211 100644
 +			}
  			return FSA_RESULT::OK;
  		}
+ 
+@@ -469,7 +514,23 @@ namespace iosu
+ 			if ((flags & FSA_CMD_FLAG_SET_POS) != 0)
+ 				fsc_setFileSeek(fscFile, filePos);
+ 			// todo: File permissions
++			uint32 readPos = fsc_getFileSeek(fscFile);
+ 			uint32 bytesSuccessfullyRead = fsc_readFile(fscFile, destPtr, bytesToRead);
++			{
++				// diagnostic: log reads for a while after "Mark" is tapped, and short reads at any time
++				static std::atomic<sint32> s_markReadBudget{600};
++				static std::atomic<sint32> s_shortReadBudget{200};
++				static std::atomic<bool> s_wasMarking{false};
++				bool marking = snd_core::AXDiag_IsMarking();
++				if (marking && !s_wasMarking.exchange(true))
++					s_markReadBudget = 600;
++				else if (!marking)
++					s_wasMarking = false;
++				if (marking && s_markReadBudget.fetch_sub(1) > 0)
++					cemuLog_log(LogType::Force, "[FileRead] {} pos {:x} size {:x} got {:x}", _FSADiag_PathForHandle((sint32)fileHandle), readPos, bytesToRead, bytesSuccessfullyRead);
++				else if (bytesSuccessfullyRead < bytesToRead && s_shortReadBudget.fetch_sub(1) > 0)
++					cemuLog_log(LogType::Force, "[FileReadShort] {} pos {:x} size {:x} got {:x}", _FSADiag_PathForHandle((sint32)fileHandle), readPos, bytesToRead, bytesSuccessfullyRead);
++			}
+ 			if (transferElementSize == 0)
+ 				return FSA_RESULT::OK;
  
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
 index 13ef6613..ac2d74cd 100644
@@ -746,15 +798,18 @@ index 00ceff9e..69a3ff24 100644
  		std::queue<std::array<uint8, 32>> m_queries;
  	};
 diff --git a/src/Cafe/OS/libs/snd_core/ax.h b/src/Cafe/OS/libs/snd_core/ax.h
-index 0861e6a7..c1c44e4f 100644
+index 0861e6a7..05c9b347 100644
 --- a/src/Cafe/OS/libs/snd_core/ax.h
 +++ b/src/Cafe/OS/libs/snd_core/ax.h
-@@ -391,6 +391,9 @@ namespace snd_core
+@@ -391,6 +391,12 @@ namespace snd_core
  	void AXOut_reset();
  	void AXOut_update();
  
 +	// diagnostics: mark a moment in the log (from the app) and log sound levels for the next 20 seconds
 +	void AXDiag_Mark(const char* note);
++	bool AXDiag_IsMarking();
++	// extra loudness for the TV output, in dB (0 = off), with a soft limiter so peaks don't crackle
++	void AXOut_SetVolumeBoostDb(sint32 db);
 +
  	COSModule* GetModuleSndCore1();
  	COSModule* GetModuleSndCore2();
@@ -803,7 +858,7 @@ index cb7c153e..4e84d9bc 100644
  }
 \ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a44..1f8fd15a 100644
+index 31a24a44..cf8ff0cf 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 @@ -751,15 +751,24 @@ namespace snd_core
@@ -836,7 +891,7 @@ index 31a24a44..1f8fd15a 100644
  	}
  
  	// mix audio generated from voice into main bus and aux buses
-@@ -804,24 +813,297 @@ namespace snd_core
+@@ -804,24 +813,302 @@ namespace snd_core
  		// todo
  	}
  
@@ -914,10 +969,9 @@ index 31a24a44..1f8fd15a 100644
 +	}
 +
 +	static void _AXDiagLogStart(sint32 idx, AXVPBInternal_t* v, uint32 samplesAddr)
- 	{
--		if (firstVoice == nullptr)
++	{
 +		if (s_voiceDiagLogBudget <= 0)
- 			return;
++			return;
 +		s_voiceDiagLogBudget--;
 +		auto vol = [v](sint32 bus, sint32 ch) -> uint32 { return _swapEndianU16(v->deviceMixTV[ch * 4 + bus].vol); };
 +		std::string auxInfo;
@@ -966,6 +1020,11 @@ index 31a24a44..1f8fd15a 100644
 +		return _AXDiagMarkNowMs() < s_markUntilMs.load();
 +	}
 +
++	bool AXDiag_IsMarking()
++	{
++		return _AXDiagMarking();
++	}
++
 +	static std::string _AXDiagDb(double energy, uint32 samples)
 +	{
 +		if (samples == 0 || energy <= 0.0)
@@ -975,7 +1034,8 @@ index 31a24a44..1f8fd15a 100644
 +	}
 +
 +	void AXDiag_Mark(const char* note)
-+	{
+ 	{
+-		if (firstVoice == nullptr)
 +		cemuLog_log(LogType::Force, "[Marker] {} -- logging sound levels for 20 seconds", note ? note : "");
 +		// snapshot of all voices the game currently has running
 +		for (sint32 i = 0; __AXVPBArrayPtr != nullptr && i < AX_MAX_VOICES; i++)
@@ -1045,7 +1105,7 @@ index 31a24a44..1f8fd15a 100644
 +		s_levelOutSamples += (uint32)sampleCount;
 +		s_levelFrames++;
 +		if (s_levelFrames < 83) // about 250ms
-+			return;
+ 			return;
 +		// report: overall output and the loudest voices
 +		std::vector<sint32> order;
 +		for (sint32 i = 0; i < AX_MAX_VOICES; i++)
@@ -1136,7 +1196,7 @@ index 31a24a44..1f8fd15a 100644
  	}
  
  	void AXMix_MergeBusSamples(float* input, sint32* output, sint32 sampleCount, uint16& volume, sint16 delta)
-@@ -977,6 +1259,8 @@ namespace snd_core
+@@ -977,6 +1264,8 @@ namespace snd_core
  
  		// merge main and aux buses
  		AXMix_mergeTVBuses();
@@ -1145,6 +1205,87 @@ index 31a24a44..1f8fd15a 100644
  		AXMix_mergeDRC0Buses();
  
  		AXAux_incrementBufferIndex();
+diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
+index 6cb1599a..8ba5f09d 100644
+--- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
++++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
+@@ -216,8 +216,35 @@ namespace snd_core
+ 		return nullptr;
+ 	}
+ 
++	static std::atomic<float> s_tvBoostGain{1.0f};
++
++	void AXOut_SetVolumeBoostDb(sint32 db)
++	{
++		db = std::clamp(db, 0, 24);
++		s_tvBoostGain = std::pow(10.0f, (float)db / 20.0f);
++		cemuLog_log(LogType::Force, "Volume boost: +{} dB", db);
++	}
++
++	// convert a mixed sample to 16 bit, applying the optional boost with a soft limiter above the knee
++	static inline sint16 _AXOutConvertSample(sint32 sample, float gain)
++	{
++		if (gain <= 1.0f)
++			return (sint16)std::min(std::max(sample, -32768), 32767);
++		float v = (float)sample * gain;
++		constexpr float knee = 20000.0f;
++		constexpr float range = 32767.0f - knee;
++		float a = std::fabs(v);
++		if (a > knee)
++		{
++			a = knee + range * std::tanh((a - knee) / range);
++			v = v < 0.0f ? -a : a;
++		}
++		return (sint16)std::clamp(v, -32768.0f, 32767.0f);
++	}
++
+ 	void AXOut_SubmitTVFrame(sint32 frameIndex)
+ 	{
++		const float boostGain = s_tvBoostGain.load();
+ 		sint32 numSamples = AIGetSamplesPerChannel(AX_DEV_TV);
+ 		if (__AXMode[AX_DEV_TV] == AX_MODE_6CH)
+ 		{
+@@ -246,14 +273,14 @@ namespace snd_core
+ 				Back Left - BL			4
+ 				Back Right - BR			5
+ 				*/
+-				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel0), -32768), 32767));
+-				dmaOutputBuffer[1] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel1), -32768), 32767));
++				dmaOutputBuffer[0] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel0), boostGain));
++				dmaOutputBuffer[1] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel1), boostGain));
+ 
+-				dmaOutputBuffer[4] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel2), -32768), 32767));
+-				dmaOutputBuffer[5] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel3), -32768), 32767));
++				dmaOutputBuffer[4] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel2), boostGain));
++				dmaOutputBuffer[5] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel3), boostGain));
+ 
+-				dmaOutputBuffer[2] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel4), -32768), 32767));
+-				dmaOutputBuffer[3] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel5), -32768), 32767));
++				dmaOutputBuffer[2] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel4), boostGain));
++				dmaOutputBuffer[3] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel5), boostGain));
+ 				dmaOutputBuffer += 6;
+ 				// next sample
+ 				inputChannel0++;
+@@ -272,8 +299,8 @@ namespace snd_core
+ 			sint16* dmaOutputBuffer = __AXTVDMABuffers[frameIndex];
+ 			for (sint32 i = 0; i < numSamples; i++)
+ 			{
+-				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel0), -32768), 32767));
+-				dmaOutputBuffer[1] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel1), -32768), 32767));
++				dmaOutputBuffer[0] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel0), boostGain));
++				dmaOutputBuffer[1] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel1), boostGain));
+ 				dmaOutputBuffer += 2;
+ 				// next sample
+ 				inputChannel0++;
+@@ -287,7 +314,7 @@ namespace snd_core
+ 			sint16* dmaOutputBuffer = __AXTVDMABuffers[frameIndex];
+ 			for (sint32 i = 0; i < numSamples; i++)
+ 			{
+-				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel0), -32768), 32767));
++				dmaOutputBuffer[0] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel0), boostGain));
+ 				dmaOutputBuffer++;
+ 				// next sample
+ 				inputChannel0++;
 diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 index d4e562e0..793ea1ee 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
@@ -1484,16 +1625,17 @@ index 1190bf43..e956b930 100644
 +	return result;
 +}
 diff --git a/src/android/app/src/main/cpp/NativeLogging.cpp b/src/android/app/src/main/cpp/NativeLogging.cpp
-index 19a75475..7487fa57 100644
+index 19a75475..c5686474 100644
 --- a/src/android/app/src/main/cpp/NativeLogging.cpp
 +++ b/src/android/app/src/main/cpp/NativeLogging.cpp
-@@ -1,10 +1,22 @@
+@@ -1,10 +1,23 @@
  #include "Common/ExceptionHandler/ExceptionHandler.h"
  #include "JNIUtils.h"
  
 +namespace snd_core
 +{
 +	void AXDiag_Mark(const char* note); // ax_mix.cpp
++	void AXOut_SetVolumeBoostDb(sint32 db); // ax_out.cpp
 +}
 +
  extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
@@ -1511,19 +1653,30 @@ index 19a75475..7487fa57 100644
  }
  
  extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+@@ -15,3 +28,9 @@ Java_info_cemu_cemu_nativeinterface_NativeLogging_crashLog(JNIEnv* env, [[maybe_
+ 	CrashLog_WriteLine("Unhandled exception from java code");
+ 	CrashLog_WriteLine(JNIUtils::FromJString(env, stacktrace));
+ }
++
++extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
++Java_info_cemu_cemu_nativeinterface_NativeAudioBoost_setVolumeBoost([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jint db)
++{
++	snd_core::AXOut_SetVolumeBoostDb(db);
++}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
-index 29a5c740..824d90f8 100644
+index 29a5c740..342d30c8 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
-@@ -25,6 +25,7 @@ import info.cemu.cemu.emulation.input.DeviceMotionHandler
+@@ -25,6 +25,8 @@ import info.cemu.cemu.emulation.input.DeviceMotionHandler
  import info.cemu.cemu.emulation.input.HotkeyManager
  import info.cemu.cemu.emulation.input.InputHandler
  import info.cemu.cemu.emulation.input.NativeInputDeviceListener
 +import info.cemu.cemu.emulation.toypadscreen.ToyPadSecondScreen
++import info.cemu.cemu.nativeinterface.NativeAudioBoost
  import kotlinx.coroutines.flow.distinctUntilChanged
  import kotlinx.coroutines.flow.map
  import kotlinx.coroutines.launch
-@@ -68,6 +69,7 @@ private class InputDelegateManager(context: Context) {
+@@ -68,6 +70,7 @@ private class InputDelegateManager(context: Context) {
  
  class EmulationActivity : AppCompatActivity() {
      private lateinit var inputManager: InputDelegateManager
@@ -1531,15 +1684,16 @@ index 29a5c740..824d90f8 100644
      private var processInputEvents = true
  
      override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-@@ -116,6 +118,7 @@ class EmulationActivity : AppCompatActivity() {
+@@ -116,6 +119,8 @@ class EmulationActivity : AppCompatActivity() {
          super.onCreate(savedInstanceState)
  
          inputManager = InputDelegateManager(this)
 +        toyPadSecondScreen = ToyPadSecondScreen(this)
++        NativeAudioBoost.apply(this)
  
          setupHotkeys()
  
-@@ -139,6 +142,18 @@ class EmulationActivity : AppCompatActivity() {
+@@ -139,6 +144,18 @@ class EmulationActivity : AppCompatActivity() {
          }
      }
  
@@ -1560,10 +1714,10 @@ index 29a5c740..824d90f8 100644
  
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 new file mode 100644
-index 00000000..2c6b675d
+index 00000000..aa53a27f
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,311 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import android.content.Context
@@ -1623,22 +1777,21 @@ index 00000000..2c6b675d
 +}
 +
 +/**
-+ * Pictures of figures, by figure number. A picture is taken from the "toypad/figures" folder if one is there
-+ * (named like 1.png for Batman, 1000.png for the Police Car). Otherwise it is downloaded once from the community
-+ * LEGO-Dimensions-NFC collection and kept in that folder. Nothing is bundled with the app.
++ * Pictures downloaded once onto the device and kept in a folder under "toypad", by figure number.
++ * A picture already in that folder (named like 1.png) is used as is, so people can put in their own.
++ * Nothing is bundled with the app.
 + */
-+object FigureImages {
-+    private const val BASE_URL =
-+        "https://raw.githubusercontent.com/skylandersNFC/LEGO-Dimensions-NFC/main/Dimensions_Images/images/Separate/Chteupnin%27s%20Assets/"
-+    private const val RETRY_AFTER_MS = 60_000L
-+
++class RemoteImageCache(
++    private val subfolder: String,
++    private val maxSize: Int,
++    private val urlFor: (Int) -> String?,
++) {
 +    private val memory = LruCache<Int, ImageBitmap>(240)
-+    private val missing = ConcurrentHashMap.newKeySet<Int>() // not in the collection
++    private val missing = ConcurrentHashMap.newKeySet<Int>() // not available at the source
 +    private val failedAt = ConcurrentHashMap<Int, Long>() // download failed (offline?), retry later
 +    private val locks = ConcurrentHashMap<Int, Mutex>()
-+    private val downloads = Semaphore(4)
 +
-+    fun folder(context: Context): File = File(ToyPadScreenSettings.folder(context), "figures")
++    fun folder(context: Context): File = File(ToyPadScreenSettings.folder(context), subfolder)
 +
 +    fun cached(id: Int): ImageBitmap? = if (id > 0) memory.get(id) else null
 +
@@ -1653,21 +1806,23 @@ index 00000000..2c6b675d
 +                    .map { File(dir, "$id.$it") }
 +                    .firstOrNull { it.isFile && it.length() > 0 }
 +                val file = local ?: if (ToyPadScreenSettings.figurePicturesEnabled(context)) download(dir, id) else null
-+                file?.let { decodeScaled(it, 256) }?.asImageBitmap()?.also { memory.put(id, it) }
++                file?.let { decodeScaled(it, maxSize) }?.asImageBitmap()?.also { memory.put(id, it) }
 +            }
 +        }
 +    }
 +
 +    private suspend fun download(dir: File, id: Int): File? {
++        val url = urlFor(id) ?: return null
 +        if (id in missing) return null
 +        val lastFail = failedAt[id]
 +        if (lastFail != null && System.currentTimeMillis() - lastFail < RETRY_AFTER_MS) return null
 +        return downloads.withPermit {
 +            try {
 +                dir.mkdirs()
-+                val connection = URL("$BASE_URL$id.png").openConnection() as HttpURLConnection
++                val connection = URL(url).openConnection() as HttpURLConnection
 +                connection.connectTimeout = 8000
 +                connection.readTimeout = 15000
++                connection.setRequestProperty("Accept", "image/png,image/webp,image/*")
 +                try {
 +                    when (connection.responseCode) {
 +                        200 -> {
@@ -1703,7 +1858,101 @@ index 00000000..2c6b675d
 +            }
 +        }
 +    }
++
++    companion object {
++        private const val RETRY_AFTER_MS = 60_000L
++        private val downloads = Semaphore(4)
++    }
 +}
++
++private const val FIGURE_PICTURES_URL =
++    "https://raw.githubusercontent.com/skylandersNFC/LEGO-Dimensions-NFC/main/Dimensions_Images/images/Separate/Chteupnin%27s%20Assets/"
++
++/** Round head (character) or vehicle pictures from the community LEGO-Dimensions-NFC collection. */
++val FigureImages = RemoteImageCache("figures", 256) { "$FIGURE_PICTURES_URL$it.png" }
++
++/** Drawings of each character's Toy Tag from the LEGO Dimensions Wiki (characters only). */
++private val TOY_TAG_URLS: Map<Int, String> = mapOf(
++    1 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/b2/BATMANTOYTAG.png/revision/latest/scale-to-width-down/256",
++    2 to "https://static.wikia.nocookie.net/lego-dimensions/images/3/32/Gandalf_toy_tag.png/revision/latest/scale-to-width-down/256",
++    3 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/8f/Wyldstyle_tag.png/revision/latest/scale-to-width-down/256",
++    4 to "https://static.wikia.nocookie.net/lego-dimensions/images/9/93/Aquaman_toy_tag.png/revision/latest/scale-to-width-down/256",
++    5 to "https://static.wikia.nocookie.net/lego-dimensions/images/d/d1/Badcoptoytag.png/revision/latest/scale-to-width-down/256",
++    6 to "https://static.wikia.nocookie.net/lego-dimensions/images/3/3f/Bane_toy_tag.png/revision/latest/scale-to-width-down/256",
++    7 to "https://static.wikia.nocookie.net/lego-dimensions/images/9/93/Bart_toy_tag.png/revision/latest/scale-to-width-down/256",
++    8 to "https://static.wikia.nocookie.net/lego-dimensions/images/6/6e/Benny_tag_toy.png/revision/latest/scale-to-width-down/256",
++    9 to "https://static.wikia.nocookie.net/lego-dimensions/images/1/1c/Chell_toy_tag.png/revision/latest/scale-to-width-down/256",
++    10 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/bb/Cole_toy_tag.png/revision/latest/scale-to-width-down/256",
++    11 to "https://static.wikia.nocookie.net/lego-dimensions/images/1/11/Cragger_toy_tag.png/revision/latest/scale-to-width-down/256",
++    12 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/bc/Cyborg_toy_tag.png/revision/latest/scale-to-width-down/256",
++    13 to "https://static.wikia.nocookie.net/lego-dimensions/images/c/c2/Cyberman_toy_tag.png/revision/latest/scale-to-width-down/256",
++    14 to "https://static.wikia.nocookie.net/lego-dimensions/images/3/36/Doc_brown_toy_tag.png/revision/latest/scale-to-width-down/256",
++    15 to "https://static.wikia.nocookie.net/lego-dimensions/images/e/e6/The_doctor_toyt_ag.png/revision/latest/scale-to-width-down/256",
++    16 to "https://static.wikia.nocookie.net/lego-dimensions/images/5/55/Emmet_toy_tag.png/revision/latest/scale-to-width-down/256",
++    17 to "https://static.wikia.nocookie.net/lego-dimensions/images/c/c6/Eris_toy_tag2.png/revision/latest/scale-to-width-down/256",
++    18 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/86/Gimli_toy_tag.png/revision/latest/scale-to-width-down/256",
++    19 to "https://static.wikia.nocookie.net/lego-dimensions/images/7/77/Gollum_toy_tag.png/revision/latest/scale-to-width-down/256",
++    20 to "https://static.wikia.nocookie.net/lego-dimensions/images/f/fa/Harley_quinn.png/revision/latest/scale-to-width-down/256",
++    21 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/82/Homer_toy_tag.png/revision/latest/scale-to-width-down/256",
++    22 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/88/Jay_toy_tag.png/revision/latest/scale-to-width-down/256",
++    23 to "https://static.wikia.nocookie.net/lego-dimensions/images/9/9b/The_joker.png/revision/latest/scale-to-width-down/256",
++    24 to "https://static.wikia.nocookie.net/lego-dimensions/images/f/f1/Kai_toy_tag.png/revision/latest/scale-to-width-down/256",
++    25 to "https://static.wikia.nocookie.net/lego-dimensions/images/4/4c/ACU_TOY_TAG.png/revision/latest/scale-to-width-down/256",
++    26 to "https://static.wikia.nocookie.net/lego-dimensions/images/9/99/Gamerkid_tag.png/revision/latest/scale-to-width-down/256",
++    27 to "https://static.wikia.nocookie.net/lego-dimensions/images/e/e2/Krusty_toy_tag.png/revision/latest/scale-to-width-down/256",
++    28 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/b7/Laval_toy_tag.png/revision/latest/scale-to-width-down/256",
++    29 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/a8/Legolas_tag.png/revision/latest/scale-to-width-down/256",
++    30 to "https://static.wikia.nocookie.net/lego-dimensions/images/d/dd/Lloyd_toy_tag.png/revision/latest/scale-to-width-down/256",
++    31 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/bd/Marty_mcfly_toy_tag.png/revision/latest/scale-to-width-down/256",
++    32 to "https://static.wikia.nocookie.net/lego-dimensions/images/e/e5/Nya_toy_tag.png/revision/latest/scale-to-width-down/256",
++    33 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/ae/OWEN_TAG.png/revision/latest/scale-to-width-down/256",
++    34 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/b9/Peter_venk%2Can_toytag.png/revision/latest/scale-to-width-down/256",
++    35 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/b7/Slimer_toy_tag.png/revision/latest/scale-to-width-down/256",
++    36 to "https://static.wikia.nocookie.net/lego-dimensions/images/9/98/Scoobydoo_toy_tag.png/revision/latest/scale-to-width-down/256",
++    37 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/ae/Wu_toy_tag.png/revision/latest/scale-to-width-down/256",
++    38 to "https://static.wikia.nocookie.net/lego-dimensions/images/c/ca/Shaggy_guy_toy_tag.png/revision/latest/scale-to-width-down/256",
++    39 to "https://static.wikia.nocookie.net/lego-dimensions/images/0/0b/Staypfttag.png/revision/latest/scale-to-width-down/256",
++    40 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/a1/Superman_toy_tag.png/revision/latest/scale-to-width-down/256",
++    41 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/8b/Unikitty_tag.png/revision/latest/scale-to-width-down/256",
++    42 to "https://static.wikia.nocookie.net/lego-dimensions/images/2/2c/Wicked_witch.png/revision/latest/scale-to-width-down/256",
++    43 to "https://static.wikia.nocookie.net/lego-dimensions/images/e/ea/Wonder_woman_toy_tag.png/revision/latest/scale-to-width-down/256",
++    44 to "https://static.wikia.nocookie.net/lego-dimensions/images/4/4e/Zane_tag.png/revision/latest/scale-to-width-down/256",
++    45 to "https://static.wikia.nocookie.net/lego-dimensions/images/0/0f/Green_arrow.png/revision/latest/scale-to-width-down/256",
++    46 to "https://static.wikia.nocookie.net/lego-dimensions/images/e/e7/Supergirl_tag.png/revision/latest/scale-to-width-down/256",
++    47 to "https://static.wikia.nocookie.net/lego-dimensions/images/f/f2/Abby_yates_toy_tag.png/revision/latest/scale-to-width-down/256",
++    48 to "https://static.wikia.nocookie.net/lego-dimensions/images/e/e3/Finn_toy_tag.png/revision/latest/scale-to-width-down/256",
++    49 to "https://static.wikia.nocookie.net/lego-dimensions/images/5/51/Ethan_hunt_toy_tag.png/revision/latest/scale-to-width-down/256",
++    50 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/86/LSP_toy_tag.png/revision/latest/scale-to-width-down/256",
++    51 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/a6/Jake_the_dog_toy_tag.png/revision/latest/scale-to-width-down/256",
++    52 to "https://static.wikia.nocookie.net/lego-dimensions/images/c/c1/Harry_potter_toy_tag.png/revision/latest/scale-to-width-down/256",
++    53 to "https://static.wikia.nocookie.net/lego-dimensions/images/d/d4/You_know_who.png/revision/latest/scale-to-width-down/256",
++    54 to "https://static.wikia.nocookie.net/lego-dimensions/images/1/19/Michael_knight_toy_tag.png/revision/latest/scale-to-width-down/256",
++    55 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/b0/B.A.png/revision/latest/scale-to-width-down/256",
++    56 to "https://static.wikia.nocookie.net/lego-dimensions/images/1/13/Newt_scammander_toy_tag.png/revision/latest/scale-to-width-down/256",
++    57 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/ac/Sonic_toy_tag.png/revision/latest/scale-to-width-down/256",
++    59 to "https://static.wikia.nocookie.net/lego-dimensions/images/5/5c/Gizmo_toy_tag.png/revision/latest/scale-to-width-down/256",
++    60 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/8b/Stripe_toy_tag.png/revision/latest/scale-to-width-down/256",
++    61 to "https://static.wikia.nocookie.net/lego-dimensions/images/1/1e/E.t._toy_tagg.png/revision/latest/scale-to-width-down/256",
++    62 to "https://static.wikia.nocookie.net/lego-dimensions/images/6/60/Tinatoytag.png/revision/latest/scale-to-width-down/256",
++    63 to "https://static.wikia.nocookie.net/lego-dimensions/images/f/f1/Marceline_toy_tag.png/revision/latest/scale-to-width-down/256",
++    64 to "https://static.wikia.nocookie.net/lego-dimensions/images/c/c5/BATGIRLTOYTAG.png/revision/latest/scale-to-width-down/256",
++    65 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/8c/Lbm_robin_toy_tag.png/revision/latest/scale-to-width-down/256",
++    66 to "https://static.wikia.nocookie.net/lego-dimensions/images/f/f7/Sloth_toy_tag.png/revision/latest/scale-to-width-down/256",
++    67 to "https://static.wikia.nocookie.net/lego-dimensions/images/6/60/Hermione_toy_tag.png/revision/latest/scale-to-width-down/256",
++    68 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/88/Chase_mccain_toytag.png/revision/latest/scale-to-width-down/256",
++    69 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/a4/Excalibur_batman_toy_tag.png/revision/latest/scale-to-width-down/256",
++    70 to "https://static.wikia.nocookie.net/lego-dimensions/images/f/f3/Raventoytags.png/revision/latest/scale-to-width-down/256",
++    71 to "https://static.wikia.nocookie.net/lego-dimensions/images/a/a5/Beastboytag.png/revision/latest/scale-to-width-down/256",
++    72 to "https://static.wikia.nocookie.net/lego-dimensions/images/b/b4/Beetlejuicelogotoytagthingrahh.png/revision/latest/scale-to-width-down/256",
++    73 to "https://static.wikia.nocookie.net/lego-dimensions/images/1/16/20251114_013837.jpg/revision/latest/scale-to-width-down/256",
++    74 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/84/Blossom_toy_tag.png/revision/latest/scale-to-width-down/256",
++    75 to "https://static.wikia.nocookie.net/lego-dimensions/images/2/29/Bubbles_zap_toy_tag.png/revision/latest/scale-to-width-down/256",
++    76 to "https://static.wikia.nocookie.net/lego-dimensions/images/0/08/Buttercup_toy_tag.png/revision/latest/scale-to-width-down/256",
++    77 to "https://static.wikia.nocookie.net/lego-dimensions/images/8/82/Starfire_toy_tag.png/revision/latest/scale-to-width-down/256",
++    769 to "https://static.wikia.nocookie.net/lego-dimensions/images/e/e7/Supergirl_tag.png/revision/latest/scale-to-width-down/256",
++)
++
++val ToyTagImages = RemoteImageCache("tags", 256) { TOY_TAG_URLS[it] }
 +
 +/** Figure numbers of installed figure files, read once per file. */
 +object FigureNumbers {
@@ -1719,14 +1968,20 @@ index 00000000..2c6b675d
 +}
 +
 +@Composable
-+fun rememberFigureImage(id: Int): ImageBitmap? {
++private fun rememberRemoteImage(cache: RemoteImageCache, id: Int): ImageBitmap? {
 +    val context = LocalContext.current.applicationContext
-+    val image = remember(id) { mutableStateOf(FigureImages.cached(id)) }
-+    LaunchedEffect(id) {
-+        if (image.value == null && id > 0) image.value = FigureImages.load(context, id)
++    val image = remember(cache, id) { mutableStateOf(cache.cached(id)) }
++    LaunchedEffect(cache, id) {
++        if (image.value == null && id > 0) image.value = cache.load(context, id)
 +    }
 +    return image.value
 +}
++
++@Composable
++fun rememberFigureImage(id: Int): ImageBitmap? = rememberRemoteImage(FigureImages, id)
++
++@Composable
++fun rememberToyTagImage(id: Int): ImageBitmap? = rememberRemoteImage(ToyTagImages, id)
 +
 +/** Optional picture behind the Toy Pad screen, chosen in the Emulated USB Devices settings. */
 +object ToyPadBackgroundImage {
@@ -1929,10 +2184,10 @@ index 00000000..1b23271a
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..4e1c6a1f
+index 00000000..30244c0e
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,715 @@
+@@ -0,0 +1,726 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -2522,13 +2777,24 @@ index 00000000..4e1c6a1f
 +    emptyLabel: String? = null,
 +) {
 +    val image = if (number > 0) rememberFigureImage(number) else null
++    // characters stand on their Toy Tag; the tag's own outline replaces the plain ring unless the spot is highlighted
++    val tag = if (name != null && number in 1..999) rememberToyTagImage(number) else null
++    val showRing = tag == null || ringColor != Bronze
 +    Box(
 +        modifier = modifier
 +            .clip(CircleShape)
 +            .background(Brush.radialGradient(listOf(Color(0xFF2A4785), Color(0xFF0B1430))))
-+            .border(ringWidth, ringColor, CircleShape),
++            .then(if (showRing) Modifier.border(ringWidth, ringColor, CircleShape) else Modifier),
 +        contentAlignment = Alignment.Center,
 +    ) {
++        if (tag != null) {
++            Image(
++                bitmap = tag,
++                contentDescription = null,
++                contentScale = ContentScale.FillBounds,
++                modifier = Modifier.fillMaxSize(),
++            )
++        }
 +        when {
 +            name == null -> Text(
 +                text = emptyLabel ?: "+",
@@ -2807,6 +3073,41 @@ index 00000000..457ffbf6
 +        return activity.dispatchGenericMotionEvent(event)
 +    }
 +}
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
+new file mode 100644
+index 00000000..e573180e
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
+@@ -0,0 +1,29 @@
++package info.cemu.cemu.nativeinterface
++
++import android.content.Context
++
++/** Extra loudness for the game's TV sound (Cemu Light Fix). Stored in the app's preferences. */
++object NativeAudioBoost {
++    private const val PREFS = "lightfix_audio"
++    private const val KEY_BOOST_DB = "volume_boost_db"
++    const val MAX_BOOST_DB = 18
++    const val STEP_DB = 3
++
++    @JvmStatic
++    external fun setVolumeBoost(db: Int)
++
++    fun getSavedBoostDb(context: Context): Int =
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_BOOST_DB, 0).coerceIn(0, MAX_BOOST_DB)
++
++    fun saveBoostDb(context: Context, db: Int) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_BOOST_DB, db.coerceIn(0, MAX_BOOST_DB)).apply()
++    }
++
++    /** Send the saved value to the emulator. */
++    fun apply(context: Context) {
++        try {
++            setVolumeBoost(getSavedBoostDb(context))
++        } catch (_: Throwable) {
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
 index 5c178c2f..3d1bfb75 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
@@ -2830,8 +3131,53 @@ index 5c178c2f..3d1bfb75 100644
      @JvmStatic
      external fun clearDimensionsFigure(pad: Int, index: Int)
  
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
+index 4c61cbd5..7ba12fd7 100644
+--- a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
++++ b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
+@@ -1,11 +1,13 @@
+ package info.cemu.cemu.settings.audio
+ 
+ import androidx.compose.runtime.Composable
++import androidx.compose.ui.platform.LocalContext
+ import info.cemu.cemu.common.ui.components.ScreenContent
+ import info.cemu.cemu.common.ui.components.SingleSelection
+ import info.cemu.cemu.common.ui.components.Slider
+ import info.cemu.cemu.common.ui.components.Toggle
+ import info.cemu.cemu.common.ui.localization.tr
++import info.cemu.cemu.nativeinterface.NativeAudioBoost
+ import info.cemu.cemu.nativeinterface.NativeSettings
+ 
+ private const val AUDIO_LATENCY_STEPS = 22
+@@ -13,6 +15,7 @@ private const val AUDIO_VOLUME_STEPS = 19
+ 
+ @Composable
+ fun AudioSettingsScreen(navigateBack: () -> Unit) {
++    val context = LocalContext.current
+     ScreenContent(
+         appBarText = tr("Audio settings"),
+         navigateBack = navigateBack,
+@@ -52,6 +55,18 @@ fun AudioSettingsScreen(navigateBack: () -> Unit) {
+             onValueChange = { NativeSettings.setAudioDeviceVolume(it, true) },
+             labelFormatter = { "$it%" }
+         )
++        Slider(
++            label = "TV volume boost (Cemu Light Fix)",
++            initialValue = { NativeAudioBoost.getSavedBoostDb(context) },
++            valueFrom = 0,
++            steps = NativeAudioBoost.MAX_BOOST_DB / NativeAudioBoost.STEP_DB - 1,
++            valueTo = NativeAudioBoost.MAX_BOOST_DB,
++            onValueChange = {
++                NativeAudioBoost.saveBoostDb(context, it)
++                NativeAudioBoost.apply(context)
++            },
++            labelFormatter = { if (it == 0) "Off" else "+$it dB" }
++        )
+         Toggle(
+             label = tr("Gamepad"),
+             description = tr("Enable audio output for the Wii U Gamepad"),
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
-index 5325cb1e..ec5c921f 100644
+index 5325cb1e..e7486a84 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 @@ -1,13 +1,44 @@
@@ -2879,7 +3225,7 @@ index 5325cb1e..ec5c921f 100644
      ScreenContent(
          appBarText = tr("Emulated USB Devices settings"),
          navigateBack = navigateBack,
-@@ -29,5 +60,32 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
+@@ -29,5 +60,33 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
              initialCheckedState = NativeSettings::isEmulateDimensionsToypadEnabled,
              onCheckedChanged = NativeSettings::setEmulateDimensionsToypadEnabled,
          )
@@ -2888,8 +3234,9 @@ index 5325cb1e..ec5c921f 100644
 +
 +        Toggle(
 +            label = "Figure pictures",
-+            description = "Show pictures of your figures instead of their names. Each picture is downloaded once " +
-+                    "from the community LEGO-Dimensions-NFC collection and kept in the toypad folder.",
++            description = "Show pictures of your figures instead of their names, with characters standing on their " +
++                    "Toy Tag. Each picture is downloaded once (figures from the community LEGO-Dimensions-NFC " +
++                    "collection, Toy Tags from the LEGO Dimensions Wiki) and kept in the toypad folder.",
 +            initialCheckedState = { ToyPadScreenSettings.figurePicturesEnabled(context) },
 +            onCheckedChanged = { ToyPadScreenSettings.setFigurePicturesEnabled(context, it) },
 +        )
