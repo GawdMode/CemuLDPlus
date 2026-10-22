@@ -489,122 +489,43 @@ index e3e42012..198fb98f 100644
  // it is guaranteed that the texture is not in use and all associated resources (descriptor sets, framebuffers) can be destroyed safely
  void VulkanRenderer::surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture)
 diff --git a/src/Cafe/IOSU/fsa/iosu_fsa.cpp b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-index 1429d083..0d04989d 100644
+index 1429d083..8d4c2b5b 100644
 --- a/src/Cafe/IOSU/fsa/iosu_fsa.cpp
 +++ b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-@@ -9,6 +9,22 @@
- 
- #include "Cafe/HW/MMU/MMU.h"
- 
-+namespace snd_core
-+{
-+	bool AXDiag_IsMarking(); // true for 20 seconds after "Mark" is tapped in the app
-+}
-+
-+// diagnostic: remember which path each open file handle belongs to, for read logging
-+static std::mutex s_diagHandleMutex;
-+static std::unordered_map<sint32, std::string> s_diagHandlePath;
-+
-+static std::string _FSADiag_PathForHandle(sint32 handle)
-+{
-+	std::unique_lock _l(s_diagHandleMutex);
-+	auto it = s_diagHandlePath.find(handle);
-+	return it != s_diagHandlePath.end() ? it->second : fmt::format("handle {:x}", (uint32)handle);
-+}
-+
- using namespace iosu::kernel;
- 
- namespace iosu
-@@ -165,7 +181,20 @@ namespace iosu
- 		FSCVirtualFile* __FSAOpenNode(FSAClient* client, std::string_view path, FSC_ACCESS_FLAG accessFlags, sint32& fscStatus)
- 		{
- 			std::string translatedPath = __FSATranslatePath(client, path);
--			return fsc_open(translatedPath.c_str(), accessFlags, &fscStatus);
-+			FSCVirtualFile* fscFile = fsc_open(translatedPath.c_str(), accessFlags, &fscStatus);
-+			if (!fscFile)
-+			{
-+				// diagnostic: log paths the game asked for that don't exist (each path once, capped)
-+				static std::mutex s_missingMutex;
-+				static std::unordered_set<std::string> s_loggedMissing;
-+				std::unique_lock _l(s_missingMutex);
-+				if (s_loggedMissing.size() < 500 && !s_loggedMissing.contains(translatedPath))
-+				{
-+					s_loggedMissing.insert(translatedPath);
-+					cemuLog_log(LogType::Force, "[FileMissing] {} (status {})", translatedPath, fscStatus);
-+				}
-+			}
-+			return fscFile;
- 		}
- 
- 		class _FSAHandleTable {
-@@ -300,6 +329,22 @@ namespace iosu
- 			}
- 			*fileHandle = fsFileHandle;
- 			cemuLog_log(LogType::CoreinitFile, "Open file {} (access: {} result: ok handle: 0x{})", path, accessModifierStr, (uint32)*fileHandle);
-+			{
-+				std::unique_lock _l(s_diagHandleMutex);
-+				if (s_diagHandlePath.size() < 20000)
-+					s_diagHandlePath[(sint32)fsFileHandle] = std::string(path);
-+			}
-+			{
-+				// diagnostic: log each opened file path once (capped), with the time it was first opened
-+				static std::mutex s_openedMutex;
-+				static std::unordered_set<std::string> s_loggedOpened;
-+				std::unique_lock _l(s_openedMutex);
-+				if (s_loggedOpened.size() < 4000 && !s_loggedOpened.contains(path))
-+				{
-+					s_loggedOpened.emplace(path);
-+					cemuLog_log(LogType::Force, "[FileOpen] {} ({} bytes)", path, fsc_getFileSize(fscFile));
-+				}
-+			}
- 			return FSA_RESULT::OK;
- 		}
- 
-@@ -469,7 +514,23 @@ namespace iosu
+@@ -469,7 +469,31 @@ namespace iosu
  			if ((flags & FSA_CMD_FLAG_SET_POS) != 0)
  				fsc_setFileSeek(fscFile, filePos);
  			// todo: File permissions
-+			uint32 readPos = fsc_getFileSeek(fscFile);
++			auto readStart = std::chrono::steady_clock::now();
  			uint32 bytesSuccessfullyRead = fsc_readFile(fscFile, destPtr, bytesToRead);
 +			{
-+				// diagnostic: log reads for a while after "Mark" is tapped, and short reads at any time
-+				static std::atomic<sint32> s_markReadBudget{600};
-+				static std::atomic<sint32> s_shortReadBudget{200};
-+				static std::atomic<bool> s_wasMarking{false};
-+				bool marking = snd_core::AXDiag_IsMarking();
-+				if (marking && !s_wasMarking.exchange(true))
-+					s_markReadBudget = 600;
-+				else if (!marking)
-+					s_wasMarking = false;
-+				if (marking && s_markReadBudget.fetch_sub(1) > 0)
-+					cemuLog_log(LogType::Force, "[FileRead] {} pos {:x} size {:x} got {:x}", _FSADiag_PathForHandle((sint32)fileHandle), readPos, bytesToRead, bytesSuccessfullyRead);
-+				else if (bytesSuccessfullyRead < bytesToRead && s_shortReadBudget.fetch_sub(1) > 0)
-+					cemuLog_log(LogType::Force, "[FileReadShort] {} pos {:x} size {:x} got {:x}", _FSADiag_PathForHandle((sint32)fileHandle), readPos, bytesToRead, bytesSuccessfullyRead);
++				// how much loading time is spent reading game files, logged every 5 seconds for the first 3 minutes
++				static std::mutex s_ioStatMutex;
++				static std::chrono::steady_clock::time_point s_ioFirst{}, s_ioWindow{};
++				static uint64 s_ioBytes = 0, s_ioReads = 0;
++				static double s_ioMs = 0.0;
++				auto now = std::chrono::steady_clock::now();
++				std::unique_lock _l(s_ioStatMutex);
++				if (s_ioFirst.time_since_epoch().count() == 0)
++					s_ioFirst = s_ioWindow = readStart;
++				s_ioBytes += bytesSuccessfullyRead;
++				s_ioReads++;
++				s_ioMs += std::chrono::duration<double, std::milli>(now - readStart).count();
++				if (now - s_ioWindow >= std::chrono::seconds(5) && now - s_ioFirst <= std::chrono::seconds(185))
++				{
++					cemuLog_log(LogType::Force, "[BootIO] +{}s: {} reads, {:.1f} MB, {:.0f} ms spent reading",
++						std::chrono::duration_cast<std::chrono::seconds>(now - s_ioFirst).count(), s_ioReads, (double)s_ioBytes / (1024.0 * 1024.0), s_ioMs);
++					s_ioWindow = now;
++					s_ioBytes = 0;
++					s_ioReads = 0;
++					s_ioMs = 0.0;
++				}
 +			}
  			if (transferElementSize == 0)
  				return FSA_RESULT::OK;
  
-diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
-index 13ef6613..ac2d74cd 100644
---- a/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
-+++ b/src/Cafe/OS/libs/coreinit/coreinit_Misc.cpp
-@@ -552,7 +552,13 @@ namespace coreinit
- 		// once a line is full or \n is written it will be posted to log
- 		auto flushLine = [](CafeLogBuffer& cafeLogBuffer, std::string_view cafeLogName) -> void
- 		{
--			cemuLog_log(LogType::CoreinitLogging, "[{0}] {1}", cafeLogName, std::basic_string_view(cafeLogBuffer.lineBuffer.data(), cafeLogBuffer.lineLength));
-+			// cap the number of game debug lines so log.txt stays small
-+			static sint32 s_cafeLogLineBudget = 5000;
-+			if (s_cafeLogLineBudget > 0)
-+			{
-+				s_cafeLogLineBudget--;
-+				cemuLog_log(LogType::CoreinitLogging, "[{0}] {1}", cafeLogName, std::basic_string_view(cafeLogBuffer.lineBuffer.data(), cafeLogBuffer.lineLength));
-+			}
- 			cafeLogBuffer.lineLength = 0;
- 		};
- 
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
-index b23560f1..5c1efa06 100644
+index b23560f1..3be9ea7b 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 @@ -575,6 +575,8 @@ namespace nsyshid
@@ -645,7 +566,7 @@ index b23560f1..5c1efa06 100644
 +		auto rgbAt = [&buf](size_t i) -> uint32 { return ((uint32)buf[i] << 16) | ((uint32)buf[i + 1] << 8) | (uint32)buf[i + 2]; };
 +		{
 +			// diagnostic: log the first few light commands so the byte layout can be verified
-+			static sint32 s_lightLogBudget = 40;
++			static sint32 s_lightLogBudget = 0; // set above 0 to log the game's light commands
 +			if (s_lightLogBudget > 0)
 +			{
 +				s_lightLogBudget--;
@@ -798,16 +719,13 @@ index 00ceff9e..69a3ff24 100644
  		std::queue<std::array<uint8, 32>> m_queries;
  	};
 diff --git a/src/Cafe/OS/libs/snd_core/ax.h b/src/Cafe/OS/libs/snd_core/ax.h
-index 0861e6a7..05c9b347 100644
+index 0861e6a7..a85281f2 100644
 --- a/src/Cafe/OS/libs/snd_core/ax.h
 +++ b/src/Cafe/OS/libs/snd_core/ax.h
-@@ -391,6 +391,12 @@ namespace snd_core
+@@ -391,6 +391,9 @@ namespace snd_core
  	void AXOut_reset();
  	void AXOut_update();
  
-+	// diagnostics: mark a moment in the log (from the app) and log sound levels for the next 20 seconds
-+	void AXDiag_Mark(const char* note);
-+	bool AXDiag_IsMarking();
 +	// extra loudness for the TV output, in dB (0 = off), with a soft limiter so peaks don't crackle
 +	void AXOut_SetVolumeBoostDb(sint32 db);
 +
@@ -815,50 +733,8 @@ index 0861e6a7..05c9b347 100644
  	COSModule* GetModuleSndCore2();
  }
 \ No newline at end of file
-diff --git a/src/Cafe/OS/libs/snd_core/ax_aux.cpp b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
-index a9176562..7fb96387 100644
---- a/src/Cafe/OS/libs/snd_core/ax_aux.cpp
-+++ b/src/Cafe/OS/libs/snd_core/ax_aux.cpp
-@@ -145,6 +145,7 @@ namespace snd_core
- 			return r;
- 		if (auxBusIndex >= AX_AUX_BUS_COUNT)
- 			return -5;
-+		cemuLog_log(LogType::Force, "[AXDiag] AXRegisterAuxCallback device {} index {} bus {} func {:08x}", device, deviceIndex, auxBusIndex, funcMPTR);
- 		if (device == AX_DEV_TV)
- 		{
- 			__AXAuxTVCallbackFunc[auxBusIndex] = funcMPTR;
-@@ -283,6 +284,14 @@ namespace snd_core
- 			return r;
- 		if (auxBus >= AX_AUX_BUS_COUNT)
- 			return -5;
-+		{
-+			static sint32 s_logBudget = 30;
-+			if (s_logBudget > 0)
-+			{
-+				s_logBudget--;
-+				cemuLog_log(LogType::Force, "[AXDiag] AXSetAuxReturnVolume device {} index {} bus {} volume {:04x}", device, deviceIndex, auxBus, volume);
-+			}
-+		}
- 		if( device == AX_DEV_TV )
- 		{ 
- 			__AXTVAuxReturnVolume[auxBus] = volume;
-diff --git a/src/Cafe/OS/libs/snd_core/ax_internal.h b/src/Cafe/OS/libs/snd_core/ax_internal.h
-index cb7c153e..4e84d9bc 100644
---- a/src/Cafe/OS/libs/snd_core/ax_internal.h
-+++ b/src/Cafe/OS/libs/snd_core/ax_internal.h
-@@ -221,4 +221,9 @@ namespace snd_core
- 	extern SysAllocator<sint32, AX_SAMPLES_MAX * AX_TV_CHANNEL_COUNT> __AXTVOutputBuffer;
- 	extern SysAllocator<sint32, AX_SAMPLES_MAX * AX_DRC_CHANNEL_COUNT * 2> __AXDRCOutputBuffer;
- 
-+	// diagnostics: remember why a voice stopped (1 = game stopped it, 2 = game freed it, 3 = dropped for a higher priority voice)
-+	void AXDiag_NoteVoiceStop(sint32 voiceIndex, uint8 reason);
-+	// diagnostics: per-voice history of recent API calls, written to the log when a voice stops without playing
-+	void AXDiag_Record(sint32 voiceIndex, uint8 type, uint32 v0 = 0, uint32 v1 = 0, uint32 v2 = 0, uint32 v3 = 0);
-+	void AXDiag_DumpHistory(sint32 voiceIndex);
- }
-\ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a44..cf8ff0cf 100644
+index 31a24a44..f94364d8 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 @@ -751,15 +751,24 @@ namespace snd_core
@@ -891,320 +767,6 @@ index 31a24a44..cf8ff0cf 100644
  	}
  
  	// mix audio generated from voice into main bus and aux buses
-@@ -804,24 +813,302 @@ namespace snd_core
- 		// todo
- 	}
- 
--	void AXMix_ProcessVoices(AXVPBInternal_t* firstVoice)
-+	// ---- diagnostic: track voices and log how longer ones (music, dialogue) are set up, how long they play and why they stop ----
-+	struct AXVoiceDiagState
-+	{
-+		bool active{};
-+		bool tracked{};
-+		uint16 format{};
-+		uint32 samplesAddr{};
-+		uint32 endOffset{};
-+		uint32 startOffset{};
-+		uint32 lastOffset{};
-+		uint32 frames{};
-+		float peakDecoded{};
-+		float peakAfterVolume{};
-+		float peakAfterFilters{};
-+	};
-+	static AXVoiceDiagState s_voiceDiag[AX_MAX_VOICES];
-+	static std::atomic<uint8> s_voiceStopReason[AX_MAX_VOICES];
-+	static sint32 s_voiceDiagLogBudget = 4000;
-+	static sint32 s_voiceQuickStopLogBudget = 1500;
-+
-+	void AXDiag_NoteVoiceStop(sint32 voiceIndex, uint8 reason)
-+	{
-+		if (voiceIndex >= 0 && voiceIndex < AX_MAX_VOICES)
-+			s_voiceStopReason[voiceIndex] = reason;
-+	}
-+
-+	static const char* _AXDiagStopReasonName(uint8 reason)
-+	{
-+		switch (reason)
-+		{
-+		case 1: return "game stopped it";
-+		case 2: return "game freed it";
-+		case 3: return "dropped for another voice";
-+		default: return "reached end of data";
-+		}
-+	}
-+
-+	static float _AXDiagPeak(const float* samples, size_t count)
-+	{
-+		float p = 0.0f;
-+		for (size_t i = 0; i < count; i++)
-+			p = std::max(p, std::fabs(samples[i]));
-+		return p / 256.0f; // in 16-bit sample units
-+	}
-+
-+	static void _AXDiagLogEnd(sint32 idx, const char* reason)
-+	{
-+		AXVoiceDiagState& st = s_voiceDiag[idx];
-+		sint64 advanced = (sint64)st.lastOffset - (sint64)st.startOffset;
-+		if (st.tracked)
-+		{
-+			if (s_voiceDiagLogBudget > 0)
-+			{
-+				s_voiceDiagLogBudget--;
-+				cemuLog_log(LogType::Force, "[AXVoice] end v{} ({}) after {}ms, advanced {} of {} | peak decoded {:.0f} after-volume {:.0f} after-filters {:.0f}",
-+					idx, reason, st.frames * 3, advanced, (sint64)st.endOffset - (sint64)st.startOffset, st.peakDecoded, st.peakAfterVolume, st.peakAfterFilters);
-+			}
-+		}
-+		else if (st.frames <= 10 && advanced == 0 && s_voiceQuickStopLogBudget > 0)
-+		{
-+			// short voice that stopped almost immediately without playing anything
-+			s_voiceQuickStopLogBudget--;
-+			cemuLog_log(LogType::Force, "[AXVoice] quickstop v{} ({}) after {}ms without playing | fmt {} samples {:08x} len {} | start abs {:x} end abs {:x}",
-+				idx, reason, st.frames * 3, st.format, st.samplesAddr, (sint64)st.endOffset - (sint64)st.startOffset, st.startOffset, st.endOffset);
-+			static sint32 s_quickStopCount = 0;
-+			s_quickStopCount++;
-+			if (s_quickStopCount <= 60 || (s_quickStopCount % 20) == 0)
-+				AXDiag_DumpHistory(idx);
-+		}
-+		st = {};
-+	}
-+
-+	static void _AXDiagLogStart(sint32 idx, AXVPBInternal_t* v, uint32 samplesAddr)
-+	{
-+		if (s_voiceDiagLogBudget <= 0)
-+			return;
-+		s_voiceDiagLogBudget--;
-+		auto vol = [v](sint32 bus, sint32 ch) -> uint32 { return _swapEndianU16(v->deviceMixTV[ch * 4 + bus].vol); };
-+		std::string auxInfo;
-+		for (sint32 bus = 1; bus < AX_BUS_COUNT; bus++)
-+		{
-+			uint32 mask = _swapEndianU16(v->deviceMixMaskTV[bus]);
-+			if (mask == 0)
-+				continue;
-+			auxInfo += fmt::format(" aux{}[mask {:03x} vol {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}]", bus - 1, mask, vol(bus, 0), vol(bus, 1), vol(bus, 2), vol(bus, 3), vol(bus, 4), vol(bus, 5));
-+		}
-+		uint32 drcMask = 0;
-+		for (sint32 i = 0; i < 8; i++)
-+			drcMask |= _swapEndianU16(v->deviceMixMaskDRC[i]);
-+		cemuLog_log(LogType::Force, "[AXVoice] start v{} fmt {} loop {} len {} samples {:08x} cur {:x} src {:08x} filter {} ve {:04x} lpf {}[{:04x} {:04x}] biquad {} | TV main[mask {:03x} vol {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}]{} | DRC mask {:x}",
-+			idx, _swapEndianU16(v->internalOffsets.format), _swapEndianU16(v->internalOffsets.loopFlag),
-+			(sint64)v->internalOffsets.GetEndOffset32() - (sint64)v->internalOffsets.GetCurrentOffset32(),
-+			samplesAddr, v->internalOffsets.GetCurrentOffset32(),
-+			v->src.GetSrcRatio32(), _swapEndianU16(v->srcFilterMode), (uint32)v->veVolume,
-+			_swapEndianU16(v->lpf.on), _swapEndianU16(v->lpf.a0), _swapEndianU16(v->lpf.b0), _swapEndianU16(v->biquad.on),
-+			_swapEndianU16(v->deviceMixMaskTV[0]), vol(0, 0), vol(0, 1), vol(0, 2), vol(0, 3), vol(0, 4), vol(0, 5), auxInfo, drcMask);
-+	}
-+
-+	// ---- diagnostic: after the user taps "Mark" in the app, log what is playing and how loud for 20 seconds ----
-+	static std::atomic<uint64> s_markUntilMs{0};
-+	struct AXLevelAcc
-+	{
-+		double mainEnergy{}; // energy reaching TV main bus channel 0+1 (16-bit units squared, summed)
-+		double auxEnergy{};  // energy sent to aux buses (channel 0+1)
-+		double rawEnergy{};  // energy after filters, before mixing
-+		uint32 samples{};
-+		uint16 format{};
-+		bool used{};
-+	};
-+	static AXLevelAcc s_levelVoice[AX_MAX_VOICES];
-+	static double s_levelOutEnergy[3]{}; // L, R, center
-+	static uint32 s_levelOutSamples = 0;
-+	static uint32 s_levelFrames = 0;
-+
-+	static uint64 _AXDiagMarkNowMs()
-+	{
-+		return (uint64)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-+	}
-+
-+	static bool _AXDiagMarking()
-+	{
-+		return _AXDiagMarkNowMs() < s_markUntilMs.load();
-+	}
-+
-+	bool AXDiag_IsMarking()
-+	{
-+		return _AXDiagMarking();
-+	}
-+
-+	static std::string _AXDiagDb(double energy, uint32 samples)
-+	{
-+		if (samples == 0 || energy <= 0.0)
-+			return "-inf";
-+		double rms = std::sqrt(energy / (double)samples);
-+		return fmt::format("{:.1f}", 20.0 * std::log10(std::max(rms, 1e-9) / 32768.0));
-+	}
-+
-+	void AXDiag_Mark(const char* note)
- 	{
--		if (firstVoice == nullptr)
-+		cemuLog_log(LogType::Force, "[Marker] {} -- logging sound levels for 20 seconds", note ? note : "");
-+		// snapshot of all voices the game currently has running
-+		for (sint32 i = 0; __AXVPBArrayPtr != nullptr && i < AX_MAX_VOICES; i++)
-+		{
-+			AXVPB* vpb = __AXVPBArrayPtr + i;
-+			AXVPBInternal_t* internal = __AXVPBInternalVoiceArray + i;
-+			uint32 state = (uint32)vpb->playbackState;
-+			if (state == 0)
-+				continue;
-+			auto vol = [internal](sint32 bus, sint32 ch) -> uint32 { return _swapEndianU16(internal->deviceMixTV[ch * 4 + bus].vol); };
-+			cemuLog_log(LogType::Force, "[Marker] running v{} prio {} fmt {} loop {} samples {:08x} cur {:x} end {:x} | ve {:04x} lpf {}[{:04x} {:04x}] | TV main {:04x} {:04x} {:04x} {:04x} {:04x} {:04x} aux0 {:04x} {:04x}",
-+				i, (uint32)vpb->priority, _swapEndianU16(vpb->offsets.format), _swapEndianU16(vpb->offsets.loopFlag), _swapEndianU32(vpb->offsets.samples),
-+				_swapEndianU32(vpb->offsets.currentOffset), _swapEndianU32(vpb->offsets.endOffset),
-+				(uint32)internal->veVolume, _swapEndianU16(internal->lpf.on), _swapEndianU16(internal->lpf.a0), _swapEndianU16(internal->lpf.b0),
-+				vol(0, 0), vol(0, 1), vol(0, 2), vol(0, 3), vol(0, 4), vol(0, 5), vol(1, 0), vol(1, 1));
-+		}
-+		for (auto& v : s_levelVoice)
-+			v = {};
-+		s_levelOutEnergy[0] = s_levelOutEnergy[1] = s_levelOutEnergy[2] = 0.0;
-+		s_levelOutSamples = 0;
-+		s_levelFrames = 0;
-+		s_markUntilMs = _AXDiagMarkNowMs() + 20000;
-+	}
-+
-+	static void _AXDiagLevelAccumulateVoice(sint32 idx, AXVPBInternal_t* v, const float* samples, size_t count)
-+	{
-+		double e = 0.0;
-+		for (size_t i = 0; i < count; i++)
-+		{
-+			double s16 = (double)samples[i] / 256.0;
-+			e += s16 * s16;
-+		}
-+		auto gain = [v](sint32 bus, sint32 ch) -> double {
-+			if (((_swapEndianU16(v->deviceMixMaskTV[bus]) >> (ch * 2)) & 3) == 0)
-+				return 0.0;
-+			return (double)_swapEndianU16(v->deviceMixTV[ch * 4 + bus].vol) / 32768.0;
-+		};
-+		double gMain = (gain(0, 0) * gain(0, 0) + gain(0, 1) * gain(0, 1)) * 0.5;
-+		double gAux = 0.0;
-+		for (sint32 bus = 1; bus < AX_BUS_COUNT; bus++)
-+			gAux += (gain(bus, 0) * gain(bus, 0) + gain(bus, 1) * gain(bus, 1)) * 0.5;
-+		AXLevelAcc& acc = s_levelVoice[idx];
-+		acc.used = true;
-+		acc.format = _swapEndianU16(v->internalOffsets.format);
-+		acc.rawEnergy += e;
-+		acc.mainEnergy += e * gMain;
-+		acc.auxEnergy += e * gAux;
-+		acc.samples += (uint32)count;
-+	}
-+
-+	static void _AXDiagLevelAccumulateOutput()
-+	{
-+		size_t sampleCount = AXGetInputSamplesPerFrame();
-+		const sint32* out = __AXTVOutputBuffer.GetPtr();
-+		const sint32 channels[3] = {0, 1, 4};
-+		for (sint32 c = 0; c < 3; c++)
-+		{
-+			const sint32* p = out + channels[c] * sampleCount;
-+			double e = 0.0;
-+			for (size_t i = 0; i < sampleCount; i++)
-+			{
-+				double s16 = (double)_swapEndianS32(p[i]);
-+				e += s16 * s16;
-+			}
-+			s_levelOutEnergy[c] += e;
-+		}
-+		s_levelOutSamples += (uint32)sampleCount;
-+		s_levelFrames++;
-+		if (s_levelFrames < 83) // about 250ms
- 			return;
-+		// report: overall output and the loudest voices
-+		std::vector<sint32> order;
-+		for (sint32 i = 0; i < AX_MAX_VOICES; i++)
-+			if (s_levelVoice[i].used && s_levelVoice[i].samples > 0)
-+				order.push_back(i);
-+		std::sort(order.begin(), order.end(), [](sint32 a, sint32 b) {
-+			return s_levelVoice[a].mainEnergy + s_levelVoice[a].auxEnergy > s_levelVoice[b].mainEnergy + s_levelVoice[b].auxEnergy;
-+		});
-+		std::string line = fmt::format("[AXLevel] out L {} R {} C {} dB |", _AXDiagDb(s_levelOutEnergy[0], s_levelOutSamples), _AXDiagDb(s_levelOutEnergy[1], s_levelOutSamples), _AXDiagDb(s_levelOutEnergy[2], s_levelOutSamples));
-+		for (size_t k = 0; k < order.size() && k < 6; k++)
-+		{
-+			const AXLevelAcc& a = s_levelVoice[order[k]];
-+			// voice levels are averaged over the whole 250ms window so they compare directly with the output level
-+			line += fmt::format(" v{} fmt{} main {} aux {} (raw {})", order[k], a.format, _AXDiagDb(a.mainEnergy, s_levelOutSamples), _AXDiagDb(a.auxEnergy, s_levelOutSamples), _AXDiagDb(a.rawEnergy, a.samples));
-+		}
-+		cemuLog_log(LogType::Force, "{}", line);
-+		for (auto& v : s_levelVoice)
-+			v = {};
-+		s_levelOutEnergy[0] = s_levelOutEnergy[1] = s_levelOutEnergy[2] = 0.0;
-+		s_levelOutSamples = 0;
-+		s_levelFrames = 0;
-+	}
-+
-+	void AXMix_ProcessVoices(AXVPBInternal_t* firstVoice)
-+	{
-+		bool voiceSeen[AX_MAX_VOICES] = {};
-+		const bool marking = _AXDiagMarking();
-+		if (firstVoice != nullptr)
-+		{
- 		size_t sampleCount = AXGetInputSamplesPerFrame();
- 		AXVPBInternal_t* internalVoice = firstVoice;
- 		cemu_assert_debug(sndGeneric.initParam.frameLength == 0);
- 		float tmpSampleBuffer[AX_SAMPLES_MAX];
- 		while (internalVoice)
- 		{
-+			sint32 idx = (sint32)(uint16)internalVoice->index;
-+			AXVoiceDiagState* st = (idx >= 0 && idx < AX_MAX_VOICES) ? &s_voiceDiag[idx] : nullptr;
-+			if (st)
-+			{
-+				voiceSeen[idx] = true;
-+				uint32 endOffset = internalVoice->internalOffsets.GetEndOffset32();
-+				uint32 curOffset = internalVoice->internalOffsets.GetCurrentOffset32();
-+				bool voiceLoops = _swapEndianU16(internalVoice->internalOffsets.loopFlag) != 0;
-+				if (st->active && st->endOffset != endOffset && !voiceLoops)
-+					_AXDiagLogEnd(idx, "replaced");
-+				if (!st->active)
-+				{
-+					s_voiceStopReason[idx] = 0;
-+					AXVPB* vpb = __AXVPBArrayPtr + idx;
-+					st->active = true;
-+					st->format = _swapEndianU16(internalVoice->internalOffsets.format);
-+					st->samplesAddr = _swapEndianU32(vpb->offsets.samples);
-+					st->endOffset = endOffset;
-+					st->startOffset = curOffset;
-+					st->tracked = voiceLoops || ((sint64)endOffset - (sint64)curOffset) > 20000;
-+					if (st->tracked)
-+						_AXDiagLogStart(idx, internalVoice, st->samplesAddr);
-+				}
-+			}
- 			AXVoiceMix_DecodeSamples(internalVoice, tmpSampleBuffer, sampleCount);
-+			if (st && st->tracked)
-+				st->peakDecoded = std::max(st->peakDecoded, _AXDiagPeak(tmpSampleBuffer, sampleCount));
- 			AXVoiceMix_ApplyADSR(internalVoice, tmpSampleBuffer, sampleCount);
-+			if (st && st->tracked)
-+				st->peakAfterVolume = std::max(st->peakAfterVolume, _AXDiagPeak(tmpSampleBuffer, sampleCount));
- 			AXVoiceMix_ApplyBiquad(internalVoice, tmpSampleBuffer, sampleCount);
- 			AXVoiceMix_ApplyLowPass(internalVoice, tmpSampleBuffer, sampleCount);
-+			if (st)
-+			{
-+				if (st->tracked)
-+					st->peakAfterFilters = std::max(st->peakAfterFilters, _AXDiagPeak(tmpSampleBuffer, sampleCount));
-+				st->frames++;
-+				st->lastOffset = internalVoice->internalOffsets.GetCurrentOffset32();
-+			}
-+			if (marking && idx >= 0 && idx < AX_MAX_VOICES)
-+				_AXDiagLevelAccumulateVoice(idx, internalVoice, tmpSampleBuffer, sampleCount);
- 			AXVoiceMix_MixIntoBuses(internalVoice, tmpSampleBuffer, sampleCount, sampleCount);
- 			// next
- 			internalVoice = internalVoice->nextToProcess.GetPtr();
- 		}
-+		}
-+		// voices that were active last frame but not processed anymore have stopped
-+		for (sint32 i = 0; i < AX_MAX_VOICES; i++)
-+		{
-+			if (s_voiceDiag[i].active && !voiceSeen[i])
-+				_AXDiagLogEnd(i, _AXDiagStopReasonName(s_voiceStopReason[i]));
-+		}
- 	}
- 
- 	void AXMix_MergeBusSamples(float* input, sint32* output, sint32 sampleCount, uint16& volume, sint16 delta)
-@@ -977,6 +1264,8 @@ namespace snd_core
- 
- 		// merge main and aux buses
- 		AXMix_mergeTVBuses();
-+		if (_AXDiagMarking())
-+			_AXDiagLevelAccumulateOutput();
- 		AXMix_mergeDRC0Buses();
- 
- 		AXAux_incrementBufferIndex();
 diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
 index 6cb1599a..8ba5f09d 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
@@ -1286,281 +848,171 @@ index 6cb1599a..8ba5f09d 100644
  				dmaOutputBuffer++;
  				// next sample
  				inputChannel0++;
-diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-index d4e562e0..793ea1ee 100644
---- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-+++ b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-@@ -369,6 +369,16 @@ namespace snd_core
- 				while (voiceItr->next)
- 					voiceItr = voiceItr->next.GetPtr();
- 				cemuLog_logDebug(LogType::Force, "Dropped voice {}", (uint32)voiceItr->index);
+diff --git a/src/Cafe/OS/libs/snd_user/snd_user.cpp b/src/Cafe/OS/libs/snd_user/snd_user.cpp
+index 58e8f4b5..6b1ed12a 100644
+--- a/src/Cafe/OS/libs/snd_user/snd_user.cpp
++++ b/src/Cafe/OS/libs/snd_user/snd_user.cpp
+@@ -1082,12 +1082,12 @@ namespace snd_user
+ 			if(!clearChannel[channel])
+ 				continue;
+ 			sint32be* channelPtr = auxSamples->channelSamples[channel].GetPtr();
+-			while (sampleCount)
+-			{
+-				*channelPtr = 0;
+-				channelPtr++;
+-				sampleCount--;
+-			}
++			if (!channelPtr)
++				continue;
++			// clear every requested channel (previously the counter ran out after the first channel, so the
++			// other channels were sent back unprocessed, making the right side louder than the left)
++			for (size_t i = 0; i < sampleCount; i++)
++				channelPtr[i] = 0;
+ 		}
+ 
+ 	}
+@@ -1129,9 +1129,84 @@ namespace snd_user
+ 		uint32 placeholder;
+ 	};
+ 
++	// The firmware's multi-channel reverb isn't emulated. Instead of silencing the effect, run a simple
++	// Freeverb-style room reverb so sounds the game sends to the reverb still get their sense of space.
++	// Output is wet only (the dry sound is mixed separately by the game), on the front left/right channels.
++	class SimpleRoomReverb
++	{
++	  public:
++		explicit SimpleRoomReverb(uint32 sampleRate)
++		{
++			static constexpr sint32 combTuning[8] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
++			static constexpr sint32 allpassTuning[4] = {556, 441, 341, 225};
++			static constexpr sint32 stereoSpread = 23;
++			const float scale = (float)sampleRate / 44100.0f;
++			for (sint32 side = 0; side < 2; side++)
++			{
++				for (sint32 i = 0; i < 8; i++)
++					m_comb[side][i].buffer.assign(std::max<sint32>(1, (sint32)((combTuning[i] + side * stereoSpread) * scale)), 0.0f);
++				for (sint32 i = 0; i < 4; i++)
++					m_allpass[side][i].buffer.assign(std::max<sint32>(1, (sint32)((allpassTuning[i] + side * stereoSpread) * scale)), 0.0f);
++			}
++		}
++
++		void Process(const float* input, float* outLeft, float* outRight, size_t count)
++		{
++			constexpr float feedback = 0.84f; // room size
++			constexpr float damp = 0.2f;
++			for (size_t n = 0; n < count; n++)
++			{
++				float in = input[n] * 0.015f;
++				float out[2] = {0.0f, 0.0f};
++				for (sint32 side = 0; side < 2; side++)
 +				{
-+					// diagnostic: log the first few voice drops
-+					static sint32 s_dropLogBudget = 40;
-+					if (s_dropLogBudget > 0)
++					for (auto& c : m_comb[side])
 +					{
-+						s_dropLogBudget--;
-+						cemuLog_log(LogType::Force, "[AXDiag] dropped voice {} (priority {}) to make room for a voice with priority {}", (uint32)voiceItr->index, i, priority);
++						float y = c.buffer[c.pos];
++						c.filterStore = y * (1.0f - damp) + c.filterStore * damp;
++						c.buffer[c.pos] = in + c.filterStore * feedback;
++						if (++c.pos >= c.buffer.size())
++							c.pos = 0;
++						out[side] += y;
++					}
++					for (auto& a : m_allpass[side])
++					{
++						float b = a.buffer[a.pos];
++						a.buffer[a.pos] = out[side] + b * 0.5f;
++						if (++a.pos >= a.buffer.size())
++							a.pos = 0;
++						out[side] = b - out[side];
 +					}
 +				}
-+				AXDiag_NoteVoiceStop((sint32)voiceItr->index, 3);
- 				// drop voice
- 				if (voiceItr->playbackState != 0)
- 				{
-@@ -393,6 +403,88 @@ namespace snd_core
- 		return nullptr;
++				outLeft[n] = out[0];
++				outRight[n] = out[1];
++			}
++		}
++
++	  private:
++		struct Comb
++		{
++			std::vector<float> buffer;
++			size_t pos = 0;
++			float filterStore = 0.0f;
++		};
++		struct Allpass
++		{
++			std::vector<float> buffer;
++			size_t pos = 0;
++		};
++		Comb m_comb[2][8];
++		Allpass m_allpass[2][4];
++	};
++
++	static std::mutex s_roomReverbMutex;
++	static std::unordered_map<uintptr_t, std::unique_ptr<SimpleRoomReverb>> s_roomReverbs;
++
+ 	void AXFXMultiChReverbInit(AXFXMultiChReverbData* param, int ukn2, int ukn3)
+ 	{
+-		cemuLog_log(LogType::Force, "AXFXMultiChReverbInit (Stubbed)");
++		cemuLog_log(LogType::Force, "AXFXMultiChReverbInit (using built-in room reverb)");
++		std::unique_lock _l(s_roomReverbMutex);
++		s_roomReverbs.erase((uintptr_t)param);
  	}
  
-+	// ---- diagnostics: per-voice history of recent API calls ----
-+	enum AXDiagCallType : uint8
-+	{
-+		AXDIAG_ACQUIRE = 1, AXDIAG_FREE, AXDIAG_SETSTATE, AXDIAG_SETOFFSETS, AXDIAG_SETSAMPLESADDR, AXDIAG_SETCUR, AXDIAG_SETEND, AXDIAG_SETLOOPOFS,
-+		AXDIAG_SETLOOPFLAG, AXDIAG_GETOFFSETS, AXDIAG_SETADPCM, AXDIAG_SETADPCMLOOP, AXDIAG_SETCUREX, AXDIAG_SETENDEX, AXDIAG_SETLOOPOFSEX, AXDIAG_GETCUREX, AXDIAG_SETOFFSETSEX
-+	};
-+	struct AXDiagCall
-+	{
-+		uint64 timeMs;
-+		uint8 type;
-+		uint16 repeat;
-+		uint32 v[4];
-+		uint32 absCur;
-+		uint32 absEnd;
-+	};
-+	static constexpr sint32 AXDIAG_HISTORY = 24;
-+	static std::mutex s_axHistMutex;
-+	static AXDiagCall s_axHist[AX_MAX_VOICES][AXDIAG_HISTORY];
-+	static uint8 s_axHistPos[AX_MAX_VOICES];
-+
-+	static uint64 _AXDiagNowMs()
-+	{
-+		return (uint64)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-+	}
-+
-+	void AXDiag_Record(sint32 voiceIndex, uint8 type, uint32 v0, uint32 v1, uint32 v2, uint32 v3)
-+	{
-+		if (voiceIndex < 0 || voiceIndex >= AX_MAX_VOICES)
+ 	void AXFXMultiChReverbSettingsUpdate(AXFXMultiChReverbData* param)
+@@ -1141,13 +1216,52 @@ namespace snd_user
+ 
+ 	void AXFXMultiChReverbShutdown(AXFXMultiChReverbData* param)
+ 	{
+-		// todo
++		std::unique_lock _l(s_roomReverbMutex);
++		s_roomReverbs.erase((uintptr_t)param);
+ 	}
+ 
+ 	void AXFXMultiChReverbCallback(AUXCBSAMPLEDATA* auxSamples, AXFXMultiChReverbData* reverbHi, AXAUXCBCHANNELINFO* auxInfo)
+ 	{
+-		// todo - implement me
+-		__UnimplementedFXCallback(auxSamples, auxInfo->numSamples, true, true, true, true, true, true);
++		size_t sampleCount = std::min<size_t>(auxInfo->numSamples, 512);
++		uint32 channelCount = std::min<uint32>(auxInfo->numChannels, 6);
++		if (channelCount == 0)
++			channelCount = 6;
++		if (sampleCount == 0)
 +			return;
-+		AXVPBInternal_t* internal = __AXVPBInternalVoiceArray + voiceIndex;
-+		std::unique_lock _l(s_axHistMutex);
-+		uint8& pos = s_axHistPos[voiceIndex];
-+		AXDiagCall& prev = s_axHist[voiceIndex][(pos + AXDIAG_HISTORY - 1) % AXDIAG_HISTORY];
-+		bool isPoll = (type == AXDIAG_GETOFFSETS || type == AXDIAG_GETCUREX);
-+		if (isPoll && prev.type == type)
++		std::unique_lock _l(s_roomReverbMutex);
++		auto& reverb = s_roomReverbs[(uintptr_t)reverbHi];
++		if (!reverb)
++			reverb = std::make_unique<SimpleRoomReverb>((uint32)(sampleCount * 1000 / 3)); // 3ms frames
++		// mix everything sent to the reverb into one input
++		float input[512] = {};
++		for (uint32 ch = 0; ch < channelCount; ch++)
 +		{
-+			// collapse repeated polling into one entry
-+			prev.repeat++;
-+			prev.timeMs = _AXDiagNowMs();
-+			prev.v[0] = v0; prev.v[1] = v1; prev.v[2] = v2; prev.v[3] = v3;
-+			prev.absCur = internal->internalOffsets.GetCurrentOffset32();
-+			prev.absEnd = internal->internalOffsets.GetEndOffset32();
-+			return;
-+		}
-+		AXDiagCall& c = s_axHist[voiceIndex][pos];
-+		c.timeMs = _AXDiagNowMs();
-+		c.type = type;
-+		c.repeat = 1;
-+		c.v[0] = v0; c.v[1] = v1; c.v[2] = v2; c.v[3] = v3;
-+		c.absCur = internal->internalOffsets.GetCurrentOffset32();
-+		c.absEnd = internal->internalOffsets.GetEndOffset32();
-+		pos = (pos + 1) % AXDIAG_HISTORY;
-+	}
-+
-+	void AXDiag_DumpHistory(sint32 voiceIndex)
-+	{
-+		if (voiceIndex < 0 || voiceIndex >= AX_MAX_VOICES)
-+			return;
-+		static const char* names[] = { "?", "Acquire", "Free", "SetState", "SetOffsets", "SetSamplesAddr", "SetCurrentOffset", "SetEndOffset", "SetLoopOffset",
-+			"SetLoop", "GetOffsets", "SetAdpcm", "SetAdpcmLoop", "SetCurrentOffsetEx", "SetEndOffsetEx", "SetLoopOffsetEx", "GetCurrentOffsetEx", "SetOffsetsEx" };
-+		AXVPB* vpb = __AXVPBArrayPtr + voiceIndex;
-+		AXVPBInternal_t* internal = __AXVPBInternalVoiceArray + voiceIndex;
-+		std::unique_lock _l(s_axHistMutex);
-+		uint64 now = _AXDiagNowMs();
-+		std::string out = fmt::format("[AXHist] v{} now: public samples {:08x} fmt {} loopFlag {} loop {:x} end {:x} cur {:x} | internal abs loop {:x} end {:x} cur {:x}",
-+			voiceIndex, _swapEndianU32(vpb->offsets.samples), _swapEndianU16(vpb->offsets.format), _swapEndianU16(vpb->offsets.loopFlag),
-+			_swapEndianU32(vpb->offsets.loopOffset), _swapEndianU32(vpb->offsets.endOffset), _swapEndianU32(vpb->offsets.currentOffset),
-+			internal->internalOffsets.GetLoopOffset32(), internal->internalOffsets.GetEndOffset32(), internal->internalOffsets.GetCurrentOffset32());
-+		cemuLog_log(LogType::Force, "{}", out);
-+		uint8 pos = s_axHistPos[voiceIndex];
-+		for (sint32 i = 0; i < AXDIAG_HISTORY; i++)
-+		{
-+			const AXDiagCall& c = s_axHist[voiceIndex][(pos + i) % AXDIAG_HISTORY];
-+			if (c.type == 0 || c.type >= (sizeof(names) / sizeof(names[0])))
++			if (ch == 5)
++				continue; // skip LFE
++			sint32be* p = auxSamples->channelSamples[ch].GetPtr();
++			if (!p)
 +				continue;
-+			if (now - c.timeMs > 3000)
-+				continue; // only the last 3 seconds
-+			cemuLog_log(LogType::Force, "[AXHist]   -{}ms {}{} args {:x} {:x} {:x} {:x} -> abs cur {:x} end {:x}",
-+				now - c.timeMs, names[c.type], c.repeat > 1 ? fmt::format(" x{}", c.repeat) : std::string(), c.v[0], c.v[1], c.v[2], c.v[3], c.absCur, c.absEnd);
++			for (size_t i = 0; i < sampleCount; i++)
++				input[i] += (float)(sint32)p[i];
 +		}
-+	}
-+
- 	AXVPB* AXAcquireVoiceEx(uint32 priority, MPTR callbackEx, MPTR userParam)
- 	{
- 		cemu_assert(priority != AX_PRIORITY_FREE && priority < AX_PRIORITY_MAX);
-@@ -409,6 +501,12 @@ namespace snd_core
- 			if (!vpb)
- 			{
- 				// no voice available
-+				static sint32 s_acquireFailLogBudget = 40;
-+				if (s_acquireFailLogBudget > 0)
-+				{
-+					s_acquireFailLogBudget--;
-+					cemuLog_log(LogType::Force, "[AXDiag] AXAcquireVoice failed, no free voice (requested priority {})", priority);
-+				}
- 				__AXVoiceListSpinlock.unlock();
- 				return nullptr;
- 			}
-@@ -418,12 +516,15 @@ namespace snd_core
- 		vpb->callbackEx = callbackEx;
- 		AXVPB_SetVoiceDefault(vpb);
- 		__AXVoiceListSpinlock.unlock();
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_ACQUIRE, priority);
- 		return vpb;
++		float left[512], right[512];
++		reverb->Process(input, left, right, sampleCount);
++		constexpr float wet = 0.6f;
++		for (uint32 ch = 0; ch < channelCount; ch++)
++		{
++			sint32be* p = auxSamples->channelSamples[ch].GetPtr();
++			if (!p)
++				continue;
++			for (size_t i = 0; i < sampleCount; i++)
++			{
++				float v = 0.0f;
++				if (ch == 0)
++					v = left[i] * wet;
++				else if (ch == 1)
++					v = right[i] * wet;
++				p[i] = (sint32)std::clamp(v, -8388608.0f, 8388607.0f);
++			}
++		}
  	}
  
- 	void AXFreeVoice(AXVPB* vpb)
- 	{
- 		cemu_assert(vpb != nullptr);
-+		AXDiag_NoteVoiceStop((sint32)vpb->index, 2);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_FREE);
- 		__AXVoiceListSpinlock.lock();
- 		if (vpb->priority == (uint32be)AX_PRIORITY_FREE)
- 		{
-@@ -608,6 +709,7 @@ namespace snd_core
- 
- 	void AXSetVoiceState(AXVPB* vpb, sint32 voiceState)
- 	{
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETSTATE, (uint32)voiceState, (uint32)vpb->playbackState);
- 		if (vpb->playbackState != (uint32be)voiceState)
- 		{
- 			vpb->playbackState = voiceState;
-@@ -618,6 +720,7 @@ namespace snd_core
- 			if (voiceState == 0)
- 			{
- 				vpb->depop = (uint32be)1;
-+				AXDiag_NoteVoiceStop((sint32)vpb->index, 1);
- 			}
- 		}
- 	}
-@@ -645,6 +748,7 @@ namespace snd_core
- 		internal->adpcmData.scale = adpcm->scale;
- 		AXSetSyncFlag(vpb, AX_SYNCFLAG_ADPCMDATA);
- 		AXVoiceProtection_Acquire(vpb);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETADPCM, _swapEndianU16(adpcm->scale), _swapEndianU16(adpcm->gain));
- 	}
- 
- 	void AXSetVoiceAdpcmLoop(AXVPB* vpb, AXPBADPCMLOOP_t* adpcmLoop)
-@@ -658,6 +762,7 @@ namespace snd_core
- 		}
- 		AXSetSyncFlag(vpb, AX_SYNCFLAG_ADPCMLOOP);
- 		AXVoiceProtection_Acquire(vpb);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETADPCMLOOP, _swapEndianU16(adpcmLoop->loopScale));
- 	}
- 
- 	void AXSetVoiceSrc(AXVPB* vpb, AXPBSRC_t* src)
-@@ -947,12 +1052,14 @@ namespace snd_core
- 		{
- 			cemu_assert_debug(false);
- 		}
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETOFFSETS, (uint32)format | ((uint32)_swapEndianU16(pbOffset->loopFlag) << 16), _swapEndianU32(pbOffset->currentOffset), _swapEndianU32(pbOffset->endOffset), _swapEndianU32(pbOffset->samples));
- 	}
- 
- 	void AXSetVoiceOffsetsEx(AXVPB* vpb, AXPBOFFSET_t* pbOffset, void* sampleBase)
- 	{
- 		// used by F1 Racing
- 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETOFFSETSEX, memory_getVirtualOffsetFromPointer(sampleBase));
- 
- 		AXPBOFFSET_t tmpOffsets = *pbOffset;
- 		tmpOffsets.samples = _swapEndianU32(memory_getVirtualOffsetFromPointer(sampleBase));
-@@ -963,6 +1070,7 @@ namespace snd_core
- 	{
- 		vpb->offsets.samples = _swapEndianU32(memory_getVirtualOffsetFromPointer(sampleBase));
- 		AXGetVoiceOffsets(vpb, &vpb->offsets);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETSAMPLESADDR, memory_getVirtualOffsetFromPointer(sampleBase), _swapEndianU32(vpb->offsets.currentOffset), _swapEndianU32(vpb->offsets.endOffset));
- 	}
- 
- 	void AXGetVoiceOffsets(AXVPB* vpb, AXPBOFFSET_t* pbOffset)
-@@ -1016,6 +1124,7 @@ namespace snd_core
- 			cemu_assert_debug(false);
- 		}
- 		cemuLog_log(LogType::SoundAPI, "Retrieved voice offsets for voice {:08x} - base {:08x} current {:08x} loopFlag {:04x} loop {:08x} end {:08x}", memory_getVirtualOffsetFromPointer(vpb), _swapEndianU32(pbOffset->samples), _swapEndianU32(pbOffset->currentOffset), _swapEndianU16(pbOffset->loopFlag), _swapEndianU32(pbOffset->loopOffset), _swapEndianU32(pbOffset->endOffset));
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_GETOFFSETS, _swapEndianU32(pbOffset->samples), _swapEndianU32(pbOffset->currentOffset), _swapEndianU32(pbOffset->endOffset));
- 	}
- 
- 	void AXGetVoiceOffsetsEx(AXVPB* vpb, AXPBOFFSET_t* pbOffset, MPTR sampleBase)
-@@ -1059,6 +1168,7 @@ namespace snd_core
- 		internal->internalOffsets.currentOffsetPtrLow = _swapEndianU16(currentOffsetPtr & 0xFFFF);
- 		AXSetSyncFlag(vpb, AX_SYNCFLAG_CURRENTOFFSET);
- 		AXVoiceProtection_Acquire(vpb);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETCUR, currentOffset, sampleBase);
- 	}
- 
- 	void AXSetVoiceLoopOffset(AXVPB* vpb, uint32 loopOffset)
-@@ -1092,6 +1202,7 @@ namespace snd_core
- 		internal->internalOffsets.loopOffsetPtrLow = _swapEndianU16(loopOffsetPtr & 0xFFFF);
- 		AXSetSyncFlag(vpb, AX_SYNCFLAG_LOOPOFFSET);
- 		AXVoiceProtection_Acquire(vpb);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETLOOPOFS, loopOffset, sampleBase);
- 	}
- 
- 	void AXSetVoiceEndOffset(AXVPB* vpb, uint32 endOffset)
-@@ -1126,11 +1237,13 @@ namespace snd_core
- 		internal->internalOffsets.endOffsetPtrLow = _swapEndianU16(endOffsetPtr & 0xFFFF);
- 		AXSetSyncFlag(vpb, AX_SYNCFLAG_ENDOFFSET);
- 		AXVoiceProtection_Acquire(vpb);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETEND, endOffset, sampleBase);
- 	}
- 
- 	void AXSetVoiceCurrentOffsetEx(AXVPB* vpb, uint32 currentOffset, MPTR sampleBase)
- 	{
- 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETCUREX, currentOffset, sampleBase);
- 		AXPBOFFSET_t pbOffset;
- 		vpb->offsets.samples = _swapEndianU32(sampleBase);
- 		AXGetVoiceOffsets(vpb, &pbOffset);
-@@ -1140,6 +1253,7 @@ namespace snd_core
- 	void AXSetVoiceLoopOffsetEx(AXVPB* vpb, uint32 loopOffset, MPTR sampleBase)
- 	{
- 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETLOOPOFSEX, loopOffset, sampleBase);
- 		AXPBOFFSET_t pbOffset;
- 		vpb->offsets.samples = _swapEndianU32(sampleBase);
- 		AXGetVoiceOffsets(vpb, &pbOffset);
-@@ -1149,6 +1263,7 @@ namespace snd_core
- 	void AXSetVoiceEndOffsetEx(AXVPB* vpb, uint32 endOffset, MPTR sampleBase)
- 	{
- 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETENDEX, endOffset, sampleBase);
- 		AXPBOFFSET_t pbOffset;
- 		vpb->offsets.samples = _swapEndianU32(sampleBase);
- 		AXGetVoiceOffsets(vpb, &pbOffset);
-@@ -1160,6 +1275,7 @@ namespace snd_core
- 		cemu_assert(vpb != NULL && sampleBase != MPTR_NULL);
- 		AXPBOFFSET_t pbOffset;
- 		AXGetVoiceOffsetsEx(vpb, &pbOffset, sampleBase);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_GETCUREX, sampleBase, _swapEndianU32(pbOffset.currentOffset));
- 		return _swapEndianU32(pbOffset.currentOffset);
- 	}
- 
-@@ -1170,6 +1286,7 @@ namespace snd_core
- 		internal->internalOffsets.loopFlag = _swapEndianU16(loopState);
- 		AXSetSyncFlag(vpb, AX_SYNCFLAG_LOOPFLAG);
- 		AXVoiceProtection_Acquire(vpb);
-+		AXDiag_Record((sint32)vpb->index, AXDIAG_SETLOOPFLAG, loopState);
- 	}
- 
- 	uint32 vpbLoopTracker_loopCount[AX_MAX_VOICES];
-diff --git a/src/Cemu/Logging/CemuLogging.cpp b/src/Cemu/Logging/CemuLogging.cpp
-index f2d9ac05..28555c35 100644
---- a/src/Cemu/Logging/CemuLogging.cpp
-+++ b/src/Cemu/Logging/CemuLogging.cpp
-@@ -264,4 +264,6 @@ std::unique_lock<decltype(LogContext.log_mutex)> cemuLog_acquire()
- void cemuLog_setActiveLoggingFlags(uint64 flagMask)
- {
- 	s_loggingFlagMask = flagMask | cemuLog_getFlag(LogType::Force);
-+	// Light Fix diagnostic build: always record unsupported OS calls and the game's own debug messages
-+	s_loggingFlagMask |= cemuLog_getFlag(LogType::UnsupportedAPI) | cemuLog_getFlag(LogType::CoreinitLogging);
- }
+ 	/* AXFXReverbStd */
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
 index 3c1587e7..7430cfee 100644
 --- a/src/android/app/build.gradle.kts
@@ -1625,35 +1077,22 @@ index 1190bf43..e956b930 100644
 +	return result;
 +}
 diff --git a/src/android/app/src/main/cpp/NativeLogging.cpp b/src/android/app/src/main/cpp/NativeLogging.cpp
-index 19a75475..c5686474 100644
+index 19a75475..27b96a6f 100644
 --- a/src/android/app/src/main/cpp/NativeLogging.cpp
 +++ b/src/android/app/src/main/cpp/NativeLogging.cpp
-@@ -1,10 +1,23 @@
+@@ -1,6 +1,11 @@
  #include "Common/ExceptionHandler/ExceptionHandler.h"
  #include "JNIUtils.h"
  
 +namespace snd_core
 +{
-+	void AXDiag_Mark(const char* note); // ax_mix.cpp
 +	void AXOut_SetVolumeBoostDb(sint32 db); // ax_out.cpp
 +}
 +
  extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
  Java_info_cemu_cemu_nativeinterface_NativeLogging_log(JNIEnv* env, [[maybe_unused]] jclass clazz, jstring message)
  {
--	cemuLog_log(LogType::Force, JNIUtils::FromJString(env, message));
-+	std::string text = JNIUtils::FromJString(env, message);
-+	// "[Marker] ..." comes from the Mark button on the Toy Pad screen: also log what is playing and how loud
-+	if (text.rfind("[Marker]", 0) == 0)
-+	{
-+		snd_core::AXDiag_Mark(text.c_str() + 8);
-+		return;
-+	}
-+	cemuLog_log(LogType::Force, text);
- }
- 
- extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
-@@ -15,3 +28,9 @@ Java_info_cemu_cemu_nativeinterface_NativeLogging_crashLog(JNIEnv* env, [[maybe_
+@@ -15,3 +20,9 @@ Java_info_cemu_cemu_nativeinterface_NativeLogging_crashLog(JNIEnv* env, [[maybe_
  	CrashLog_WriteLine("Unhandled exception from java code");
  	CrashLog_WriteLine(JNIUtils::FromJString(env, stacktrace));
  }
@@ -2184,10 +1623,10 @@ index 00000000..1b23271a
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..30244c0e
+index 00000000..156fd51d
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,726 @@
+@@ -0,0 +1,688 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -2206,7 +1645,6 @@ index 00000000..30244c0e
 +import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.PaddingValues
 +import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
 +import androidx.compose.foundation.layout.fillMaxHeight
 +import androidx.compose.foundation.layout.fillMaxSize
 +import androidx.compose.foundation.layout.fillMaxWidth
@@ -2228,7 +1666,6 @@ index 00000000..30244c0e
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableIntStateOf
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
 +import androidx.compose.runtime.setValue
@@ -2247,7 +1684,6 @@ index 00000000..30244c0e
 +import androidx.compose.ui.unit.min
 +import androidx.compose.ui.unit.sp
 +import info.cemu.cemu.nativeinterface.NativeEmulatedUSBDevices
-+import info.cemu.cemu.nativeinterface.NativeLogging
 +import kotlinx.coroutines.delay
 +
 +// slot index -> pad number used by the emulated Toy Pad (1 = center, 2 = left, 3 = right)
@@ -2417,8 +1853,6 @@ index 00000000..30244c0e
 +                    fontWeight = FontWeight.SemiBold,
 +                    color = TextOnBackground,
 +                )
-+                Spacer(Modifier.weight(1f))
-+                MarkButton()
 +            }
 +
 +            // the pad
@@ -2521,39 +1955,6 @@ index 00000000..30244c0e
 +                }
 +            }
 +        }
-+    }
-+}
-+
-+@Composable
-+private fun MarkButton() {
-+    var marks by remember { mutableIntStateOf(0) }
-+    var justMarked by remember { mutableStateOf(false) }
-+    LaunchedEffect(marks) {
-+        if (marks > 0) {
-+            justMarked = true
-+            delay(2500)
-+            justMarked = false
-+        }
-+    }
-+    Box(
-+        modifier = Modifier
-+            .clip(RoundedCornerShape(50))
-+            .background(if (justMarked) Color(0xCC2E7D32) else Color(0x66FFFFFF))
-+            .clickable {
-+                marks++
-+                try {
-+                    NativeLogging.log("[Marker] Mark #$marks tapped on the Toy Pad screen")
-+                } catch (_: Throwable) {
-+                }
-+            }
-+            .padding(horizontal = 12.dp, vertical = 6.dp),
-+    ) {
-+        Text(
-+            text = if (justMarked) "Marked #$marks" else "Mark",
-+            color = Color.White,
-+            fontSize = 13.sp,
-+            fontWeight = FontWeight.Medium,
-+        )
 +    }
 +}
 +

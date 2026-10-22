@@ -30,8 +30,11 @@ copy the save back. Build 3 and later can all be installed as normal updates.
 
 ## Known issues
 
-- Some NPC voice lines (for example the mini-quest characters) don't play, and their text may not appear until
-  you tap. This also happens in regular Cemu, on Android and PC, and is still being looked into.
+- The intro logos take about a minute before you can skip. This build logs how much of that time is spent loading
+  (`[BootIO]` lines in the log) to see whether it can be made faster.
+
+Not a bug: side-quest characters in the Adventure Worlds (for example Hans Moleman in Springfield) only play a short
+greeting sound and then speak in text. That's how the original game works too.
 
 ## Important: game profile settings (fixes stuttering, crunchy audio)
 
@@ -82,10 +85,6 @@ while you use the touch screen.
 - **Background:** tap **Choose background picture** to use any picture on your device behind the Toy Pad, or keep the
   built-in star map.
 
-**Mark** button (top right): tap it at the moment something goes wrong, for example right when you talk to an NPC whose
-voice doesn't play. It writes a marker into the log and records sound levels for the next 20 seconds, which makes the
-log much easier to read.
-
 ## Moving your save from regular Cemu
 
 Copying leaves the originals in place, so you won't lose anything.
@@ -97,6 +96,11 @@ Copying leaves the originals in place, so you won't lose anything.
 4. **Emulated Toy Pad figures:** go back to the main **Cemu** folder, long-press **`emulatedUSBDevices`**,
    then **⋮** → **Copy to…** → **Cemu Light Fix** (top level) → **Copy**.
 5. If you installed the game's update or DLC through Cemu's **Title Manager**, install them again in Cemu Light Fix.
+6. **Shader cache (less stutter):** in the main **Cemu** folder open `shaderCache` → `transferable`, long-press
+   **`0005000010194200.bin`** (that's the US game; other regions use their own number), also select the file with the same number
+   ending in `_vkpipeline.bin` if there is one, then **⋮** → **Copy to…** → **Cemu Light Fix** → `shaderCache` →
+   `transferable` → **Copy**. Cemu Light Fix then starts with every shader your regular Cemu has already built,
+   instead of building them again while you play.
 
 ## Reporting a problem
 
@@ -123,12 +127,16 @@ Cemu's per-voice low-pass filter subtracted its feedback term instead of adding 
 high-pass filter at roughly a third of the intended volume, so many voices and effects sounded thin and quiet.
 LEGO Dimensions uses this filter on most of its sounds. It now works as a proper low-pass filter.
 
-### Diagnostic logging
+### Reverb (build 12 and later)
 
-These builds also write extra lines to `log.txt` to help track down the missing NPC dialogue and the long intro:
-opened files (`[FileOpen]`), missing files (`[FileMissing]`), how long sounds are set up and why they stop
-(`[AXVoice]`, `[AXHist]`), sound levels and file reads after you tap **Mark** (`[Marker]`, `[AXLevel]`, `[FileRead]`), unsupported system calls and
-the game's own debug messages.
+LEGO Dimensions sends many sounds to the Wii U's built-in reverb effect, which Cemu doesn't emulate. Cemu's
+placeholder was meant to silence that effect but only silenced the left channel, so the right side came back
+louder and dry. This build fixes the placeholder and replaces it with a simple room reverb, so the sound is
+balanced again and those sounds get some space around them.
+
+### Volume boost
+
+An optional gain on the game's TV sound (Settings → Audio), with a soft limiter so loud moments don't crackle.
 
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.
