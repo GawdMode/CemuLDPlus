@@ -89,6 +89,11 @@ LEGO Dimensions Toy Pad there while you play:
 - **Abilities:** hold any figure (in the list or on the pad) to see what it can do. For vehicles the card shows all three
   builds and their abilities side by side. Tap an ability to list everyone who has it, or use the **Abilities** button
   next to the search box to pick one (for example *Flying* or *Dig*). It works together with the franchise logos.
+  While an ability is picked, **Put one on the pad** places a figure that has it in a free spot (your favorites first).
+  In the ability list, a ✓ marks abilities a figure on the pad already has.
+- **Favorites and team:** on a figure's card, tap the star to make it a favorite, or **Add to team** (up to 7).
+  The **Favorites** and **Team** buttons next to the franchise logos show them. **Put team on pad** takes everything
+  off the pad and puts your team on it in one tap (side pads first, then the center).
 - When you rebuild a vehicle in the game, the pad shows the new build.
 - **Building a new vehicle:** when the game asks you to build a vehicle and *place the model on the central panel*,
   place that vehicle on the center spot. If the game doesn't take it, place **Blank tag** (first in the vehicle list)
@@ -153,6 +158,12 @@ LEGO Dimensions draws its shadow maps as four 960x960 pieces stacked inside one 
 Resolution pack scales the 960x960 pieces but has no rule for the 3840-tall texture, so the two ended up at different
 sizes and couldn't be copied into each other: lighting broke above 720p. For LEGO Dimensions only, Cemu LD+ now gives
 that texture the same scale as the pieces inside it, so the copies line up at any resolution.
+
+### Half resolution effects (build 19 and later)
+
+Some effects are drawn into 640x368 buffers and read back as 640x360 textures. The Resolution pack only scales the
+640x368 version, so at higher resolutions the two couldn't be synced. When a 640x360 texture shares memory with a
+scaled 640x368 buffer, Cemu LD+ now gives it the same scale.
 
 ### Vehicle tags (build 17 and later)
 

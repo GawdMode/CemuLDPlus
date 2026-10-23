@@ -1,5 +1,5 @@
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 4445fb26..6d7be9d1 100644
+index 4445fb26..5c09567c 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 @@ -7,6 +7,7 @@
@@ -45,7 +45,7 @@ index 4445fb26..6d7be9d1 100644
  		LatteTexture* baseTexture = texRel->baseTexture;
  		LatteTexture* subTexture = texRel->subTexture;
  		for (sint32 cMipIndex = 0; cMipIndex < texRel->mipCount; cMipIndex++)
-@@ -730,6 +747,371 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
+@@ -730,6 +747,405 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
  	}
  }
  
@@ -112,6 +112,40 @@ index 4445fb26..6d7be9d1 100644
 +			if (s_loggedShapes.size() < 16 && s_loggedShapes.insert(key).second)
 +				cemuLog_log(LogType::Force, "[Cemu LD+] Shadow atlas {}x{} (fmt {:04x}, depth {}) scaled to {}x{} to match the graphic pack", texture->width, texture->height, (uint32)texture->format, texture->isDepth ? 1 : 0, newWidth, newHeight);
 +		}
++	}
++}
++
++// LEGO Dimensions draws some half resolution effects into 640x368 buffers (360 rows padded to a multiple of 16) and
++// later reads the same memory back as a 640x360 texture. The Resolution pack scales only the 640x368 version, so the two
++// can't be synced above 720p. When a 640x360 texture is created at the address of a scaled 640x368 one, give it the same scale.
++// (Only in that case: scaled textures can't be filled from data in RAM, so scaling every 640x360 texture could blank out images.)
++static void _LatteTexture_ApplyHalfResEffectScale(LatteTexture* texture)
++{
++	if (texture->width != 640 || texture->height != 360 || texture->depth != 1 || texture->mipLevels != 1)
++		return;
++	if (!_LatteTexture_IsLegoDimensions())
++		return;
++	std::vector<LatteTexture*> sameAddress;
++	LatteTC_LookupTexturesByPhysAddr(texture->physAddress, sameAddress);
++	for (LatteTexture* other : sameAddress)
++	{
++		if (other == texture || other->width != 640 || other->height != 368 || !other->overwriteInfo.hasResolutionOverwrite)
++			continue;
++		const sint32 newWidth = other->overwriteInfo.width;
++		const sint32 newHeight = other->overwriteInfo.height * 360 / 368;
++		if (newWidth <= 0 || newHeight <= 0 || newWidth > 16384 || newHeight > 16384)
++			return;
++		texture->overwriteInfo.hasResolutionOverwrite = true;
++		texture->overwriteInfo.width = newWidth;
++		texture->overwriteInfo.height = newHeight;
++		texture->overwriteInfo.depth = texture->depth;
++		static sint32 s_logBudget = 8;
++		if (s_logBudget > 0)
++		{
++			s_logBudget--;
++			cemuLog_log(LogType::Force, "[Cemu LD+] Half resolution buffer {:08x} 640x360 (fmt {:04x}) scaled to {}x{} to match its 640x368 version", texture->physAddress, (uint32)texture->format, newWidth, newHeight);
++		}
++		return;
 +	}
 +}
 +
@@ -417,7 +451,7 @@ index 4445fb26..6d7be9d1 100644
  void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  {
  	for (sint32 mipIndex = 0; mipIndex < texture->mipLevels; mipIndex++)
-@@ -768,6 +1150,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
+@@ -768,6 +1184,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  						else
  						{
  							LatteTexture_TrackDataOverlap(texture, sliceMipInfo, occupancy);
@@ -425,12 +459,14 @@ index 4445fb26..6d7be9d1 100644
  						}
  					}
  				}
-@@ -1303,6 +1686,8 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+@@ -1303,6 +1720,10 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
  			}
  		}
  	}
 +	if (!this->overwriteInfo.hasResolutionOverwrite)
 +		_LatteTexture_ApplyShadowAtlasScale(this);
++	if (!this->overwriteInfo.hasResolutionOverwrite)
++		_LatteTexture_ApplyHalfResEffectScale(this);
  	// determine if this texture should ever be mirrored to CPU RAM
  	if (this->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
  	{
@@ -2639,12 +2675,55 @@ index 00000000..1b23271a
 +        }
 +    )
 +}
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
+new file mode 100644
+index 00000000..c82ebedf
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
+@@ -0,0 +1,37 @@
++package info.cemu.cemu.emulation.toypadscreen
++
++import android.content.Context
++
++/** Favorite figures and the saved team (figures put on the pad together with one tap), by figure number. */
++object ToyPadLists {
++    private const val PREFS = "toypad_screen"
++    private const val KEY_FAVORITES = "favorites"
++    private const val KEY_TEAM = "team"
++
++    /** The pad has 7 spots. */
++    const val TEAM_SIZE = 7
++
++    private fun read(context: Context, key: String): List<Int> =
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .getString(key, "")
++            .orEmpty()
++            .split(',')
++            .mapNotNull { it.trim().toIntOrNull() }
++            .filter { it > 0 }
++            .distinct()
++
++    private fun write(context: Context, key: String, numbers: List<Int>) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
++            .putString(key, numbers.joinToString(","))
++            .apply()
++    }
++
++    fun favorites(context: Context): Set<Int> = read(context, KEY_FAVORITES).toSet()
++
++    fun setFavorites(context: Context, numbers: Set<Int>) = write(context, KEY_FAVORITES, numbers.sorted())
++
++    /** In the order the figures were added, which is also the order they go on the pad. */
++    fun team(context: Context): List<Int> = read(context, KEY_TEAM).take(TEAM_SIZE)
++
++    fun setTeam(context: Context, numbers: List<Int>) = write(context, KEY_TEAM, numbers.distinct().take(TEAM_SIZE))
++}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..57dc38cc
+index 00000000..63b05bfd
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,1280 @@
+@@ -0,0 +1,1589 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -2688,6 +2767,7 @@ index 00000000..57dc38cc
 +import androidx.compose.foundation.shape.CircleShape
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material3.Button
++import androidx.compose.material3.Icon
 +import androidx.compose.material3.ButtonDefaults
 +import androidx.compose.material3.MaterialTheme
 +import androidx.compose.material3.OutlinedButton
@@ -2705,6 +2785,8 @@ index 00000000..57dc38cc
 +import androidx.compose.ui.graphics.Color
 +import androidx.compose.ui.graphics.Shape
 +import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.painterResource
 +import androidx.compose.ui.text.font.FontWeight
 +import androidx.compose.ui.text.style.TextAlign
 +import androidx.compose.ui.text.style.TextOverflow
@@ -2712,6 +2794,7 @@ index 00000000..57dc38cc
 +import androidx.compose.ui.unit.dp
 +import androidx.compose.ui.unit.min
 +import androidx.compose.ui.unit.sp
++import info.cemu.cemu.R
 +import info.cemu.cemu.nativeinterface.NativeEmulatedUSBDevices
 +import kotlinx.coroutines.delay
 +
@@ -2723,10 +2806,18 @@ index 00000000..57dc38cc
 +private val RIGHT_SLOTS = intArrayOf(2, 5, 6)
 +private const val CENTER_SLOT = 1
 +
++// order spots are filled when several figures are placed at once: both side pads first, the center pad last
++private val FILL_ORDER = intArrayOf(0, 4, 3, 2, 5, 6, CENTER_SLOT)
++
++// special views in the franchise strip (0 = everything, 1+ = a franchise)
++private const val FAVORITES_VIEW = -1
++private const val TEAM_VIEW = -2
++
 +private val TextOnBackground = Color(0xFFF2F5FF)
 +private val TextDim = Color(0xFFB8C3E6)
 +private val Bronze = Color(0xFFD9893A)
 +private val Amber = Color(0xFFFFC107)
++private val TeamColor = Color(0xFF7FB2FF)
 +private val OnPadColor = Color(0xFF43E0B0)
 +
 +private data class SlotInfo(val name: String, val number: Int)
@@ -2825,6 +2916,11 @@ index 00000000..57dc38cc
 +    var infoFigure by remember { mutableStateOf<FigureEntry?>(null) } // figure whose info card is open (long press)
 +    var abilityFilter by remember { mutableStateOf<String?>(null) }
 +    var pickingAbility by remember { mutableStateOf(false) }
++    val context = LocalContext.current
++    var favorites by remember { mutableStateOf(ToyPadLists.favorites(context)) }
++    var team by remember { mutableStateOf(ToyPadLists.team(context)) }
++    var lastQuickSlot by remember { mutableStateOf<Int?>(null) } // spot filled by the last "put one on the pad"
++    var lastQuickNumber by remember { mutableIntStateOf(-1) }
 +
 +    LaunchedEffect(Unit) {
 +        var tick = 0
@@ -2949,6 +3045,78 @@ index 00000000..57dc38cc
 +        pickingAbility = false
 +    }
 +
++    fun toggleFavorite(number: Int) {
++        favorites = if (number in favorites) favorites - number else favorites + number
++        ToyPadLists.setFavorites(context, favorites)
++    }
++
++    fun toggleTeam(number: Int) {
++        team = when {
++            number in team -> team - number
++            team.size < ToyPadLists.TEAM_SIZE -> team + number
++            else -> team
++        }
++        ToyPadLists.setTeam(context, team)
++    }
++
++    /** Takes everything off the pad and puts the saved team on it. */
++    fun placeTeam() {
++        if (moveSource != null) cancelMove()
++        val members = team.mapNotNull { ENTRY_BY_ID[it] }.take(ToyPadLists.TEAM_SIZE)
++        if (members.isEmpty()) return
++        slots.forEachIndexed { index, slot ->
++            if (slot != null) NativeEmulatedUSBDevices.clearDimensionsFigure(SLOT_PADS[index], index)
++        }
++        var failed = 0
++        members.forEachIndexed { n, entry ->
++            val slot = FILL_ORDER[n]
++            val path = pathFor(entry)
++            if (path == null || !NativeEmulatedUSBDevices.loadDimensionsFigure(path, SLOT_PADS[slot], slot)) failed++
++        }
++        lastQuickSlot = null
++        clearSelection()
++        refresh()
++        errorMessage = if (failed > 0) "Couldn't place $failed of your team" else null
++    }
++
++    /** Puts a figure with this ability on the pad: in a free spot, or in place of the last one put there this way. */
++    fun placeWithAbility(ability: String) {
++        if (moveSource != null) cancelMove()
++        val alreadyThere = slots.mapNotNull { it?.number }.firstOrNull { ability in abilitiesOf(it) }
++        if (alreadyThere != null) {
++            errorMessage = "${ENTRY_BY_ID[alreadyThere]?.name ?: "A figure"} on the pad already has $ability"
++            return
++        }
++        val candidates = CATALOG_ENTRIES.filter { ability in abilitiesOf(it.id) }
++        // characters first (vehicles only for abilities no character has); favorites, then the team, then figures used before
++        val pick = candidates.filter { !it.isVehicle }.ifEmpty { candidates }.minWithOrNull(
++            compareBy<FigureEntry>(
++                {
++                    when {
++                        it.id in favorites -> 0
++                        it.id in team -> 1
++                        installed.pathById.containsKey(it.id) -> 2
++                        else -> 3
++                    }
++                },
++                { it.name.lowercase() },
++            )
++        ) ?: return
++        val free = FILL_ORDER.firstOrNull { slots[it] == null }
++        val target = free ?: lastQuickSlot?.takeIf { slots[it]?.number == lastQuickNumber }
++        if (target == null) {
++            errorMessage = "The pad is full. Remove a figure to make room for one with $ability."
++            return
++        }
++        if (free == null) NativeEmulatedUSBDevices.clearDimensionsFigure(SLOT_PADS[target], target)
++        loadFigure(pick, target)
++        if (errorMessage == null) {
++            lastQuickSlot = target
++            lastQuickNumber = pick.id
++            errorMessage = "Put ${pick.name} on the pad ($ability)"
++        }
++    }
++
 +    fun onMove(index: Int) {
 +        NativeEmulatedUSBDevices.tempRemoveDimensionsFigure(index)
 +        moveSource = index
@@ -2960,9 +3128,15 @@ index 00000000..57dc38cc
 +    val allEntries = remember(installed) { CATALOG_ENTRIES + installed.others }
 +    val key = searchKey(query)
 +    val ability = abilityFilter
-+    val shown = remember(allEntries, franchise, key, ability) {
++    fun inView(e: FigureEntry): Boolean = when (franchise) {
++        0 -> true
++        FAVORITES_VIEW -> e.id in favorites
++        TEAM_VIEW -> e.id in team
++        else -> e.franchise == franchise
++    }
++    val shown = remember(allEntries, franchise, key, ability, favorites, team) {
 +        allEntries.filter { e ->
-+            (franchise == 0 || e.franchise == franchise) &&
++            inView(e) &&
 +                    (ability == null || ability in abilitiesOf(e.id)) &&
 +                    (key.isEmpty() || searchKey(e.name).contains(key) ||
 +                            searchKey(FRANCHISES.getOrNull(e.franchise - 1)?.name ?: "").contains(key) ||
@@ -2970,18 +3144,20 @@ index 00000000..57dc38cc
 +        }
 +    }
 +    // abilities to pick from, with how many figures (in the chosen franchise) have each
-+    val abilityCounts = remember(allEntries, franchise) {
-+        val inFranchise = allEntries.filter { franchise == 0 || it.franchise == franchise }
++    val abilityCounts = remember(allEntries, franchise, favorites, team) {
++        val inFranchise = allEntries.filter { inView(it) }
 +        ALL_ABILITIES.map { a -> a to inFranchise.count { a in abilitiesOf(it.id) } }.filter { it.second > 0 }
 +    }
 +    val characters = remember(shown) { shown.filter { !it.isVehicle }.sortedBy { it.name.lowercase() } }
++    val teamShown = remember(shown, team) { team.mapNotNull { number -> shown.firstOrNull { it.id == number } } }
++    val padAbilities = remember(onPadNumbers) { onPadNumbers.flatMap { abilitiesOf(it) }.toSet() }
 +    val vehicles = remember(shown, franchise, key, ability) {
 +        val list = shown.filter { it.isVehicle }
 +        // inside a franchise keep each vehicle's three builds together; otherwise A to Z
-+        val sorted = if (franchise != 0) list.sortedWith(compareBy({ it.family.lowercase() }, { it.build }, { it.name.lowercase() }))
++        val sorted = if (franchise > 0) list.sortedWith(compareBy({ it.family.lowercase() }, { it.build }, { it.name.lowercase() }))
 +        else list.sortedBy { it.name.lowercase() }
 +        // the blank tag comes first in every list, for when the game asks for a newly built vehicle
-+        val showBlank = ability == null && (key.isEmpty() || searchKey(BLANK_TAG.name).contains(key))
++        val showBlank = ability == null && franchise >= 0 && (key.isEmpty() || searchKey(BLANK_TAG.name).contains(key))
 +        if (showBlank) listOf(BLANK_TAG) + sorted else sorted
 +    }
 +
@@ -3098,13 +3274,19 @@ index 00000000..57dc38cc
 +                    onDone = { typing = false },
 +                )
 +            } else {
-+                FranchiseStrip(selected = franchise, onSelect = { franchise = it })
++                FranchiseStrip(
++                    selected = franchise,
++                    favoriteCount = favorites.size,
++                    teamCount = team.size,
++                    onSelect = { franchise = it },
++                )
 +            }
 +
 +            // figure collection (or the list of abilities to pick from)
 +            if (pickingAbility) AbilityPicker(
 +                abilities = abilityCounts,
 +                selected = abilityFilter,
++                onPad = padAbilities,
 +                onPick = { picked ->
 +                    abilityFilter = if (abilityFilter == picked) null else picked
 +                    pickingAbility = false
@@ -3125,33 +3307,67 @@ index 00000000..57dc38cc
 +                horizontalArrangement = Arrangement.spacedBy(4.dp),
 +                verticalArrangement = Arrangement.spacedBy(6.dp),
 +            ) {
-+                if (characters.isEmpty() && vehicles.isEmpty()) {
++                if (ability != null && franchise != TEAM_VIEW) {
++                    item(span = { GridItemSpan(maxLineSpan) }) {
++                        AbilityQuickPlace(
++                            ability = ability,
++                            onPadName = slots.firstOrNull { slot -> slot != null && ability in abilitiesOf(slot.number) }?.name,
++                            onPlace = { placeWithAbility(ability) },
++                        )
++                    }
++                }
++                if (franchise == TEAM_VIEW) {
++                    item(span = { GridItemSpan(maxLineSpan) }) {
++                        TeamHeader(count = team.size, onPlace = ::placeTeam)
++                    }
++                    if (team.isEmpty()) {
++                        item(span = { GridItemSpan(maxLineSpan) }) {
++                            SectionLabel("Hold a figure and tap Team to add it (up to ${ToyPadLists.TEAM_SIZE}).")
++                        }
++                    }
++                    items(teamShown, key = { "t${it.id}" }) { entry ->
++                        FigureTile(
++                            entry = entry,
++                            isSelected = selectedFigure == entry,
++                            isOnPad = entry.id in onPadNumbers,
++                            isFavorite = entry.id in favorites,
++                            inTeam = true,
++                            onTap = { onFigureTapped(entry) },
++                            onLongPress = { infoFigure = entry },
++                        )
++                    }
++                } else if (characters.isEmpty() && vehicles.isEmpty()) {
 +                    val emptyText = when {
 +                        key.isNotEmpty() -> "Nothing matches \"$query\""
 +                        ability != null -> "No figures here with $ability"
++                        franchise == FAVORITES_VIEW -> "Hold a figure and tap the star to make it a favorite."
 +                        else -> "Nothing here"
 +                    }
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel(emptyText) }
 +                }
-+                if (characters.isNotEmpty()) {
++                if (franchise != TEAM_VIEW && characters.isNotEmpty()) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Characters (${characters.size})") }
 +                    items(characters, key = { "c${it.id}${it.otherPath ?: ""}" }) { entry ->
 +                        FigureTile(
 +                            entry = entry,
 +                            isSelected = selectedFigure == entry,
 +                            isOnPad = entry.id in onPadNumbers,
++                            isFavorite = entry.id in favorites,
++                            inTeam = entry.id in team,
 +                            onTap = { onFigureTapped(entry) },
 +                            onLongPress = { infoFigure = entry },
 +                        )
 +                    }
 +                }
-+                if (vehicles.isNotEmpty()) {
++                if (franchise != TEAM_VIEW && vehicles.isNotEmpty()) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Vehicles and gadgets (${vehicles.count { it.id != BLANK_TAG.id }})") }
 +                    items(vehicles, key = { "v${it.id}${it.otherPath ?: ""}" }) { entry ->
 +                        FigureTile(
 +                            entry = entry,
 +                            isSelected = selectedFigure == entry,
 +                            isOnPad = entry.id in onPadNumbers,
++                            isFavorite = entry.id in favorites,
++                            inTeam = entry.id in team,
 +                            onTap = { onFigureTapped(entry) },
 +                            onLongPress = { infoFigure = entry },
 +                        )
@@ -3172,6 +3388,11 @@ index 00000000..57dc38cc
 +                FigureInfoCard(
 +                    entry = entry,
 +                    isOnPad = entry.id in onPadNumbers,
++                    isFavorite = entry.id in favorites,
++                    inTeam = entry.id in team,
++                    teamFull = team.size >= ToyPadLists.TEAM_SIZE,
++                    onToggleFavorite = { toggleFavorite(entry.id) },
++                    onToggleTeam = { toggleTeam(entry.id) },
 +                    onAbility = ::showAbility,
 +                    onShowFigure = { infoFigure = it },
 +                    onPlace = { placeFromInfo(entry) },
@@ -3267,7 +3488,7 @@ index 00000000..57dc38cc
 +
 +/** "All" plus one logo per franchise; tap one to show only its characters and vehicles. */
 +@Composable
-+private fun FranchiseStrip(selected: Int, onSelect: (Int) -> Unit) {
++private fun FranchiseStrip(selected: Int, favoriteCount: Int, teamCount: Int, onSelect: (Int) -> Unit) {
 +    LazyRow(
 +        modifier = Modifier
 +            .fillMaxWidth()
@@ -3276,6 +3497,24 @@ index 00000000..57dc38cc
 +    ) {
 +        item(key = 0) {
 +            FranchiseChip(index = 0, name = "All", isSelected = selected == 0, onTap = { onSelect(0) })
++        }
++        item(key = FAVORITES_VIEW) {
++            IconChip(
++                icon = R.drawable.ic_toypad_star,
++                iconTint = Amber,
++                label = if (favoriteCount > 0) "Favorites ($favoriteCount)" else "Favorites",
++                isSelected = selected == FAVORITES_VIEW,
++                onTap = { onSelect(if (selected == FAVORITES_VIEW) 0 else FAVORITES_VIEW) },
++            )
++        }
++        item(key = TEAM_VIEW) {
++            IconChip(
++                icon = R.drawable.ic_toypad_team,
++                iconTint = TeamColor,
++                label = if (teamCount > 0) "Team ($teamCount)" else "Team",
++                isSelected = selected == TEAM_VIEW,
++                onTap = { onSelect(if (selected == TEAM_VIEW) 0 else TEAM_VIEW) },
++            )
 +        }
 +        lazyRowItems(FRANCHISES, key = { it.index }) { f ->
 +            FranchiseChip(index = f.index, name = f.name, isSelected = selected == f.index, onTap = { onSelect(if (selected == f.index) 0 else f.index) })
@@ -3631,6 +3870,8 @@ index 00000000..57dc38cc
 +    entry: FigureEntry,
 +    isSelected: Boolean,
 +    isOnPad: Boolean,
++    isFavorite: Boolean,
++    inTeam: Boolean,
 +    onTap: () -> Unit,
 +    onLongPress: () -> Unit,
 +) {
@@ -3652,6 +3893,8 @@ index 00000000..57dc38cc
 +                ringWidth = if (isSelected) 3.dp else 2.dp,
 +                modifier = Modifier.fillMaxSize(),
 +            )
++            if (isFavorite) TileBadge(R.drawable.ic_toypad_star, Amber, Modifier.align(Alignment.TopStart))
++            if (inTeam) TileBadge(R.drawable.ic_toypad_team, TeamColor, Modifier.align(Alignment.TopEnd))
 +            if (isOnPad) {
 +                Box(
 +                    modifier = Modifier
@@ -3722,6 +3965,7 @@ index 00000000..57dc38cc
 +private fun AbilityPicker(
 +    abilities: List<Pair<String, Int>>,
 +    selected: String?,
++    onPad: Set<String>,
 +    onPick: (String) -> Unit,
 +    modifier: Modifier = Modifier,
 +) {
@@ -3732,7 +3976,9 @@ index 00000000..57dc38cc
 +        horizontalArrangement = Arrangement.spacedBy(6.dp),
 +        verticalArrangement = Arrangement.spacedBy(6.dp),
 +    ) {
-+        item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Pick an ability (${abilities.size})") }
++        item(span = { GridItemSpan(maxLineSpan) }) {
++            SectionLabel("Pick an ability (${abilities.size}). ✓ = a figure on the pad has it")
++        }
 +        items(abilities, key = { it.first }) { (name, count) ->
 +            Row(
 +                modifier = Modifier
@@ -3754,6 +4000,7 @@ index 00000000..57dc38cc
 +                    overflow = TextOverflow.Ellipsis,
 +                    modifier = Modifier.weight(1f),
 +                )
++                if (name in onPad) Text(text = "✓", color = OnPadColor, fontSize = 14.sp, fontWeight = FontWeight.Bold)
 +                Text(text = "$count", color = TextDim, fontSize = 12.sp)
 +            }
 +        }
@@ -3801,6 +4048,11 @@ index 00000000..57dc38cc
 +private fun FigureInfoCard(
 +    entry: FigureEntry,
 +    isOnPad: Boolean,
++    isFavorite: Boolean,
++    inTeam: Boolean,
++    teamFull: Boolean,
++    onToggleFavorite: () -> Unit,
++    onToggleTeam: () -> Unit,
 +    onAbility: (String) -> Unit,
 +    onShowFigure: (FigureEntry) -> Unit,
 +    onPlace: () -> Unit,
@@ -3856,6 +4108,31 @@ index 00000000..57dc38cc
 +                    .clickable(onClick = onClose)
 +                    .padding(horizontal = 10.dp, vertical = 4.dp),
 +            )
++        }
++
++        if (ENTRY_BY_ID.containsKey(entry.id)) {
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                CardToggle(
++                    icon = if (isFavorite) R.drawable.ic_toypad_star else R.drawable.ic_toypad_star_outline,
++                    iconTint = Amber,
++                    label = if (isFavorite) "Favorite" else "Add to favorites",
++                    active = isFavorite,
++                    enabled = true,
++                    onTap = onToggleFavorite,
++                )
++                CardToggle(
++                    icon = R.drawable.ic_toypad_team,
++                    iconTint = TeamColor,
++                    label = when {
++                        inTeam -> "On your team"
++                        teamFull -> "Team is full"
++                        else -> "Add to team"
++                    },
++                    active = inTeam,
++                    enabled = inTeam || !teamFull,
++                    onTap = onToggleTeam,
++                )
++            }
 +        }
 +
 +        if (entry.id == BLANK_TAG.id) {
@@ -3923,6 +4200,117 @@ index 00000000..57dc38cc
 +            if (!isOnPad) Button(onClick = onPlace) { Text("Place on pad") }
 +            OutlinedButton(onClick = onClose, colors = ButtonDefaults.outlinedButtonColors(contentColor = TextOnBackground)) { Text("Close") }
 +        }
++    }
++}
++
++/** "Favorites" and "Team" in the franchise strip. */
++@Composable
++private fun IconChip(icon: Int, iconTint: Color, label: String, isSelected: Boolean, onTap: () -> Unit) {
++    val shape = RoundedCornerShape(12.dp)
++    Column(
++        modifier = Modifier
++            .width(84.dp)
++            .fillMaxHeight()
++            .clip(shape)
++            .background(if (isSelected) Color(0x993D6BDB) else Color(0x99060B1E))
++            .border(if (isSelected) 2.dp else 1.dp, if (isSelected) Color.White else Color(0x44FFFFFF), shape)
++            .clickable(onClick = onTap)
++            .padding(horizontal = 4.dp, vertical = 4.dp),
++        horizontalAlignment = Alignment.CenterHorizontally,
++        verticalArrangement = Arrangement.Center,
++    ) {
++        Icon(painter = painterResource(icon), contentDescription = null, tint = iconTint, modifier = Modifier.size(20.dp))
++        Text(
++            text = label,
++            color = TextOnBackground,
++            fontSize = 11.sp,
++            fontWeight = FontWeight.SemiBold,
++            maxLines = 1,
++            overflow = TextOverflow.Ellipsis,
++        )
++    }
++}
++
++/** Small marker in the corner of a figure in the list (favorite star, team). */
++@Composable
++private fun TileBadge(icon: Int, tint: Color, modifier: Modifier = Modifier) {
++    Box(
++        modifier = modifier
++            .size(20.dp)
++            .clip(CircleShape)
++            .background(Color(0xE60B1430)),
++        contentAlignment = Alignment.Center,
++    ) {
++        Icon(painter = painterResource(icon), contentDescription = null, tint = tint, modifier = Modifier.size(14.dp))
++    }
++}
++
++@Composable
++private fun TeamHeader(count: Int, onPlace: () -> Unit) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .padding(horizontal = 4.dp, vertical = 2.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(8.dp),
++    ) {
++        Text(
++            text = "Your team ($count of ${ToyPadLists.TEAM_SIZE})",
++            color = TextDim,
++            fontSize = 13.sp,
++            fontWeight = FontWeight.SemiBold,
++            modifier = Modifier.weight(1f),
++        )
++        Button(onClick = onPlace, enabled = count > 0) { Text("Put team on pad") }
++    }
++}
++
++/** Shown while an ability is picked: puts a figure with it on the pad in one tap. */
++@Composable
++private fun AbilityQuickPlace(ability: String, onPadName: String?, onPlace: () -> Unit) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .clip(RoundedCornerShape(12.dp))
++            .background(Color(0x33FFFFFF))
++            .padding(horizontal = 10.dp, vertical = 6.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(8.dp),
++    ) {
++        Text(
++            text = if (onPadName != null) "✓ $onPadName on the pad has $ability" else "Need $ability?",
++            color = if (onPadName != null) OnPadColor else TextOnBackground,
++            fontSize = 13.sp,
++            maxLines = 2,
++            overflow = TextOverflow.Ellipsis,
++            modifier = Modifier.weight(1f),
++        )
++        if (onPadName == null) Button(onClick = onPlace) { Text("Put one on the pad") }
++    }
++}
++
++/** Favorite / team switch on a figure's info card. */
++@Composable
++private fun CardToggle(icon: Int, iconTint: Color, label: String, active: Boolean, enabled: Boolean, onTap: () -> Unit) {
++    val shape = RoundedCornerShape(18.dp)
++    Row(
++        modifier = Modifier
++            .height(36.dp)
++            .clip(shape)
++            .background(if (active) Color(0x553D6BDB) else Color(0x1FFFFFFF))
++            .border(1.dp, if (active) iconTint else Color(0x44FFFFFF), shape)
++            .clickable(enabled = enabled, onClick = onTap)
++            .padding(horizontal = 12.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(6.dp),
++    ) {
++        Icon(
++            painter = painterResource(icon),
++            contentDescription = null,
++            tint = if (enabled) iconTint else iconTint.copy(alpha = 0.4f),
++            modifier = Modifier.size(18.dp),
++        )
++        Text(text = label, color = if (enabled) TextOnBackground else TextDim, fontSize = 13.sp, maxLines = 1)
 +    }
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
@@ -4271,6 +4659,51 @@ index 5325cb1e..2e1fa933 100644
 +        }
      }
  }
+diff --git a/src/android/app/src/main/res/drawable/ic_toypad_star.xml b/src/android/app/src/main/res/drawable/ic_toypad_star.xml
+new file mode 100644
+index 00000000..8bb66809
+--- /dev/null
++++ b/src/android/app/src/main/res/drawable/ic_toypad_star.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="@android:color/white"
++        android:pathData="M12,17.27L18.18,21l-1.64,-7.03L22,9.24l-7.19,-0.61L12,2 9.19,8.63 2,9.24l5.46,4.73L5.82,21z" />
++</vector>
+diff --git a/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml b/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml
+new file mode 100644
+index 00000000..7aed0363
+--- /dev/null
++++ b/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="@android:color/white"
++        android:pathData="M22,9.24l-7.19,-0.62L12,2 9.19,8.63 2,9.24l5.46,4.73L5.82,21 12,17.27 18.18,21l-1.63,-7.03L22,9.24zM12,15.4l-3.76,2.27 1,-4.28 -3.32,-2.88 4.38,-0.38L12,6.1l1.71,4.04 4.38,0.38 -3.32,2.88 1,4.28L12,15.4z" />
++</vector>
+diff --git a/src/android/app/src/main/res/drawable/ic_toypad_team.xml b/src/android/app/src/main/res/drawable/ic_toypad_team.xml
+new file mode 100644
+index 00000000..133e382f
+--- /dev/null
++++ b/src/android/app/src/main/res/drawable/ic_toypad_team.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="@android:color/white"
++        android:pathData="M16,11c1.66,0 2.99,-1.34 2.99,-3S17.66,5 16,5c-1.66,0 -3,1.34 -3,3s1.34,3 3,3zM8,11c1.66,0 2.99,-1.34 2.99,-3S9.66,5 8,5C6.34,5 5,6.34 5,8s1.34,3 3,3zM8,13c-2.33,0 -7,1.17 -7,3.5L1,19h14v-2.5c0,-2.33 -4.67,-3.5 -7,-3.5zM16,13c-0.29,0 -0.62,0.02 -0.97,0.05 1.16,0.84 1.97,1.97 1.97,3.45L17,19h6v-2.5c0,-2.33 -4.67,-3.5 -7,-3.5z" />
++</vector>
 diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
 index 053d3be8..71202a35 100644
 --- a/src/android/app/src/main/res/values/strings.xml
