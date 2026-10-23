@@ -3,7 +3,7 @@
 An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco/Cemu) made for **LEGO Dimensions**:
 
 - **Lighting fix:** on the regular build, lighting is stuck in a square around your character and everything else
-  goes dark. Here the whole level is lit, at 720p and (new in build 16) higher resolutions.
+  goes dark. Here the whole level is lit, at 720p and higher resolutions.
 - **Toy Pad on the second screen** (for example the AYN Thor's bottom screen) with every character and vehicle
   ready to place, pictures, Toy Tags, franchise logos and search.
 - **Better sound:** fixed sound filter, balanced left/right with a simple reverb, and an optional volume boost.
@@ -64,7 +64,7 @@ LEGO Dimensions mixes its sound very quietly, so even at full volume it can be h
 
 ## Higher resolutions (1080p and up)
 
-Build 16 adds support for higher resolutions with the community **Resolution** graphic pack (new, so reports are welcome):
+From build 16 the lighting fix also works with the community **Resolution** graphic pack (tested at 1920x1080 on an AYN Thor):
 
 1. Open **Graphic packs**. If LEGO Dimensions isn't listed, download the community graphic packs there first.
 2. Open *LEGO Dimensions → Graphics → Resolution*, turn it on and pick a resolution, for example **1920x1080**.
@@ -86,6 +86,9 @@ LEGO Dimensions Toy Pad there while you play:
   are shown in white so they stand out on the dark background.
 - **Search:** tap the search box and type on the small keyboard that appears on the Toy Pad screen.
 - When you rebuild a vehicle in the game, the pad shows the new build.
+- **Building a new vehicle:** when the game asks you to build a vehicle and *place the model on the central panel*,
+  place that vehicle on the center spot. If the game doesn't take it, place **Blank tag** (first in the vehicle list)
+  instead: the game writes the vehicle onto it, just like a real pack's tag.
 - Tap an empty spot, then a figure from your collection, to place it. Or tap a figure first, then a spot.
 - Tap a figure on the pad for **Move** (then tap where it should go) or **Remove**.
 
@@ -146,6 +149,13 @@ LEGO Dimensions draws its shadow maps as four 960x960 pieces stacked inside one 
 Resolution pack scales the 960x960 pieces but has no rule for the 3840-tall texture, so the two ended up at different
 sizes and couldn't be copied into each other: lighting broke above 720p. For LEGO Dimensions only, Cemu LD+ now gives
 that texture the same scale as the pieces inside it, so the copies line up at any resolution.
+
+### Vehicle tags (build 17 and later)
+
+Vehicle and gadget tags keep their vehicle number unencrypted, with a marker that tells the game the tag is a
+vehicle. Tags made by the Toy Pad screen in builds 13 to 16 were written like character tags instead, so the game
+didn't recognize them as vehicles. New ones are written correctly, and older ones are fixed automatically the first
+time they're placed.
 
 ### Sound filter fix (build 7 and later)
 
