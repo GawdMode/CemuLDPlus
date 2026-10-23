@@ -2033,10 +2033,10 @@ index 00000000..1b23271a
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..0382fe18
+index 00000000..64a8348e
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,923 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -2337,21 +2337,35 @@ index 00000000..0382fe18
 +                .padding(horizontal = 12.dp, vertical = 10.dp),
 +            verticalArrangement = Arrangement.spacedBy(8.dp)
 +        ) {
-+            if (!typing) {
-+                Row(verticalAlignment = Alignment.CenterVertically) {
++            // title, with the search box in the space to its right
++            Row(
++                verticalAlignment = Alignment.CenterVertically,
++                horizontalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                if (!typing) {
 +                    Text(
 +                        text = "LEGO Dimensions Toy Pad",
 +                        style = MaterialTheme.typography.titleMedium,
 +                        fontWeight = FontWeight.SemiBold,
 +                        color = TextOnBackground,
++                        maxLines = 1,
 +                    )
 +                }
++                SearchBox(
++                    query = query,
++                    typing = typing,
++                    onTap = { typing = true },
++                    onClear = { query = "" },
++                    modifier = Modifier.weight(1f),
++                )
++            }
 +
++            if (!typing) {
 +                // the pad
 +                Row(
 +                    modifier = Modifier
 +                        .fillMaxWidth()
-+                        .weight(1.35f),
++                        .weight(1f),
 +                    horizontalArrangement = Arrangement.spacedBy(8.dp),
 +                ) {
 +                    SidePad(
@@ -2390,8 +2404,8 @@ index 00000000..0382fe18
 +                    )
 +                }
 +
-+                // what to do next
-+                ActionBar(
++                // what to do next (only shown while something is selected or being moved)
++                if (errorMessage != null || moveSource != null || selectedFigure != null || selectedSlot != null) ActionBar(
 +                    slots = slots,
 +                    selectedSlot = selectedSlot,
 +                    selectedFigure = selectedFigure,
@@ -2404,13 +2418,6 @@ index 00000000..0382fe18
 +                    },
 +                )
 +            }
-+
-+            SearchBox(
-+                query = query,
-+                typing = typing,
-+                onTap = { typing = true },
-+                onClear = { query = "" },
-+            )
 +
 +            if (typing) {
 +                OnScreenKeyboard(
@@ -2427,7 +2434,7 @@ index 00000000..0382fe18
 +                columns = GridCells.Adaptive(minSize = 84.dp),
 +                modifier = Modifier
 +                    .fillMaxWidth()
-+                    .weight(1f)
++                    .weight(1.15f)
 +                    .clip(RoundedCornerShape(16.dp))
 +                    .background(Color(0x66040818)),
 +                contentPadding = PaddingValues(8.dp),
@@ -2465,10 +2472,9 @@ index 00000000..0382fe18
 +}
 +
 +@Composable
-+private fun SearchBox(query: String, typing: Boolean, onTap: () -> Unit, onClear: () -> Unit) {
++private fun SearchBox(query: String, typing: Boolean, onTap: () -> Unit, onClear: () -> Unit, modifier: Modifier = Modifier) {
 +    Row(
-+        modifier = Modifier
-+            .fillMaxWidth()
++        modifier = modifier
 +            .height(40.dp)
 +            .clip(RoundedCornerShape(20.dp))
 +            .background(Color(0x99060B1E))
@@ -2481,7 +2487,7 @@ index 00000000..0382fe18
 +            text = when {
 +                query.isNotEmpty() -> query + if (typing) "|" else ""
 +                typing -> "|"
-+                else -> "Search characters and vehicles"
++                else -> "Search figures"
 +            },
 +            color = if (query.isEmpty() && !typing) TextDim else TextOnBackground,
 +            fontSize = 15.sp,
