@@ -3,7 +3,7 @@
 An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco/Cemu) made for **LEGO Dimensions**:
 
 - **Lighting fix:** on the regular build, lighting is stuck in a square around your character and everything else
-  goes dark. Here the whole level is lit.
+  goes dark. Here the whole level is lit, at 720p and (new in build 16) higher resolutions.
 - **Toy Pad on the second screen** (for example the AYN Thor's bottom screen) with every character and vehicle
   ready to place, pictures, Toy Tags, franchise logos and search.
 - **Better sound:** fixed sound filter, balanced left/right with a simple reverb, and an optional volume boost.
@@ -62,11 +62,16 @@ LEGO Dimensions mixes its sound very quietly, so even at full volume it can be h
 **Settings → Audio**, first make sure **TV volume** is at 100%, then raise **TV volume boost (Cemu LD+)**
 (+3 to +18 dB). A soft limiter keeps loud moments from crackling. Start with +12 dB.
 
-## Important: play at 720p
+## Higher resolutions (1080p and up)
 
-The fix works at the game's native **1280x720** resolution. In **Graphic packs**, set
-*LEGO Dimensions → Resolution* to **1280x720 (Default)**, or leave it off. Higher resolutions may still
-have broken or missing lighting. Support for those may come in a later build.
+Build 16 adds support for higher resolutions with the community **Resolution** graphic pack (new, so reports are welcome):
+
+1. Open **Graphic packs**. If LEGO Dimensions isn't listed, download the community graphic packs there first.
+2. Open *LEGO Dimensions → Graphics → Resolution*, turn it on and pick a resolution, for example **1920x1080**.
+
+Shadows are drawn at the higher resolution too, so they get sharper. Higher resolutions need more GPU power: if the
+game slows down, try **1600x900**, or go back to **1280x720 (Default)**. If lighting looks wrong at a higher
+resolution, please open an [Issue](../../issues) with your log.
 
 ## Toy Pad on the second screen (dual-screen devices)
 
@@ -77,7 +82,8 @@ LEGO Dimensions Toy Pad there while you play:
 - **Every character and vehicle, ready to place.** No need to create figures first: tap any of them and it's made
   the first time you use it. Figures on the pad get a green check.
 - **Franchise logos:** tap a logo to show just that franchise's characters and vehicles (each vehicle's three builds
-  together), or **All** for everything A to Z.
+  together), or **All** for everything A to Z. Logos with black lettering (Harry Potter, Midway, LEGO City Undercover)
+  are shown in white so they stand out on the dark background.
 - **Search:** tap the search box and type on the small keyboard that appears on the Toy Pad screen.
 - When you rebuild a vehicle in the game, the pad shows the new build.
 - Tap an empty spot, then a figure from your collection, to place it. Or tap a figure first, then a spot.
@@ -133,6 +139,13 @@ of the larger texture was ever filled in. That's why lighting only worked in a s
 [`lightfix.patch`](lightfix.patch) adds tracking and copying for these "offset" textures. A pair is only
 linked after checking with Cemu's address math that both memory layouts really line up. It also adds
 depth↔color copies with offsets on Vulkan. It only links two textures after checking that their memory layouts really line up, and caches those checks.
+
+### Higher resolutions (build 16 and later)
+
+LEGO Dimensions draws its shadow maps as four 960x960 pieces stacked inside one 960x3840 texture. The community
+Resolution pack scales the 960x960 pieces but has no rule for the 3840-tall texture, so the two ended up at different
+sizes and couldn't be copied into each other: lighting broke above 720p. For LEGO Dimensions only, Cemu LD+ now gives
+that texture the same scale as the pieces inside it, so the copies line up at any resolution.
 
 ### Sound filter fix (build 7 and later)
 

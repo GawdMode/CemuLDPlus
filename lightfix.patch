@@ -1,8 +1,32 @@
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 4445fb26..5b128b10 100644
+index 4445fb26..6d7be9d1 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-@@ -500,11 +500,18 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
+@@ -7,6 +7,7 @@
+ #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
+ 
+ #include "Cafe/GraphicPack/GraphicPack2.h"
++#include "Cafe/CafeSystem.h"
+ 
+ #include <boost/container/small_vector.hpp>
+ 
+@@ -385,6 +386,15 @@ void LatteTexture_CopySlice(LatteTexture* srcTexture, sint32 srcSlice, sint32 sr
+ 			cemuLog_log(LogType::Force, "Destination: {:08x} origResolution {:4}/{:4} effectiveResolution {:4}/{:4} fmt {:04x} mipIndex {} ratioW/H: {:.4}/{:.4}", dstTexture->physAddress, dstTexture->width, dstTexture->height, effectiveWidth_dst, effectiveHeight_dst, (uint32)dstTexture->format, dstMip, ratioWidth_dst, ratioHeight_dst);
+ 		}
+ 		//cemuLog_logDebug(LogType::Force, "If these textures are not meant to share data you can ignore this");
++		// Cemu LD+: log a few of these (each shape pair once) so scaling problems show up in normal logs
++		static sint32 s_scaleMismatchLogBudget = 12;
++		static std::unordered_set<uint64> s_loggedScaleMismatches;
++		const uint64 pairKey = ((uint64)srcTexture->width << 48) ^ ((uint64)srcTexture->height << 32) ^ ((uint64)dstTexture->width << 16) ^ (uint64)dstTexture->height ^ ((uint64)srcTexture->format << 56) ^ ((uint64)dstTexture->format << 40);
++		if (s_scaleMismatchLogBudget > 0 && s_loggedScaleMismatches.insert(pairKey).second)
++		{
++			s_scaleMismatchLogBudget--;
++			cemuLog_log(LogType::Force, "[TexScale] can't sync, scale differs (graphic pack): src {:08x} {}x{} -> {}x{} fmt {:04x} | dst {:08x} {}x{} -> {}x{} fmt {:04x}", srcTexture->physAddress, srcTexture->width, srcTexture->height, effectiveWidth_src, effectiveHeight_src, (uint32)srcTexture->format, dstTexture->physAddress, dstTexture->width, dstTexture->height, effectiveWidth_dst, effectiveHeight_dst, (uint32)dstTexture->format);
++		}
+ 		return;
+ 	}
+ 	// todo - store 'lastUpdated' value per slice/mip and copy it's value when copying the slice data
+@@ -500,11 +510,18 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
  
  }
  
@@ -21,7 +45,7 @@ index 4445fb26..5b128b10 100644
  		LatteTexture* baseTexture = texRel->baseTexture;
  		LatteTexture* subTexture = texRel->subTexture;
  		for (sint32 cMipIndex = 0; cMipIndex < texRel->mipCount; cMipIndex++)
-@@ -730,6 +737,312 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
+@@ -730,6 +747,371 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
  	}
  }
  
@@ -35,6 +59,61 @@ index 4445fb26..5b128b10 100644
 +// ---------------------------------------------------------------------------------------------------------------------
 +
 +static sint32 s_offsetRelLogBudget = 0; // set above 0 to log offset relation decisions (diagnostics)
++static sint32 s_offsetRelAcceptLogBudget = 8; // accepted relations are logged separately (each texture shape pair once)
++static sint32 s_offsetRelScaleLogBudget = 12; // pairs that can't be synced because a graphic pack scales only one side
++
++static bool _LatteTexture_IsLegoDimensions()
++{
++	const uint64 titleId = CafeSystem::GetForegroundTitleId();
++	return titleId == 0x0005000010194200ull || titleId == 0x0005000010195D00ull;
++}
++
++// LEGO Dimensions renders its shadow cascades into 960x960 surfaces that sit in rows of one taller 960x(N*960) shadow
++// atlas, which the lighting pass then samples. The community Resolution pack scales 960x960 textures but has no rule for
++// the atlas, so the cascades and the atlas end up with different scales and can't be synced (lighting breaks above 720p).
++// Give the atlas the same scale as its cascades.
++static void _LatteTexture_ApplyShadowAtlasScale(LatteTexture* texture)
++{
++	constexpr sint32 cascadeSize = 960;
++	if (texture->width != cascadeSize || texture->depth != 1 || (texture->dim != Latte::E_DIM::DIM_2D && texture->dim != Latte::E_DIM::DIM_2D_ARRAY))
++		return;
++	if (texture->height <= cascadeSize || (texture->height % cascadeSize) != 0 || texture->height / cascadeSize > 4)
++		return;
++	if (!_LatteTexture_IsLegoDimensions())
++		return;
++	const sint32 cascadeCount = texture->height / cascadeSize;
++	for (const auto& gp : GraphicPack2::GetActiveGraphicPacks())
++	{
++		for (const auto& rule : gp->GetTextureRules())
++		{
++			const auto& filter = rule.filter_settings;
++			if (filter.width != cascadeSize || filter.height != cascadeSize)
++				continue;
++			if (rule.overwrite_settings.width == -1 && rule.overwrite_settings.height == -1)
++				continue;
++			if (!filter.format_whitelist.empty() && std::find(filter.format_whitelist.begin(), filter.format_whitelist.end(), (sint32)texture->format) == filter.format_whitelist.end())
++				continue;
++			if (!filter.format_blacklist.empty() && std::find(filter.format_blacklist.begin(), filter.format_blacklist.end(), (sint32)texture->format) != filter.format_blacklist.end())
++				continue;
++			if (!filter.tilemode_whitelist.empty() && std::find(filter.tilemode_whitelist.begin(), filter.tilemode_whitelist.end(), (int)texture->tileMode) == filter.tilemode_whitelist.end())
++				continue;
++			if (!filter.tilemode_blacklist.empty() && std::find(filter.tilemode_blacklist.begin(), filter.tilemode_blacklist.end(), (int)texture->tileMode) != filter.tilemode_blacklist.end())
++				continue;
++			const sint32 newWidth = rule.overwrite_settings.width != -1 ? rule.overwrite_settings.width : texture->width;
++			const sint32 newHeight = (rule.overwrite_settings.height != -1 ? rule.overwrite_settings.height : cascadeSize) * cascadeCount;
++			if (newWidth <= 0 || newHeight <= 0 || newWidth > 16384 || newHeight > 16384)
++				continue; // too large for the GPU, keep it unscaled
++			texture->overwriteInfo.hasResolutionOverwrite = true;
++			texture->overwriteInfo.width = newWidth;
++			texture->overwriteInfo.height = newHeight;
++			texture->overwriteInfo.depth = texture->depth;
++			static std::unordered_set<uint64> s_loggedShapes;
++			const uint64 key = ((uint64)texture->height << 40) ^ ((uint64)newWidth << 20) ^ (uint64)newHeight ^ ((uint64)texture->format << 52);
++			if (s_loggedShapes.size() < 16 && s_loggedShapes.insert(key).second)
++				cemuLog_log(LogType::Force, "[Cemu LD+] Shadow atlas {}x{} (fmt {:04x}, depth {}) scaled to {}x{} to match the graphic pack", texture->width, texture->height, (uint32)texture->format, texture->isDepth ? 1 : 0, newWidth, newHeight);
++		}
++	}
++}
 +
 +// verification results are cached per texture-shape pair, since the same pairs are re-checked whenever textures get recreated
 +static std::unordered_map<uint64, bool> s_offsetRelVerifyCache;
@@ -152,7 +231,9 @@ index 4445fb26..5b128b10 100644
 +
 +	auto logResult = [&](const char* result, sint32 yOffset)
 +	{
-+		if (s_offsetRelLogBudget <= 0)
++		const bool isAccepted = strcmp(result, "accepted") == 0;
++		sint32& logBudget = isAccepted ? s_offsetRelAcceptLogBudget : s_offsetRelLogBudget;
++		if (logBudget <= 0)
 +			return;
 +		// only log each combination of texture shapes and result once
 +		static std::unordered_set<uint64> s_loggedCombinations;
@@ -163,7 +244,7 @@ index 4445fb26..5b128b10 100644
 +		if (s_loggedCombinations.contains(key))
 +			return;
 +		s_loggedCombinations.insert(key);
-+		s_offsetRelLogBudget--;
++		logBudget--;
 +		cemuLog_log(LogType::Force, "[OffsetTexSync] {} | base {:08x} {}x{}x{} pitch {} fmt {:04x} tm {} swz {} depth {} slice {} | sub {:08x} {}x{} pitch {} fmt {:04x} tm {} swz {} depth {} | byteOffset {:x} yOffset {}",
 +			result,
 +			baseTexture->physAddress, baseTexture->width, baseTexture->height, baseTexture->depth, baseInfo->pitch, (uint32)baseTexture->format, (uint32)baseInfo->tileMode, baseSwizzle, baseTexture->isDepth ? 1 : 0, baseInfo->sliceIndex,
@@ -296,9 +377,11 @@ index 4445fb26..5b128b10 100644
 +
 +	if (!LatteTexture_doesEffectiveRescaleRatioMatch(baseTexture, 0, subTexture, 0))
 +	{
-+		if (s_offsetRelLogBudget > 0)
++		static std::unordered_set<uint64> s_loggedScalePairs;
++		const uint64 pairKey = ((uint64)baseTexture->width << 48) ^ ((uint64)baseTexture->height << 32) ^ ((uint64)subTexture->width << 16) ^ (uint64)subTexture->height ^ ((uint64)baseTexture->format << 56) ^ ((uint64)subTexture->format << 40);
++		if (s_offsetRelScaleLogBudget > 0 && s_loggedScalePairs.insert(pairKey).second)
 +		{
-+			s_offsetRelLogBudget--;
++			s_offsetRelScaleLogBudget--;
 +			sint32 bw, bh, sw, sh;
 +			baseTexture->GetEffectiveSize(bw, bh, 0);
 +			subTexture->GetEffectiveSize(sw, sh, 0);
@@ -334,7 +417,7 @@ index 4445fb26..5b128b10 100644
  void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  {
  	for (sint32 mipIndex = 0; mipIndex < texture->mipLevels; mipIndex++)
-@@ -768,6 +1081,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
+@@ -768,6 +1150,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  						else
  						{
  							LatteTexture_TrackDataOverlap(texture, sliceMipInfo, occupancy);
@@ -342,6 +425,15 @@ index 4445fb26..5b128b10 100644
  						}
  					}
  				}
+@@ -1303,6 +1686,8 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+ 			}
+ 		}
+ 	}
++	if (!this->overwriteInfo.hasResolutionOverwrite)
++		_LatteTexture_ApplyShadowAtlasScale(this);
+ 	// determine if this texture should ever be mirrored to CPU RAM
+ 	if (this->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
+ 	{
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.h b/src/Cafe/HW/Latte/Core/LatteTexture.h
 index 6c09e840..9d95036f 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.h
@@ -1549,10 +1641,10 @@ index 00000000..fc3d5993
 +val CATALOG_BY_ID: Map<Int, CatalogFigure> = CATALOG.associateBy { it.id }
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 new file mode 100644
-index 00000000..0e397e4d
+index 00000000..eb53d69c
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,369 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import android.content.Context
@@ -1619,6 +1711,7 @@ index 00000000..0e397e4d
 +class RemoteImageCache(
 +    private val subfolder: String,
 +    private val maxSize: Int,
++    private val transform: ((Int, Bitmap) -> Bitmap)? = null,
 +    private val urlFor: (Int) -> String?,
 +) {
 +    private val memory = LruCache<Int, ImageBitmap>(240)
@@ -1641,7 +1734,9 @@ index 00000000..0e397e4d
 +                    .map { File(dir, "$id.$it") }
 +                    .firstOrNull { it.isFile && it.length() > 0 }
 +                val file = local ?: if (ToyPadScreenSettings.figurePicturesEnabled(context)) download(dir, id) else null
-+                file?.let { decodeScaled(it, maxSize) }?.asImageBitmap()?.also { memory.put(id, it) }
++                file?.let { decodeScaled(it, maxSize) }
++                    ?.let { bitmap -> transform?.let { runCatching { it(id, bitmap) }.getOrNull() } ?: bitmap }
++                    ?.asImageBitmap()?.also { memory.put(id, it) }
 +            }
 +        }
 +    }
@@ -1709,8 +1804,49 @@ index 00000000..0e397e4d
 +    "$FIGURE_PICTURES_URL$picture.png"
 +}
 +
++/** Logos whose text is black, which disappears on the dark Toy Pad background. */
++private val DARK_TEXT_LOGOS = setOf("Harry Potter", "Midway Arcade", "LEGO City Undercover")
++
++/**
++ * Turns the black and near-black parts of a logo white (like the light version of a logo printed on a dark
++ * background). Colored parts are kept, and the change fades in smoothly so edges stay clean.
++ */
++private fun lightenBlackParts(source: Bitmap): Bitmap {
++    val width = source.width
++    val height = source.height
++    val pixels = IntArray(width * height)
++    source.getPixels(pixels, 0, width, 0, 0, width, height)
++    for (i in pixels.indices) {
++        val c = pixels[i]
++        val a = c ushr 24
++        if (a == 0) continue
++        val r = (c shr 16) and 0xFF
++        val g = (c shr 8) and 0xFF
++        val b = c and 0xFF
++        val max = maxOf(r, g, b)
++        val min = minOf(r, g, b)
++        // fully applied to black, fading out towards gray (max 110) and towards colored pixels (saturation 70)
++        val weight = ((110 - max) / 50f).coerceIn(0f, 1f) * ((70 - (max - min)) / 30f).coerceIn(0f, 1f)
++        if (weight <= 0f) continue
++        val target = 255 - max
++        val nr = (r + (target - r) * weight).toInt().coerceIn(0, 255)
++        val ng = (g + (target - g) * weight).toInt().coerceIn(0, 255)
++        val nb = (b + (target - b) * weight).toInt().coerceIn(0, 255)
++        pixels[i] = (a shl 24) or (nr shl 16) or (ng shl 8) or nb
++    }
++    val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
++    result.setPixels(pixels, 0, width, 0, 0, width, height)
++    return result
++}
++
 +/** Franchise logos (from the community LegoToypad project), by franchise index (1-based). */
-+val FranchiseLogos = RemoteImageCache("logos", 400) { FRANCHISES.getOrNull(it - 1)?.logoUrl }
++val FranchiseLogos = RemoteImageCache(
++    subfolder = "logos",
++    maxSize = 400,
++    transform = { index, bitmap ->
++        if (FRANCHISES.getOrNull(index - 1)?.name in DARK_TEXT_LOGOS) lightenBlackParts(bitmap) else bitmap
++    },
++) { FRANCHISES.getOrNull(it - 1)?.logoUrl }
 +
 +/** Drawings of each character's Toy Tag from the LEGO Dimensions Wiki (characters only). */
 +private val TOY_TAG_URLS: Map<Int, String> = mapOf(

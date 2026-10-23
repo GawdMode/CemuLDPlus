@@ -143,7 +143,7 @@ jobs:
 
             **Download:** `Cemu-LDPlus.apk` below. It installs as a separate app called **Cemu LD+** next to your regular Cemu, and as an update over Cemu Light Fix (saves and settings stay).
 
-            - Play at **1280x720** (set *LEGO Dimensions → Resolution* to the default, or leave it off). Higher resolutions may still have lighting problems.
+            - New: higher resolutions (for example 1920x1080) with the *LEGO Dimensions → Resolution* graphic pack. See the README, and please report lighting problems.
             - Setup tips (game profile settings, volume boost, moving your save and shader cache): see the [README](https://github.com/${{ github.repository }}#readme).
             - Problems? Open an [Issue](https://github.com/${{ github.repository }}/issues) and attach your log (game list menu → **Share log file**).
 
