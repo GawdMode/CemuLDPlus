@@ -5,7 +5,7 @@ An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco
 - **Lighting fix:** on the regular build, lighting is stuck in a square around your character and everything else
   goes dark. Here the whole level is lit, at 720p and higher resolutions.
 - **Toy Pad on the second screen** (for example the AYN Thor's bottom screen) with every character and vehicle
-  ready to place, pictures, Toy Tags, franchise logos and search.
+  ready to place, pictures, Toy Tags, franchise logos, search and every figure's abilities.
 - **Better sound:** fixed sound filter, balanced left/right with a simple reverb, and an optional volume boost.
 
 Everything else matches SSimco's Android Cemu, including the built-in emulated Toy Pad.
@@ -84,7 +84,11 @@ LEGO Dimensions Toy Pad there while you play:
 - **Franchise logos:** tap a logo to show just that franchise's characters and vehicles (each vehicle's three builds
   together), or **All** for everything A to Z. Logos with black lettering (Harry Potter, Midway, LEGO City Undercover)
   are shown in white so they stand out on the dark background.
-- **Search:** tap the search box and type on the small keyboard that appears on the Toy Pad screen.
+- **Search:** tap the search box and type on the small keyboard that appears on the Toy Pad screen. It finds names,
+  franchises and abilities.
+- **Abilities:** hold any figure (in the list or on the pad) to see what it can do. For vehicles the card shows all three
+  builds and their abilities side by side. Tap an ability to list everyone who has it, or use the **Abilities** button
+  next to the search box to pick one (for example *Flying* or *Dig*). It works together with the franchise logos.
 - When you rebuild a vehicle in the game, the pad shows the new build.
 - **Building a new vehicle:** when the game asks you to build a vehicle and *place the model on the central panel*,
   place that vehicle on the center spot. If the game doesn't take it, place **Blank tag** (first in the vehicle list)
@@ -192,6 +196,8 @@ build is SSimco's code at that commit plus the patch in this repo.
   [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) community collection (Chteupnin's assets)
 - Franchise logos and the franchise and vehicle family lists from [LegoToypad](https://github.com/harrysof/LegoToypad)
   by harrysof (logos downloaded on your device, not included here)
+- Character and vehicle ability lists from [LD-ToyPad-Emulator](https://github.com/Berny23/LD-ToyPad-Emulator)
+  by Berny23 and contributors (MIT License; the notice is included with the data in the source)
 - Toy Tag drawings (downloaded on your device, not included here) from the
   [LEGO Dimensions Wiki](https://lego-dimensions.fandom.com/wiki/Toy_Tag) community
 

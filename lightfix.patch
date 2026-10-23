@@ -1368,6 +1368,378 @@ index 29a5c740..342d30c8 100644
      override fun onPause() {
          super.onPause()
  
+diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt
+new file mode 100644
+index 00000000..c991f02c
+--- /dev/null
++++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt
+@@ -0,0 +1,366 @@
++package info.cemu.cemu.emulation.toypadscreen
++
++/*
++ * Abilities of every character and vehicle, from the LD-ToyPad-Emulator project
++ * (https://github.com/Berny23/LD-ToyPad-Emulator, server/json/charactermap.json and tokenmap.json),
++ * used under the MIT License:
++ *
++ * MIT License
++ *
++ * Copyright (c) 2023 Berny23
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++// one figure per line: "number:Ability|Ability|..."
++private const val ABILITY_DATA = """
++1:Grapple|Boomerang|Stealth|Rope Swing|Glide|Detective Mode|Master Build
++2:Magic|Magical Shield|Illumination
++3:Relic Detector|Acrobat|Master Build
++4:Atlantis Elemental|Dive|Hazard Cleaner|Growth|Water Spray
++5:Laser|Relic Detector|Target
++6:Big Transform|Super Strength|Super Strength Handles|Hazard Protection
++7:Target|Mini Access
++8:Hacking|Sonar Smash|Target|Master Build|Technology|Glide
++9:Acrobat|Portal Gun
++10:Spinjitzu|Acrobat|Stealth|Laser Deflector|Super Strength
++11:CHI|Super Strength|Super Strength Handles|Dive|Hazard Protection
++12:Target|Dive|Laser|Underwater Laser|Technology|Underwater Technology|Big Transform|Super Strength|Super Strength Handles|Character Changing|Flying|Fix-It|Hearts Regenerate
++13:Mind Control|Hacking|Drone Mazes|Silver LEGO Blowup|X-Ray Vision|Dive|Technology
++14:Hacking|Technology|Fix-It|Drone Mazes|Intelligence
++15:Hacking|Technology|Fix-It|Sonar Smash|Intelligence
++16:Drill|Master Build|Fix-It
++17:Super Strength|CHI|Target|Flying
++18:Super Strength|Super Strength Handles|Mini Access
++19:Boomerang|Silver LEGO Blowup|Mini Access|Acrobat|Dive
++20:Acrobat|Super Strength
++21:Sonar Smash|Chili Eating|Big Transform|Super Strength|Super Strength Handles
++22:Spinjitzu|Fix-It|Acrobat|Stealth|Electricity|Intelligence
++23:Electricity|Target|Grapple|Hazard Protection
++24:Spinjitzu|Acrobat|Stealth|Laser Deflector
++25:Electricity|Illumination
++26:Super Strength|Super Strength Handles|Laser|Invulnerability|Stealth|Speed
++27:Growth|Hazard Cleaner|Water Spray
++28:CHI|Super Strength|Acrobat|Laser Deflector|Sonar Smash
++29:Pole Vault|Target|Acrobat|Grind Rails
++30:Spinjitzu|Acrobat|Stealth|Laser Deflector|Illumination
++31:Sonar Smash
++32:Spinjitzu|Acrobat|Stealth|Laser Deflector|Fix-It
++33:Tracking|Stealth|Target|Vine Cut
++34:Suspend Ghost|Laser|Hazard Protection
++35:Boomerang|Flying|Slurp Access|Dive|Hazard Cleaner|Sonar Smash|Illumination|Mini Access|Hazard Protection
++36:Tracking|Dig|Dive|Stealth|Glide
++37:Spinjitzu|Stealth|Pole Vault|Acrobat|Glide
++38:Tracking|Illumination|Stealth|Glide
++39:Big Transform|Super Strength|Super Strength Handles|Hazard Protection
++40:Flying|Dive|Invulnerability|Super Strength|Super Strength Handles|Freeze Breath|Laser|X-Ray Vision
++41:Rainbow LEGO Objects|Master Build|Big Transform
++42:Silver LEGO Blowup|Flying|Magic|Illumination|Mind Control|Magical Shield
++43:Acrobat|Flying|Mind Control|Laser Deflector|Invulnerability|Grapple|Boomerang|Dive|Super Strength|Super Strength Handles
++44:Acrobat|Spinjitzu|Stealth|Boomerang|Dive|X-Ray Vision
++45:Pole Vault|Target|Acrobat|Grapple
++46:Flying|Laser|Invulnerability|Super Strength|Super Strength Handles|X-Ray Vision|Dive|Freeze Breath|Red Lantern Transformation|Lantern Constructs|Dig|Grapple
++47:Intelligence|Ghost Trap|Suspend Ghost|Ghost Puzzles|Laser|Hazard Protection|Charge Transfer|P.K.E. Meter|Character Changing|Technology|Silver LEGO Blowup|Fix-It|Grapple|Rope Swing|Super Strength|Super Strength Handles|Ghost Chipper
++48:Acrobat|Laser|Target|Laser Deflector|Pole Vault|Sword Switch|Cursed Red LEGO Objects|Grapple|Vine Cut|Rope Swing
++49:Acrobat|Target|Technology|Fuse Box|Magno Gloves|Drone Mazes|Grapple|Silver LEGO Blowup|Stealth|Scan Disguise|Dive|X-Ray Vision|Rope Swing
++50:Boomerang|Hazard Protection|Rainbow LEGO Objects|Mini Access|Slurp Access|Target
++51:Grapple|Illumination|Slurp Access|Tracking|Dig|Rope Swing|Shape Shift|Super Strength|Super Strength Handles|Drill|Gyrosphere Switch|Sonar Smash|Dive|Mini Access|Drone Mazes|Big Transform
++52:Water Spray|Target|Laser Deflector|Diffindo|Flying|Illumination|Silver LEGO Blowup|Stealth|Magic|Parseltongue Doors|Apparate Access|Hazard Cleaner|Growth
++53:Water Spray|Target|Laser Deflector|Diffindo|Flying|Illumination|Mind Control|Silver LEGO Blowup|Magic|Parseltongue Doors|Apparate Access|Hazard Cleaner|Growth
++54:Acrobat|Hacking|Technology|Tracking|X-Ray Vision
++55:Target|Fix-It|Silver LEGO Blowup|Super Strength|Super Strength Handles|A-Team Master Build|Laser Deflector|Character Changing
++56:Water Spray|Target|Laser Deflector|Diffindo|Illumination|Silver LEGO Blowup|Stealth|Magic|Intelligence|Fix-It|Lockpicking|Fantastical Briefcase|Apparate Access|Hazard Cleaner|Growth
++57:Speed|Grind Rails|Acrobat|Super Strength|Super Transformation|Invulnerability|Laser Deflector|Super Jump
++59:Target|Mini Access|Grapple|Rope Swing|Vine Cut|Acrobat|Dig|Silver LEGO Blowup
++60:Target|Acrobat|Dig|Vine Cut
++61:Growth|Fix-It|Hearts Regenerate|Illumination|Stealth|Magic|Mini Access
++62:Acrobat|Water Spray|Target|Laser Deflector|Diffindo|Illumination|Silver LEGO Blowup|Stealth|Magic|Apparate Access|Magical Shield|Growth|Hazard Cleaner|Mind Control
++63:Sonar Smash|Flying|Magic|Slurp Access|Dig|Tracking|Stealth|Acrobat|Cursed Red LEGO Objects|Hearts Regenerate|Mini Access|Vine Cut|Super Strength
++64:Boomerang|Detective Mode|Stealth|Grapple|High Security Access|Glide|Rope Swing
++65:Acrobat|Fix-It|Vent Access|Illumination|Suit Rip|Dive|Pole Vault|Laser Deflector|Glide|Grapple|Rope Swing
++66:Super Strength|Super Strength Handles|Grapple|Rope Swing|Dig|Dive|Target|Uniform Changing|Character Changing|Mini Access|Intelligence|Silver LEGO Blowup|Acrobat|Laser Deflector|Technology|X-Ray Vision|Fix-It|Tracking|Illumination|Sonar Smash|Truffle Shuffle|Vine Cut
++67:Acrobat|Water Spray|Target|Laser Deflector|Diffindo|Illumination|Silver LEGO Blowup|Magic|Intelligence|Apparate Access|Hazard Cleaner|Growth
++68:Acrobat|Grapple|Rope Swing|Tracking|Relic Detector|Uniform Changing|Illumination|Silver LEGO Blowup|Super Strength|Water Spray|Growth|Hazard Cleaner|Glide|Target|Hacking|Flying|Drill
++69:Boomerang|Sword Switch|Stealth|Laser Deflector|Grapple|Rope Swing|Super Strength|Master Build
++70:Magic|Raven Portals|Flying|Laser|Electricity|Drone Mazes|Hazard Protection|Intelligence|Lantern Constructs
++71:Atlantis Elemental|Acrobat|Dig|Flying|Drone Mazes|Slurp Access|Mini Access|Tracking|Dive
++72:Mind Control|Magic|Slurp Access|Illumination|Mini Access|Super Strength|Apparate Access
++74:Flying|Lantern Constructs|Laser|Freeze Breath|Energy Shield|Intelligence|Super Strength|Dive|X-Ray Vision|Hearts Regenerate
++75:Flying|Laser|Lantern Constructs|Rainbow LEGO Objects|Sonar Smash|Parseltongue Doors|Super Strength|Dive|Atlantis Elemental|Hearts Regenerate
++76:Flying|Lantern Constructs|Super Strength|Super Strength Handles|Energy Shield|Gyrosphere Switch|Dive|Spinjitzu|Hearts Regenerate
++77:Atlantis Elemental|Acrobat|Laser|Rainbow LEGO Objects|Dive|Flying|Parseltongue Doors|Hearts Regenerate
++769:Flying|Dive|Invulnerability|Super Strength|Laser|X-Ray Vision|Lantern Constructs|Dig|Grapple|Freeze Breath
++1000:Accelerator Switches|Tow Bar
++1001:Flying|Flight Docks and Flight Cargo Hooks|Accelerator Switches|Tow Bar
++1002:Flying|Flight Docks and Flight Cargo Hooks|Silver LEGO Blowup|Accelerator Switches|Tow Bar
++1003:Accelerator Switches
++1004:Accelerator Switches|Speed Boost|Tow Bar
++1005:Flying|Flight Docks and Flight Cargo Hooks|Special Attack|Accelerator Switches|Speed Boost|Tow Bar
++1006:Accelerator Switches
++1007:Accelerator Switches|Sonar Smash|Tow Bar
++1008:Accelerator Switches|Special Attack|Sonar Smash|Tow Bar
++1009:Flying|Flight Docks and Flight Cargo Hooks
++1010:Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup
++1011:Flying|Flight Docks and Flight Cargo Hooks|Silver LEGO Blowup|Gold LEGO Blowup
++1012:Accelerator Switches|Time Travel
++1013:Special Attack|Electricity|Tow Bar|Accelerator Switches|Time Travel
++1014:Silver LEGO Blowup|Flying|Flight Docks and Flight Cargo Hooks|Time Travel|Special Attack|Electricity|Tow Bar
++1015:Hover
++1016:Special Attack|Hover
++1017:Flying|Special Attack|Silver LEGO Blowup|Hover
++1018:Flying|Flight Docks and Flight Cargo Hooks
++1019:Flying|Flight Docks and Flight Cargo Hooks|Speed Boost|Silver LEGO Blowup
++1020:Flying|Flight Docks and Flight Cargo Hooks|Special Attack|Gold LEGO Blowup|Speed Boost|Silver LEGO Blowup
++1021:Sail
++1022:Sail|Speed Boost|Special Attack
++1023:Dive|Silver LEGO Blowup|Sail|Speed Boost|Special Attack
++1024:Mech Walker
++1025:Mech Walker|Super Strength|Dig
++1026:Gold LEGO Blowup|Mech Walker|Super Strength|Dig
++1027:Silver LEGO Blowup
++1028:Sonar Smash|Silver LEGO Blowup
++1029:Gold LEGO Blowup|Sonar Smash|Silver LEGO Blowup
++1030:TARDIS Travel|Stealth|Flying|Flight Docks and Flight Cargo Hooks
++1031:TARDIS Travel|Stealth|Flying|Gold LEGO Blowup
++1032:TARDIS Travel|Stealth|Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup
++1033:Accelerator Switches|Dig
++1034:Accelerator Switches|Dig|Tow Bar
++1035:Mech Walker|Super Strength|Accelerator Switches|Dig|Tow Bar
++1036:
++1037:Special Attack|Silver LEGO Blowup|Flying
++1038:Flying|Special Weapon|Sonar Smash|Special Attack|Silver LEGO Blowup
++1039:Accelerator Switches|Tow Bar
++1040:Accelerator Switches|Special Attack|Tow Bar
++1041:Accelerator Switches|Flying|Flight Docks and Flight Cargo Hooks|Tow Bar|Special Attack
++1042:Dig
++1043:Super Strength|Special Attack|Dig
++1044:Special Attack|Dig|Super Strength
++1045:Accelerator Switches|Tow Bar
++1046:Sail|Dive|Silver LEGO Blowup|Accelerator Switches|Tow Bar
++1047:Dive|Silver LEGO Blowup|Accelerator Switches|Tow Bar
++1048:Taunt|Silver LEGO Blowup
++1049:Special Weapon|Gold LEGO Blowup|Taunt|Silver LEGO Blowup
++1050:Gold LEGO Blowup|Taunt|Silver LEGO Blowup
++1051:Guardian Ability|Vine Cut
++1052:Super Strength|Dig|Vine Cut|Guardian Ability|Special Attack
++1053:Special Attack|Vine Cut|Guardian Ability|Super Strength
++1054:Gyrosphere Switch
++1055:Gyrosphere Switch|Sonar Smash
++1056:Gyrosphere Switch|Speed Boost|Sonar Smash
++1057:Accelerator Switches
++1058:Accelerator Switches|Special Attack|Tow Bar
++1059:Flying|Flight Docks and Flight Cargo Hooks|Accelerator Switches|Special Attack|Tow Bar
++1060:Accelerator Switches
++1061:Special Attack|Tow Bar|Accelerator Switches
++1062:Special Weapon|Special Attack|Tow Bar|Accelerator Switches
++1063:Accelerator Switches
++1064:Accelerator Switches|Special Attack|Tow Bar
++1065:Accelerator Switches|Special Weapon|Special Attack|Tow Bar
++1066:Accelerator Switches
++1067:Accelerator Switches|Tow Bar
++1068:Accelerator Switches|Water Spray|Tow Bar
++1069:Flying|Flight Docks and Flight Cargo Hooks
++1070:Flying|Flight Docks and Flight Cargo Hooks|Silver LEGO Blowup
++1071:Flying|Flight Docks and Flight Cargo Hooks|Special Attack|Silver LEGO Blowup
++1072:Flying|Flight Docks and Flight Cargo Hooks
++1073:Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup|Electricity
++1074:Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup|Electricity|Special Attack
++1075:Accelerator Switches
++1076:Accelerator Switches|Special Attack|Flying|Flight Docks and Flight Cargo Hooks
++1077:Accelerator Switches|Special Attack|Flying|Flight Docks and Flight Cargo Hooks
++1078:Mech Walker|Super Strength
++1079:Silver LEGO Blowup|Mech Walker|Super Strength
++1080:Flying|Flight Docks and Flight Cargo Hooks|Silver LEGO Blowup|Mech Walker|Super Strength
++1081:Weight Switch
++1082:Laser Deflector|Weight Switch
++1083:Hearts Regenerate|Weight Switch|Laser Deflector
++1084:Turret Switches
++1085:Gold LEGO Blowup|Turret Switches
++1086:Silver LEGO Blowup|Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup|Turret Switches
++1087:Super Strength
++1088:Gold LEGO Blowup|Super Strength
++1089:Stealth|Gold LEGO Blowup|Super Strength
++1090:Flying|Flight Docks and Flight Cargo Hooks
++1091:Flying|Flight Docks and Flight Cargo Hooks|Water Spray
++1092:Flying|Flight Docks and Flight Cargo Hooks|Special Attack|Water Spray
++1093:Flying|Flight Docks and Flight Cargo Hooks|Stealth
++1094:Flying|Flight Docks and Flight Cargo Hooks|Stealth|Gold LEGO Blowup
++1095:Flying|Flight Docks and Flight Cargo Hooks|Stealth|Gold LEGO Blowup|Silver LEGO Blowup
++1096:Flying|Flight Docks and Flight Cargo Hooks
++1097:Flying|Flight Docks and Flight Cargo Hooks|Special Attack
++1098:Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup|Special Attack
++1099:Accelerator Switches|Time Travel
++1100:Flying|Flight Docks and Flight Cargo Hooks|Time Travel|Accelerator Switches|Tow Bar
++1101:Flying|Flight Docks and Flight Cargo Hooks|Silver LEGO Blowup|Time Travel|Accelerator Switches|Tow Bar
++1102:Sail|Dive
++1103:Speed Boost|Special Weapon|Sail|Dive
++1104:Silver LEGO Blowup|Special Attack|Speed Boost|Special Weapon|Sail|Dive
++1105:Accelerator Switches|Drill|Dig
++1106:Tow Bar|Dig|Drill|Accelerator Switches
++1107:Special Attack|Silver LEGO Blowup|Drill|Dig|Accelerator Switches|Tow Bar
++1108:Accelerator Switches
++1109:Speed Boost|Tow Bar|Accelerator Switches
++1110:Silver LEGO Blowup|Speed Boost|Tow Bar|Accelerator Switches
++1111:Flying|Flight Docks and Flight Cargo Hooks|Special Attack
++1112:Flying|Flight Docks and Flight Cargo Hooks|Special Attack
++1113:Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup|Special Attack
++1114:Flying|Flight Docks and Flight Cargo Hooks
++1115:Flying|Flight Docks and Flight Cargo Hooks|Special Weapon
++1116:Flying|Flight Docks and Flight Cargo Hooks|Silver LEGO Blowup|Special Weapon
++1117:
++1118:Gold LEGO Blowup
++1119:Flying|Flight Docks and Flight Cargo Hooks|Silver LEGO Blowup|Gold LEGO Blowup
++1120:Accelerator Switches
++1121:Accelerator Switches|Water Spray|Tow Bar
++1122:Dive|Silver LEGO Blowup|Accelerator Switches|Water Spray|Tow Bar
++1123:Ghost Trap
++1124:Ghost Trap|Special Attack
++1125:Gold LEGO Blowup|Special Weapon|Ghost Trap|Special Attack
++1132:Flying
++1133:Flying|Special Attack
++1144:Flying|Special Weapon|Special Attack
++1155:Flying
++1156:Flying|Special Attack
++1157:Flying|Special Weapon|Special Attack
++1158:Arcade Docks
++1159:Flying|Arcade Docks
++1160:Special Attack|Arcade Docks|Flying
++1161:Accelerator Switches|Tow Bar
++1162:Sail|Silver LEGO Blowup|Accelerator Switches|Tow Bar
++1163:Flying|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup|Sail|Silver LEGO Blowup|Accelerator Switches|Tow Bar
++1164:Slime Bolts|Special Attack
++1165:Slime Beam|Slime Bolts|Special Attack
++1166:Slime Bomb|Silver LEGO Blowup|Slime Beam|Slime Bolts|Special Attack
++1167:Guardian Ability
++1168:Silver LEGO Blowup|Dig|Guardian Ability
++1169:Flying|Special Weapon|Silver LEGO Blowup|Dig|Guardian Ability
++1170:Hover|Gold LEGO Blowup|Guardian Ability
++1171:Flight Docks and Flight Cargo Hooks|Tow Bar|Water Spray|Hover|Gold LEGO Blowup|Guardian Ability
++1172:Gold LEGO Blowup|Underwater Interactions|Underwater Drone|Flight Docks and Flight Cargo Hooks|Tow Bar|Water Spray|Hover|Guardian Ability
++1173:BMO Docks|Illumination|Guardian Ability
++1174:Dig|Illumination|Guardian Ability|BMO Docks
++1175:Electricity|Dig|Illumination|Guardian Ability|BMO Docks
++1176:Tow Bar|Guardian Ability|Accelerator Switches
++1177:Sonar Smash|Super Jump|Super Strength|Guardian Ability|Tow Bar|Accelerator Switches
++1178:Sail|Tow Bar|Water Spray|Guardian Ability|Sonar Smash|Super Jump|Super Strength|Tow Bar|Accelerator Switches
++1179:Accelerator Switches|Tow Bar|Jump
++1180:Rainbow LEGO Objects|Gold LEGO Blowup|Flight Docks and Flight Cargo Hooks|Underwater Drone|Sonar Smash|Underwater Interactions|Accelerator Switches|Tow Bar|Jump
++1181:Underwater Drone|Sonar Smash|Underwater Interactions|Accelerator Switches|Tow Bar|Jump
++1182:Sonar Smash|Super Jump|Dig|Tow Bar
++1183:Flight Docks and Flight Cargo Hooks|Special Attack|Tow Bar|Sonar Smash|Super Jump|Dig
++1184:Guardian Ability|Super Strength|Cursed Red LEGO Objects|Flight Docks and Flight Cargo Hooks|Special Attack|Tow Bar|Sonar Smash|Super Jump|Dig
++1185:Accelerator Switches|Tow Bar
++1186:Accelerator Switches|Silver LEGO Blowup|Special Attack|Super Strength|Tow Bar
++1187:Flying|Flight Docks and Flight Cargo Hooks|Sail|Accelerator Switches|Silver LEGO Blowup|Special Attack|Super Strength|Tow Bar
++1188:Phone Home|Sonar Smash
++1189:Phone Home|Special Attack|Sonar Smash
++1190:Silver LEGO Blowup|Gold LEGO Blowup|Flight Docks and Flight Cargo Hooks|Tow Bar|Phone Home|Special Attack|Sonar Smash
++1191:Playable Character|Enhanced Stud Attraction|Dig|Guardian Ability
++1192:Vine Cut|Special Weapon|Playable Character|Enhanced Stud Attraction|Dig|Guardian Ability
++1193:Gold LEGO Blowup|Guardian Ability|Vine Cut|Special Weapon|Playable Character|Enhanced Stud Attraction|Dig
++1194:Playable Character|Guardian Ability
++1195:Special Weapon|Guardian Ability|Tow Bar|Vine Cut|Playable Character
++1196:Super Jump|Electricity|Dig|Special Weapon|Guardian Ability|Tow Bar|Vine Cut|Playable Character
++1197:Accelerator Switches|Tow Bar
++1198:Accelerator Switches|Tow Bar|Special Attack|Super Strength
++1199:Electricity|Water Spray|Flying|Sail|Accelerator Switches|Tow Bar|Special Attack|Super Strength
++1200:Illumination|Sonar Smash|Gold LEGO Blowup
++1201:Special Attack|Special Weapon|Illumination|Sonar Smash|Gold LEGO Blowup
++1202:Super Jump|Cursed Red LEGO Objects|Special Attack|Special Weapon|Illumination|Sonar Smash|Gold LEGO Blowup
++1203:Accelerator Switches|Special Attack|Electricity
++1204:Accelerator Switches|Special Attack|Tow Bar|Electricity
++1205:Super Jump|Vine Cut|Accelerator Switches|Special Attack|Tow Bar|Electricity
++1206:Accelerator Switches|Tow Bar|Sonar Smash
++1207:Gold LEGO Blowup|Flight Docks and Flight Cargo Hooks|Super Strength|Super Jump|Special Attack|Guardian Ability|Accelerator Switches|Tow Bar|Sonar Smash
++1208:Super Strength|Super Jump|Special Attack|Guardian Ability|Accelerator Switches|Tow Bar|Sonar Smash
++1209:Accelerator Switches|Tow Bar|Flight Docks and Flight Cargo Hooks
++1210:Underwater Drone|Underwater Interactions|Sonar Smash|Accelerator Switches|Tow Bar|Flight Docks and Flight Cargo Hooks
++1211:Vine Cut|Gold LEGO Blowup|Underwater Drone|Underwater Interactions|Sonar Smash|Accelerator Switches|Tow Bar|Flight Docks and Flight Cargo Hooks
++1212:Accelerator Switches|Jump|Special Attack
++1213:Accelerator Switches|Jump|Special Weapon|Silver LEGO Blowup|Special Attack
++1214:Flight Docks and Flight Cargo Hooks|Underwater Interactions|Special Weapon|Tow Bar|Accelerator Switches|Jump|Silver LEGO Blowup|Special Attack
++1215:Accelerator Switches|Tow Bar
++1216:Super Strength|Gold LEGO Blowup|Tow Bar|Accelerator Switches
++1217:Underwater Drone|Underwater Interactions|Super Strength|Gold LEGO Blowup|Tow Bar|Accelerator Switches
++1218:Accelerator Switches|Tow Bar
++1219:Flight Docks and Flight Cargo Hooks|Sail|Sonar Smash|Tow Bar|Accelerator Switches
++1220:Accelerator Switches|Dig|Vine Cut|Super Jump|Flight Docks and Flight Cargo Hooks|Sail|Sonar Smash|Tow Bar
++1221:Tow Bar|Flight Docks and Flight Cargo Hooks
++1222:Jump|Gold LEGO Blowup|Super Jump|Guardian Ability|Tow Bar|Flight Docks and Flight Cargo Hooks
++1223:Tow Bar|Flight Docks and Flight Cargo Hooks|Electricity|Jump|Gold LEGO Blowup|Super Jump|Guardian Ability
++1224:Accelerator Switches|Gold LEGO Blowup
++1225:Tow Bar|Super Strength|Electricity|Accelerator Switches|Gold LEGO Blowup
++1226:Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup|Silver LEGO Blowup|Tow Bar|Super Strength|Electricity|Accelerator Switches
++1227:Flight Docks and Flight Cargo Hooks|Special Attack|Tow Bar
++1228:Gold LEGO Blowup|Accelerator Switches|Super Jump|Special Attack|Flight Docks and Flight Cargo Hooks|Tow Bar
++1229:Flight Docks and Flight Cargo Hooks|Tow Bar|Drone Mazes|Gold LEGO Blowup|Accelerator Switches|Super Jump|Special Attack
++1230:Super Jump|Special Weapon
++1231:Super Jump|Super Strength|Special Weapon
++1232:Sonar Smash|Super Strength|Super Jump|Super Strength|Special Weapon
++1233:Tow Bar|Flight Docks and Flight Cargo Hooks
++1234:Accelerator Switches|Tow Bar|Flight Docks and Flight Cargo Hooks
++1235:Accelerator Switches|Tow Bar|Silver LEGO Blowup|Flight Docks and Flight Cargo Hooks
++1236:Organ Docks|Special Weapon|Sonar Smash
++1237:Jump|Special Weapon|Electricity|Organ Docks|Sonar Smash
++1238:Gold LEGO Blowup|Flight Docks and Flight Cargo Hooks|Tow Bar|Jump|Special Weapon|Electricity|Organ Docks|Sonar Smash
++1239:Sail|Silver LEGO Blowup|Special Attack
++1240:Water Spray|Special Attack|Vine Cut|Sail|Silver LEGO Blowup
++1241:Special Attack|Special Weapon|Silver LEGO Blowup|Water Spray|Vine Cut|Sail
++1242:Super Strength|Flying|Guardian Ability|Silver LEGO Blowup
++1243:Flying|Electricity|Super Strength|Guardian Ability|Silver LEGO Blowup
++1244:Flying|Special Weapon|Sonar Smash|Electricity|Super Strength|Guardian Ability|Silver LEGO Blowup
++1245:Sonar Smash
++1246:Gold LEGO Blowup|Tow Bar|Silver LEGO Blowup|Special Weapon|Super Jump|Cursed Red LEGO Objects|Enhanced Stud Attraction|Sonar Smash
++1247:Special Weapon|Super Jump|Cursed Red LEGO Objects|Enhanced Stud Attraction|Sonar Smash
++1248:Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup
++1249:Special Weapon|Rainbow LEGO Objects|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup
++1250:Special Weapon|Enhanced Stud Attraction|Silver LEGO Blowup|Rainbow LEGO Objects|Flight Docks and Flight Cargo Hooks|Gold LEGO Blowup
++1251:Special Weapon|Super Strength|Accelerator Switches|Tow Bar|Silver LEGO Blowup
++1252:Special Attack|Special Weapon|Sonar Smash|Super Strength|Accelerator Switches|Tow Bar|Silver LEGO Blowup
++1253:Special Weapon|Silver LEGO Blowup
++1254:Gold LEGO Blowup
++1255:Vine Cut|Super Jump|Dig|Gold LEGO Blowup
++1256:Water Spray|Vine Cut|Super Jump|Dig|Gold LEGO Blowup
++1257:Super Jump|Accelerator Switches|Tow Bar
++1258:Super Jump|Accelerator Switches|Drone Mazes|Tow Bar
++1259:Accelerator Switches|Flight Docks and Flight Cargo Hooks|Tow Bar|Sail|Super Jump|Drone Mazes
++1260:Summon Ability|Rainbow LEGO Objects|Cursed Red LEGO Objects|Sonar Smash
++1261:Cursed Red LEGO Objects|Flying|Gold LEGO Blowup|Tow Bar|Sonar Smash|Summon Ability|Rainbow LEGO Objects
++1262:Super Jump|Dig|Super Strength|Cursed Red LEGO Objects|Flying|Gold LEGO Blowup|Tow Bar|Sonar Smash|Summon Ability|Rainbow LEGO Objects
++1263:Special Weapon|Super Strength|Tow Bar|Silver LEGO Blowup
++1264:Gold LEGO Blowup|Flying|Special Weapon|Super Strength|Tow Bar|Silver LEGO Blowup
++1265:Super Jump|Dig|Electricity|Gold LEGO Blowup|Flying|Special Weapon|Super Strength|Tow Bar|Silver LEGO Blowup
++"""
++
++private val abilitiesById: Map<Int, List<String>> by lazy {
++    ABILITY_DATA.lineSequence()
++        .filter { it.isNotBlank() }
++        .associate { line ->
++            val number = line.substringBefore(':').trim().toInt()
++            number to line.substringAfter(':').split('|').map { it.trim() }.filter { it.isNotEmpty() }
++        }
++}
++
++/** The abilities of a figure, in the order the game lists them (empty if none are known). */
++fun abilitiesOf(number: Int): List<String> = abilitiesById[number] ?: emptyList()
++
++/** Every ability, A to Z. */
++val ALL_ABILITIES: List<String> by lazy {
++    abilitiesById.values.flatten().distinct().sortedBy { it.lowercase() }
++}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt
 new file mode 100644
 index 00000000..fc3d5993
@@ -2269,10 +2641,10 @@ index 00000000..1b23271a
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..a8e3f757
+index 00000000..57dc38cc
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,1280 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -2285,6 +2657,12 @@ index 00000000..a8e3f757
 +import androidx.compose.foundation.background
 +import androidx.compose.foundation.border
 +import androidx.compose.foundation.clickable
++import androidx.compose.foundation.combinedClickable
++import androidx.compose.foundation.interaction.MutableInteractionSource
++import androidx.compose.foundation.layout.FlowRow
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
 +import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Box
 +import androidx.compose.runtime.mutableIntStateOf
@@ -2375,6 +2753,8 @@ index 00000000..a8e3f757
 + */
 +private val BLANK_TAG = FigureEntry(0, "Blank tag", 0, true, "", 0)
 +
++private val ENTRY_BY_ID: Map<Int, FigureEntry> = CATALOG_ENTRIES.associateBy { it.id }
++
 +private fun readSlots(): List<SlotInfo?> =
 +    List(NativeEmulatedUSBDevices.MAX_DIMENSIONS_SLOTS) { index ->
 +        val name = NativeEmulatedUSBDevices.getDimensionsFigureSlot(index) ?: return@List null
@@ -2442,6 +2822,9 @@ index 00000000..a8e3f757
 +    var franchise by remember { mutableIntStateOf(0) } // 0 = all
 +    var query by remember { mutableStateOf("") }
 +    var typing by remember { mutableStateOf(false) }
++    var infoFigure by remember { mutableStateOf<FigureEntry?>(null) } // figure whose info card is open (long press)
++    var abilityFilter by remember { mutableStateOf<String?>(null) }
++    var pickingAbility by remember { mutableStateOf(false) }
 +
 +    LaunchedEffect(Unit) {
 +        var tick = 0
@@ -2545,6 +2928,27 @@ index 00000000..a8e3f757
 +        refresh()
 +    }
 +
++    fun showInfoForSlot(index: Int) {
++        val number = slots[index]?.number ?: return
++        infoFigure = if (number == 0) BLANK_TAG else ENTRY_BY_ID[number] ?: return
++    }
++
++    fun placeFromInfo(entry: FigureEntry) {
++        infoFigure = null
++        val slot = selectedSlot
++        if (slot != null) loadFigure(entry, slot) else selectedFigure = entry
++    }
++
++    fun showAbility(ability: String) {
++        // everyone with this ability, across all franchises
++        infoFigure = null
++        abilityFilter = ability
++        franchise = 0
++        query = ""
++        typing = false
++        pickingAbility = false
++    }
++
 +    fun onMove(index: Int) {
 +        NativeEmulatedUSBDevices.tempRemoveDimensionsFigure(index)
 +        moveSource = index
@@ -2555,21 +2959,29 @@ index 00000000..a8e3f757
 +    val onPadNumbers = slots.mapNotNull { it?.number }.filter { it > 0 }.toSet()
 +    val allEntries = remember(installed) { CATALOG_ENTRIES + installed.others }
 +    val key = searchKey(query)
-+    val shown = remember(allEntries, franchise, key) {
++    val ability = abilityFilter
++    val shown = remember(allEntries, franchise, key, ability) {
 +        allEntries.filter { e ->
 +            (franchise == 0 || e.franchise == franchise) &&
++                    (ability == null || ability in abilitiesOf(e.id)) &&
 +                    (key.isEmpty() || searchKey(e.name).contains(key) ||
-+                            searchKey(FRANCHISES.getOrNull(e.franchise - 1)?.name ?: "").contains(key))
++                            searchKey(FRANCHISES.getOrNull(e.franchise - 1)?.name ?: "").contains(key) ||
++                            abilitiesOf(e.id).any { searchKey(it).contains(key) })
 +        }
 +    }
++    // abilities to pick from, with how many figures (in the chosen franchise) have each
++    val abilityCounts = remember(allEntries, franchise) {
++        val inFranchise = allEntries.filter { franchise == 0 || it.franchise == franchise }
++        ALL_ABILITIES.map { a -> a to inFranchise.count { a in abilitiesOf(it.id) } }.filter { it.second > 0 }
++    }
 +    val characters = remember(shown) { shown.filter { !it.isVehicle }.sortedBy { it.name.lowercase() } }
-+    val vehicles = remember(shown, franchise, key) {
++    val vehicles = remember(shown, franchise, key, ability) {
 +        val list = shown.filter { it.isVehicle }
 +        // inside a franchise keep each vehicle's three builds together; otherwise A to Z
 +        val sorted = if (franchise != 0) list.sortedWith(compareBy({ it.family.lowercase() }, { it.build }, { it.name.lowercase() }))
 +        else list.sortedBy { it.name.lowercase() }
 +        // the blank tag comes first in every list, for when the game asks for a newly built vehicle
-+        val showBlank = key.isEmpty() || searchKey(BLANK_TAG.name).contains(key)
++        val showBlank = ability == null && (key.isEmpty() || searchKey(BLANK_TAG.name).contains(key))
 +        if (showBlank) listOf(BLANK_TAG) + sorted else sorted
 +    }
 +
@@ -2599,9 +3011,21 @@ index 00000000..a8e3f757
 +                SearchBox(
 +                    query = query,
 +                    typing = typing,
-+                    onTap = { typing = true },
++                    onTap = {
++                        typing = true
++                        pickingAbility = false
++                    },
 +                    onClear = { query = "" },
 +                    modifier = Modifier.weight(1f),
++                )
++                AbilityButton(
++                    selected = abilityFilter,
++                    open = pickingAbility,
++                    onTap = {
++                        typing = false
++                        pickingAbility = !pickingAbility
++                    },
++                    onClear = { abilityFilter = null },
 +                )
 +            }
 +
@@ -2621,6 +3045,7 @@ index 00000000..a8e3f757
 +                        selectedSlot = selectedSlot,
 +                        moveSource = moveSource,
 +                        onSlotTapped = ::onSlotTapped,
++                        onSlotLongPressed = ::showInfoForSlot,
 +                        modifier = Modifier
 +                            .weight(1f)
 +                            .fillMaxHeight(),
@@ -2631,6 +3056,7 @@ index 00000000..a8e3f757
 +                        isSelected = selectedSlot == CENTER_SLOT,
 +                        isMoveSource = moveSource == CENTER_SLOT,
 +                        onTap = { onSlotTapped(CENTER_SLOT) },
++                        onLongPress = { showInfoForSlot(CENTER_SLOT) },
 +                        modifier = Modifier
 +                            .weight(0.95f)
 +                            .fillMaxHeight(),
@@ -2643,6 +3069,7 @@ index 00000000..a8e3f757
 +                        selectedSlot = selectedSlot,
 +                        moveSource = moveSource,
 +                        onSlotTapped = ::onSlotTapped,
++                        onSlotLongPressed = ::showInfoForSlot,
 +                        modifier = Modifier
 +                            .weight(1f)
 +                            .fillMaxHeight(),
@@ -2674,8 +3101,20 @@ index 00000000..a8e3f757
 +                FranchiseStrip(selected = franchise, onSelect = { franchise = it })
 +            }
 +
-+            // figure collection
-+            LazyVerticalGrid(
++            // figure collection (or the list of abilities to pick from)
++            if (pickingAbility) AbilityPicker(
++                abilities = abilityCounts,
++                selected = abilityFilter,
++                onPick = { picked ->
++                    abilityFilter = if (abilityFilter == picked) null else picked
++                    pickingAbility = false
++                },
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .weight(1.15f)
++                    .clip(RoundedCornerShape(16.dp))
++                    .background(Color(0x66040818)),
++            ) else LazyVerticalGrid(
 +                columns = GridCells.Adaptive(minSize = 84.dp),
 +                modifier = Modifier
 +                    .fillMaxWidth()
@@ -2687,7 +3126,12 @@ index 00000000..a8e3f757
 +                verticalArrangement = Arrangement.spacedBy(6.dp),
 +            ) {
 +                if (characters.isEmpty() && vehicles.isEmpty()) {
-+                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Nothing matches \"$query\"") }
++                    val emptyText = when {
++                        key.isNotEmpty() -> "Nothing matches \"$query\""
++                        ability != null -> "No figures here with $ability"
++                        else -> "Nothing here"
++                    }
++                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel(emptyText) }
 +                }
 +                if (characters.isNotEmpty()) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Characters (${characters.size})") }
@@ -2697,6 +3141,7 @@ index 00000000..a8e3f757
 +                            isSelected = selectedFigure == entry,
 +                            isOnPad = entry.id in onPadNumbers,
 +                            onTap = { onFigureTapped(entry) },
++                            onLongPress = { infoFigure = entry },
 +                        )
 +                    }
 +                }
@@ -2708,9 +3153,30 @@ index 00000000..a8e3f757
 +                            isSelected = selectedFigure == entry,
 +                            isOnPad = entry.id in onPadNumbers,
 +                            onTap = { onFigureTapped(entry) },
++                            onLongPress = { infoFigure = entry },
 +                        )
 +                    }
 +                }
++            }
++        }
++
++        // info card for a figure (long press on it in the list or on the pad)
++        infoFigure?.let { entry ->
++            Box(
++                modifier = Modifier
++                    .fillMaxSize()
++                    .background(Color(0xB3000000))
++                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { infoFigure = null },
++                contentAlignment = Alignment.Center,
++            ) {
++                FigureInfoCard(
++                    entry = entry,
++                    isOnPad = entry.id in onPadNumbers,
++                    onAbility = ::showAbility,
++                    onShowFigure = { infoFigure = it },
++                    onPlace = { placeFromInfo(entry) },
++                    onClose = { infoFigure = null },
++                )
 +            }
 +        }
 +    }
@@ -3007,6 +3473,7 @@ index 00000000..a8e3f757
 +    selectedSlot: Int?,
 +    moveSource: Int?,
 +    onSlotTapped: (Int) -> Unit,
++    onSlotLongPressed: (Int) -> Unit,
 +    modifier: Modifier = Modifier,
 +) {
 +    PadBackground(light = light, shape = RoundedCornerShape(20.dp), modifier = modifier) {
@@ -3026,6 +3493,7 @@ index 00000000..a8e3f757
 +                    isSelected = selectedSlot == index,
 +                    isMoveSource = moveSource == index,
 +                    onTap = { onSlotTapped(index) },
++                    onLongPress = { onSlotLongPressed(index) },
 +                    modifier = Modifier
 +                        .offset(x = x, y = y)
 +                        .size(size),
@@ -3042,6 +3510,7 @@ index 00000000..a8e3f757
 +    isSelected: Boolean,
 +    isMoveSource: Boolean,
 +    onTap: () -> Unit,
++    onLongPress: () -> Unit,
 +    modifier: Modifier = Modifier,
 +) {
 +    PadBackground(light = light, shape = RoundedCornerShape(28.dp), modifier = modifier) {
@@ -3052,6 +3521,7 @@ index 00000000..a8e3f757
 +                isSelected = isSelected,
 +                isMoveSource = isMoveSource,
 +                onTap = onTap,
++                onLongPress = onLongPress,
 +                modifier = Modifier.size(size),
 +            )
 +        }
@@ -3123,6 +3593,7 @@ index 00000000..a8e3f757
 +    isSelected: Boolean,
 +    isMoveSource: Boolean,
 +    onTap: () -> Unit,
++    onLongPress: () -> Unit,
 +    modifier: Modifier = Modifier,
 +) {
 +    val ringColor = when {
@@ -3134,7 +3605,7 @@ index 00000000..a8e3f757
 +    Box(
 +        modifier = modifier
 +            .clip(CircleShape)
-+            .clickable(onClick = onTap),
++            .combinedClickable(onClick = onTap, onLongClick = onLongPress),
 +        contentAlignment = Alignment.Center,
 +    ) {
 +        Portrait(
@@ -3161,13 +3632,14 @@ index 00000000..a8e3f757
 +    isSelected: Boolean,
 +    isOnPad: Boolean,
 +    onTap: () -> Unit,
++    onLongPress: () -> Unit,
 +) {
 +    Column(
 +        modifier = Modifier
 +            .fillMaxWidth()
 +            .clip(RoundedCornerShape(14.dp))
 +            .background(if (isSelected) Color(0x663D8BFF) else Color.Transparent)
-+            .clickable(onClick = onTap)
++            .combinedClickable(onClick = onTap, onLongClick = onLongPress)
 +            .padding(vertical = 4.dp, horizontal = 2.dp),
 +        horizontalAlignment = Alignment.CenterHorizontally,
 +        verticalArrangement = Arrangement.spacedBy(3.dp),
@@ -3203,6 +3675,254 @@ index 00000000..a8e3f757
 +            maxLines = 2,
 +            overflow = TextOverflow.Ellipsis,
 +        )
++    }
++}
++
++/** "Abilities" next to the search box; shows the chosen ability (with ✕ to clear it) while one is picked. */
++@Composable
++private fun AbilityButton(selected: String?, open: Boolean, onTap: () -> Unit, onClear: () -> Unit) {
++    val shape = RoundedCornerShape(20.dp)
++    val active = open || selected != null
++    Row(
++        modifier = Modifier
++            .height(40.dp)
++            .widthIn(max = 170.dp)
++            .clip(shape)
++            .background(if (active) Color(0x993D6BDB) else Color(0x99060B1E))
++            .border(if (open) 2.dp else 1.dp, if (active) Color.White else Color(0x55FFFFFF), shape)
++            .clickable(onClick = onTap)
++            .padding(start = 14.dp, end = if (selected != null) 4.dp else 14.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Text(
++            text = selected ?: "Abilities",
++            color = TextOnBackground,
++            fontSize = 14.sp,
++            fontWeight = FontWeight.Medium,
++            maxLines = 1,
++            overflow = TextOverflow.Ellipsis,
++            modifier = Modifier.weight(1f, fill = false),
++        )
++        if (selected != null) {
++            Text(
++                text = "✕",
++                color = TextOnBackground,
++                fontSize = 16.sp,
++                modifier = Modifier
++                    .clip(CircleShape)
++                    .clickable(onClick = onClear)
++                    .padding(horizontal = 8.dp, vertical = 4.dp),
++            )
++        }
++    }
++}
++
++/** Every ability (with how many figures have it); pick one to show only those figures. */
++@Composable
++private fun AbilityPicker(
++    abilities: List<Pair<String, Int>>,
++    selected: String?,
++    onPick: (String) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    LazyVerticalGrid(
++        columns = GridCells.Adaptive(minSize = 150.dp),
++        modifier = modifier,
++        contentPadding = PaddingValues(8.dp),
++        horizontalArrangement = Arrangement.spacedBy(6.dp),
++        verticalArrangement = Arrangement.spacedBy(6.dp),
++    ) {
++        item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Pick an ability (${abilities.size})") }
++        items(abilities, key = { it.first }) { (name, count) ->
++            Row(
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .height(42.dp)
++                    .clip(RoundedCornerShape(10.dp))
++                    .background(if (name == selected) Color(0x993D6BDB) else Color(0x33FFFFFF))
++                    .clickable { onPick(name) }
++                    .padding(horizontal = 10.dp),
++                verticalAlignment = Alignment.CenterVertically,
++                horizontalArrangement = Arrangement.spacedBy(6.dp),
++            ) {
++                Text(
++                    text = name,
++                    color = TextOnBackground,
++                    fontSize = 13.sp,
++                    lineHeight = 15.sp,
++                    maxLines = 2,
++                    overflow = TextOverflow.Ellipsis,
++                    modifier = Modifier.weight(1f),
++                )
++                Text(text = "$count", color = TextDim, fontSize = 12.sp)
++            }
++        }
++    }
++}
++
++@Composable
++private fun AbilityChip(name: String, onTap: () -> Unit) {
++    val shape = RoundedCornerShape(16.dp)
++    Text(
++        text = name,
++        color = TextOnBackground,
++        fontSize = 13.sp,
++        modifier = Modifier
++            .clip(shape)
++            .background(Color(0x333D8BFF))
++            .border(1.dp, Color(0x883D8BFF), shape)
++            .clickable(onClick = onTap)
++            .padding(horizontal = 12.dp, vertical = 6.dp),
++    )
++}
++
++/** The franchise's logo (or its name while the logo isn't available). */
++@Composable
++private fun FranchiseLabel(franchise: Int) {
++    val name = FRANCHISES.getOrNull(franchise - 1)?.name ?: return
++    val logo = rememberFranchiseLogo(franchise)
++    if (logo != null) {
++        Image(
++            bitmap = logo,
++            contentDescription = name,
++            contentScale = ContentScale.Fit,
++            alignment = Alignment.CenterStart,
++            modifier = Modifier
++                .height(28.dp)
++                .widthIn(max = 160.dp),
++        )
++    } else {
++        Text(text = name, color = TextDim, fontSize = 13.sp)
++    }
++}
++
++/** What a figure can do: its abilities, and for vehicles every build of it. */
++@Composable
++private fun FigureInfoCard(
++    entry: FigureEntry,
++    isOnPad: Boolean,
++    onAbility: (String) -> Unit,
++    onShowFigure: (FigureEntry) -> Unit,
++    onPlace: () -> Unit,
++    onClose: () -> Unit,
++) {
++    val shape = RoundedCornerShape(20.dp)
++    val abilities = abilitiesOf(entry.id)
++    val builds = remember(entry) {
++        if (entry.isVehicle && entry.family.isNotEmpty())
++            CATALOG_ENTRIES.filter { it.isVehicle && it.family == entry.family && it.franchise == entry.franchise }.sortedBy { it.build }
++        else emptyList()
++    }
++    val kind = when {
++        entry.id == BLANK_TAG.id -> "Blank vehicle tag"
++        !entry.isVehicle -> "Character"
++        builds.size > 1 -> "Vehicle · build ${entry.build} of ${builds.size}"
++        else -> "Vehicle or gadget"
++    }
++    Column(
++        modifier = Modifier
++            .padding(16.dp)
++            .fillMaxWidth()
++            .clip(shape)
++            .background(Color(0xF20B1430))
++            .border(1.dp, Color(0x55FFFFFF), shape)
++            // taps inside the card don't close it
++            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
++            .verticalScroll(rememberScrollState())
++            .padding(16.dp),
++        verticalArrangement = Arrangement.spacedBy(12.dp),
++    ) {
++        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
++            Portrait(number = entry.id, name = entry.name, ringColor = Bronze, ringWidth = 2.dp, modifier = Modifier.size(84.dp))
++            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                Text(
++                    text = entry.name,
++                    color = TextOnBackground,
++                    fontSize = 20.sp,
++                    fontWeight = FontWeight.SemiBold,
++                    maxLines = 2,
++                    overflow = TextOverflow.Ellipsis,
++                )
++                FranchiseLabel(entry.franchise)
++                Text(text = kind, color = TextDim, fontSize = 13.sp)
++            }
++            Text(
++                text = "✕",
++                color = TextOnBackground,
++                fontSize = 20.sp,
++                modifier = Modifier
++                    .align(Alignment.Top)
++                    .clip(CircleShape)
++                    .clickable(onClick = onClose)
++                    .padding(horizontal = 10.dp, vertical = 4.dp),
++            )
++        }
++
++        if (entry.id == BLANK_TAG.id) {
++            Text(
++                text = "When the game asks you to build a vehicle and place the model on the central panel, " +
++                        "put this on the center spot. The game writes that vehicle onto it, and from then on " +
++                        "it works as that vehicle.",
++                color = TextOnBackground,
++                fontSize = 14.sp,
++            )
++        } else {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                Text(text = "Abilities", color = TextDim, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
++                if (abilities.isEmpty()) {
++                    Text(text = "No special abilities listed.", color = TextOnBackground, fontSize = 14.sp)
++                } else {
++                    FlowRow(
++                        horizontalArrangement = Arrangement.spacedBy(6.dp),
++                        verticalArrangement = Arrangement.spacedBy(6.dp),
++                    ) {
++                        abilities.forEach { ability -> AbilityChip(name = ability, onTap = { onAbility(ability) }) }
++                    }
++                    Text(text = "Tap an ability to see everyone who has it.", color = TextDim, fontSize = 12.sp)
++                }
++            }
++        }
++
++        if (builds.size > 1) {
++            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                Text(text = "All builds", color = TextDim, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
++                builds.forEach { build ->
++                    val isThis = build.id == entry.id
++                    Row(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .clip(RoundedCornerShape(12.dp))
++                            .background(if (isThis) Color(0x333D8BFF) else Color(0x14FFFFFF))
++                            .clickable(enabled = !isThis) { onShowFigure(build) }
++                            .padding(8.dp),
++                        verticalAlignment = Alignment.CenterVertically,
++                        horizontalArrangement = Arrangement.spacedBy(10.dp),
++                    ) {
++                        Portrait(number = build.id, name = build.name, ringColor = Bronze, ringWidth = 2.dp, modifier = Modifier.size(44.dp))
++                        Column(modifier = Modifier.weight(1f)) {
++                            Text(
++                                text = "${build.build}. ${build.name}",
++                                color = TextOnBackground,
++                                fontSize = 14.sp,
++                                fontWeight = if (isThis) FontWeight.SemiBold else FontWeight.Normal,
++                            )
++                            val buildAbilities = abilitiesOf(build.id)
++                            Text(
++                                text = if (buildAbilities.isEmpty()) "No special abilities listed" else buildAbilities.joinToString(" · "),
++                                color = TextDim,
++                                fontSize = 12.sp,
++                                lineHeight = 15.sp,
++                            )
++                        }
++                    }
++                }
++            }
++        }
++
++        Row(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), modifier = Modifier.fillMaxWidth()) {
++            if (!isOnPad) Button(onClick = onPlace) { Text("Place on pad") }
++            OutlinedButton(onClick = onClose, colors = ButtonDefaults.outlinedButtonColors(contentColor = TextOnBackground)) { Text("Close") }
++        }
 +    }
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
