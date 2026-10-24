@@ -1007,10 +1007,10 @@ index 31a24a44..f94364d8 100644
  
  	// mix audio generated from voice into main bus and aux buses
 diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-index 6cb1599a..8ba5f09d 100644
+index 6cb1599a..23f80744 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-@@ -216,8 +216,35 @@ namespace snd_core
+@@ -216,86 +216,173 @@ namespace snd_core
  		return nullptr;
  	}
  
@@ -1024,69 +1024,219 @@ index 6cb1599a..8ba5f09d 100644
 +	}
 +
 +	// convert a mixed sample to 16 bit, applying the optional boost with a soft limiter above the knee
-+	static inline sint16 _AXOutConvertSample(sint32 sample, float gain)
++	// Cemu LD+: output limiter for the TV mix (with the volume boost applied before it).
++	// Instead of cutting off or reshaping loud samples (which sounds crunchy), it briefly lowers the volume just enough
++	// for peaks to fit, then slowly lets it back up. A short look-ahead lets the volume come down smoothly before a peak.
++	class TVOutputLimiter
 +	{
-+		if (gain <= 1.0f)
-+			return (sint16)std::min(std::max(sample, -32768), 32767);
-+		float v = (float)sample * gain;
-+		constexpr float knee = 20000.0f;
-+		constexpr float range = 32767.0f - knee;
-+		float a = std::fabs(v);
-+		if (a > knee)
++	  public:
++		static constexpr sint32 kLookahead = 48; // 1 ms at 48 kHz
++		static constexpr sint32 kMaxChannels = 6;
++		static constexpr float kThreshold = 31000.0f; // just under full scale
++		static constexpr float kReleaseCoeff = 1.7e-4f; // back up over roughly 120 ms
++
++		// processes planar samples in place (scale of 16 bit samples); output is delayed by kLookahead - 1 samples
++		void Process(float* const* channels, sint32 channelCount, sint32 sampleCount)
 +		{
-+			a = knee + range * std::tanh((a - knee) / range);
-+			v = v < 0.0f ? -a : a;
++			if (channelCount != m_channelCount)
++				Reset(channelCount);
++			for (sint32 i = 0; i < sampleCount; i++)
++			{
++				float peak = 0.0f;
++				for (sint32 c = 0; c < channelCount; c++)
++					peak = std::max(peak, std::fabs(channels[c][i]));
++				m_required[m_pos] = peak > kThreshold ? (kThreshold / peak) : 1.0f;
++				// the lowest gain any sample in the look-ahead window needs
++				float windowMin = 1.0f;
++				for (sint32 k = 0; k < kLookahead; k++)
++					windowMin = std::min(windowMin, m_required[k]);
++				if (windowMin < m_envelope)
++					m_envelope = windowMin;
++				else
++					m_envelope += (windowMin - m_envelope) * kReleaseCoeff;
++				// averaging over the window makes the gain change smooth and still never exceeds what the oldest sample needs
++				m_envelopeSum += m_envelope - m_envelopeHistory[m_pos];
++				m_envelopeHistory[m_pos] = m_envelope;
++				const float gain = std::min(1.0f, (float)(m_envelopeSum / kLookahead));
++				const sint32 oldest = (m_pos + 1) % kLookahead;
++				for (sint32 c = 0; c < channelCount; c++)
++				{
++					m_delay[c][m_pos] = channels[c][i];
++					channels[c][i] = m_delay[c][oldest] * gain;
++				}
++				m_pos = oldest;
++			}
++			// keep the running sum exact
++			m_envelopeSum = 0.0;
++			for (sint32 k = 0; k < kLookahead; k++)
++				m_envelopeSum += m_envelopeHistory[k];
 +		}
-+		return (sint16)std::clamp(v, -32768.0f, 32767.0f);
++
++	  private:
++		void Reset(sint32 channelCount)
++		{
++			m_channelCount = channelCount;
++			for (auto& ch : m_delay)
++				ch.fill(0.0f);
++			m_required.fill(1.0f);
++			m_envelopeHistory.fill(1.0f);
++			m_envelopeSum = kLookahead;
++			m_envelope = 1.0f;
++			m_pos = 0;
++		}
++
++		sint32 m_channelCount{-1};
++		std::array<std::array<float, kLookahead>, kMaxChannels> m_delay{};
++		std::array<float, kLookahead> m_required{};
++		std::array<float, kLookahead> m_envelopeHistory{};
++		double m_envelopeSum{0.0};
++		float m_envelope{1.0f};
++		sint32 m_pos{0};
++	};
++
++	static TVOutputLimiter s_tvLimiter;
++
++	static inline sint16 _AXOutFloatToSample(float v)
++	{
++		return (sint16)std::clamp((sint32)std::lrint(v), -32768, 32767);
 +	}
 +
  	void AXOut_SubmitTVFrame(sint32 frameIndex)
  	{
+-		sint32 numSamples = AIGetSamplesPerChannel(AX_DEV_TV);
 +		const float boostGain = s_tvBoostGain.load();
- 		sint32 numSamples = AIGetSamplesPerChannel(AX_DEV_TV);
++		const sint32 numSamples = std::min<sint32>(AIGetSamplesPerChannel(AX_DEV_TV), AX_SAMPLES_PER_3MS_48KHZ);
++		sint32 channelCount;
  		if (__AXMode[AX_DEV_TV] == AX_MODE_6CH)
++			channelCount = 6;
++		else if (__AXMode[AX_DEV_TV] == AX_MODE_STEREO)
++			channelCount = 2;
++		else if (__AXMode[AX_DEV_TV] == AX_MODE_MONO)
++			channelCount = 1;
++		else
++		{
++			assert_dbg();
++			return;
++		}
++		// planar float copy of the mix with the boost applied, then the limiter
++		static float s_planar[TVOutputLimiter::kMaxChannels][AX_SAMPLES_PER_3MS_48KHZ];
++		float* planar[TVOutputLimiter::kMaxChannels];
++		for (sint32 c = 0; c < channelCount; c++)
  		{
-@@ -246,14 +273,14 @@ namespace snd_core
- 				Back Left - BL			4
- 				Back Right - BR			5
- 				*/
+-			sint32* inputChannel0 = __AXTVBuffer48.GetPtr() + numSamples * 0;
+-			sint32* inputChannel1 = __AXTVBuffer48.GetPtr() + numSamples * 1;
+-			sint32* inputChannel2 = __AXTVBuffer48.GetPtr() + numSamples * 2;
+-			sint32* inputChannel3 = __AXTVBuffer48.GetPtr() + numSamples * 3;
+-			sint32* inputChannel4 = __AXTVBuffer48.GetPtr() + numSamples * 4;
+-			sint32* inputChannel5 = __AXTVBuffer48.GetPtr() + numSamples * 5;
++			const sint32* input = __AXTVBuffer48.GetPtr() + AIGetSamplesPerChannel(AX_DEV_TV) * c;
++			for (sint32 i = 0; i < numSamples; i++)
++				s_planar[c][i] = (float)_swapEndianS32(input[i]) * boostGain;
++			planar[c] = s_planar[c];
++		}
++		s_tvLimiter.Process(planar, channelCount, numSamples);
++
++		if (channelCount == 6)
++		{
++			/*
++			* DirectSound surround order
++			LEFT				0
++			RIGHT				1
++			SUR_LEFT			2
++			SUR_RIGHT			3
++			CH_FC				4
++			CH_LFE				5
++			=>
++			Front Left - FL			0
++			Front Right - FR		1
++			Front Center - FC		2
++			Low Frequency - LF		3
++			Back Left - BL			4
++			Back Right - BR			5
++			*/
+ 			sint16* dmaOutputBuffer = AIGetCurrentDMABuffer(AX_DEV_TV);
+ 			for (sint32 i = 0; i < numSamples; i++)
+ 			{
+-				/*
+-				* DirectSound surround order
+-				LEFT				0
+-				RIGHT				1
+-				SUR_LEFT			2
+-				SUR_RIGHT			3
+-				CH_FC				4
+-				CH_LFE				5
+-				=>
+-				Front Left - FL			0
+-				Front Right - FR		1
+-				Front Center - FC		2
+-				Low Frequency - LF		3
+-				Back Left - BL			4
+-				Back Right - BR			5
+-				*/
 -				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel0), -32768), 32767));
 -				dmaOutputBuffer[1] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel1), -32768), 32767));
-+				dmaOutputBuffer[0] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel0), boostGain));
-+				dmaOutputBuffer[1] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel1), boostGain));
- 
+-
 -				dmaOutputBuffer[4] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel2), -32768), 32767));
 -				dmaOutputBuffer[5] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel3), -32768), 32767));
-+				dmaOutputBuffer[4] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel2), boostGain));
-+				dmaOutputBuffer[5] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel3), boostGain));
- 
+-
 -				dmaOutputBuffer[2] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel4), -32768), 32767));
 -				dmaOutputBuffer[3] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel5), -32768), 32767));
-+				dmaOutputBuffer[2] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel4), boostGain));
-+				dmaOutputBuffer[3] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel5), boostGain));
++				dmaOutputBuffer[0] = _swapEndianS16(_AXOutFloatToSample(s_planar[0][i]));
++				dmaOutputBuffer[1] = _swapEndianS16(_AXOutFloatToSample(s_planar[1][i]));
++				dmaOutputBuffer[4] = _swapEndianS16(_AXOutFloatToSample(s_planar[2][i]));
++				dmaOutputBuffer[5] = _swapEndianS16(_AXOutFloatToSample(s_planar[3][i]));
++				dmaOutputBuffer[2] = _swapEndianS16(_AXOutFloatToSample(s_planar[4][i]));
++				dmaOutputBuffer[3] = _swapEndianS16(_AXOutFloatToSample(s_planar[5][i]));
  				dmaOutputBuffer += 6;
- 				// next sample
- 				inputChannel0++;
-@@ -272,8 +299,8 @@ namespace snd_core
+-				// next sample
+-				inputChannel0++;
+-				inputChannel1++;
+-				inputChannel2++;
+-				inputChannel3++;
+-				inputChannel4++;
+-				inputChannel5++;
+ 			}
+ 			AIInitDMA(__AXTVDMABuffers[frameIndex], numSamples * 6 * sizeof(sint16)); // 6ch output
+ 		}
+-		else if (__AXMode[AX_DEV_TV] == AX_MODE_STEREO)
++		else if (channelCount == 2)
+ 		{
+-			sint32* inputChannel0 = __AXTVBuffer48.GetPtr() + numSamples * 0;
+-			sint32* inputChannel1 = __AXTVBuffer48.GetPtr() + numSamples * 1;
  			sint16* dmaOutputBuffer = __AXTVDMABuffers[frameIndex];
  			for (sint32 i = 0; i < numSamples; i++)
  			{
 -				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel0), -32768), 32767));
 -				dmaOutputBuffer[1] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel1), -32768), 32767));
-+				dmaOutputBuffer[0] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel0), boostGain));
-+				dmaOutputBuffer[1] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel1), boostGain));
++				dmaOutputBuffer[0] = _swapEndianS16(_AXOutFloatToSample(s_planar[0][i]));
++				dmaOutputBuffer[1] = _swapEndianS16(_AXOutFloatToSample(s_planar[1][i]));
  				dmaOutputBuffer += 2;
- 				// next sample
- 				inputChannel0++;
-@@ -287,7 +314,7 @@ namespace snd_core
+-				// next sample
+-				inputChannel0++;
+-				inputChannel1++;
+ 			}
+ 			AIInitDMA(__AXTVDMABuffers[frameIndex], numSamples * 2 * sizeof(sint16)); // 2ch output
+ 		}
+-		else if (__AXMode[AX_DEV_TV] == AX_MODE_MONO)
++		else
+ 		{
+-			sint32* inputChannel0 = __AXTVBuffer48.GetPtr() + numSamples * 0;
  			sint16* dmaOutputBuffer = __AXTVDMABuffers[frameIndex];
  			for (sint32 i = 0; i < numSamples; i++)
  			{
 -				dmaOutputBuffer[0] = _swapEndianS16((sint16)std::min(std::max(_swapEndianS32(*inputChannel0), -32768), 32767));
-+				dmaOutputBuffer[0] = _swapEndianS16(_AXOutConvertSample(_swapEndianS32(*inputChannel0), boostGain));
++				dmaOutputBuffer[0] = _swapEndianS16(_AXOutFloatToSample(s_planar[0][i]));
  				dmaOutputBuffer++;
- 				// next sample
- 				inputChannel0++;
+-				// next sample
+-				inputChannel0++;
+ 			}
+ 			AIInitDMA(__AXTVDMABuffers[frameIndex], numSamples * 1 * sizeof(sint16)); // 1ch (output as stereo)
+ 		}
+-		else
+-			assert_dbg();
+ 	}
+ 
+ 	void AIInitDRCDMA(sint16* sampleData, sint32 size)
 diff --git a/src/Cafe/OS/libs/snd_user/snd_user.cpp b/src/Cafe/OS/libs/snd_user/snd_user.cpp
 index 58e8f4b5..6b1ed12a 100644
 --- a/src/Cafe/OS/libs/snd_user/snd_user.cpp

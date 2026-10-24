@@ -37,6 +37,10 @@ copy the save back. Build 3 and later can all be installed as normal updates.
 
 ## Known issues
 
+- **Graphics glitches (stretched or "warping" shapes):** these usually come from the GPU driver. If you use a custom
+  driver (for example a Turnip build), try the default system driver or a different Turnip version and see if they
+  go away.
+
 - The intro logos take about 45 seconds before you can skip. That's the game's own timed logo sequence, not
   loading (the game reads almost nothing from disk while they're shown), so it can't be shortened without
   patching the game itself. Copying your shader cache from regular Cemu (see below) removes extra delay on first runs.
@@ -60,7 +64,10 @@ These are tested on an AYN Thor. If you use a custom GPU driver in your regular 
 
 LEGO Dimensions mixes its sound very quietly, so even at full volume it can be hard to hear on a handheld. In
 **Settings → Audio**, first make sure **TV volume** is at 100%, then raise **TV volume boost (Cemu LD+)**
-(+3 to +18 dB). A soft limiter keeps loud moments from crackling. Start with +12 dB.
+(+3 to +18 dB). A limiter turns loud moments down slightly instead of letting them crackle. Start with +6 dB.
+
+**Sound stutters in busy moments?** Raise **Latency** in Settings → Audio (for example to 100 ms or more). A bigger
+buffer rides out short slowdowns. Turning off the *60FPS* graphic pack also lowers the load.
 
 ## Higher resolutions (1080p and up)
 
@@ -187,7 +194,9 @@ balanced again and those sounds get some space around them.
 
 ### Volume boost
 
-An optional gain on the game's TV sound (Settings → Audio), with a soft limiter so loud moments don't crackle.
+An optional gain on the game's TV sound (Settings → Audio). From build 20 the output goes through a look-ahead limiter
+(1 ms): when a peak would go over full scale it lowers the volume just enough and lets it back up over about a second,
+instead of cutting off or reshaping the waveform (which sounded crunchy). It also catches peaks with the boost off.
 
 So far it has only been tested with LEGO Dimensions on one device (AYN Thor). Other games that use the same
 technique might also benefit, and might also have new issues. Reports are welcome either way.
