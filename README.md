@@ -101,6 +101,8 @@ LEGO Dimensions Toy Pad there while you play:
 - **Favorites and team:** on a figure's card, tap the star to make it a favorite, or **Add to team** (up to 7).
   The **Favorites** and **Team** buttons next to the franchise logos show them. **Put team on pad** takes everything
   off the pad and puts your team on it in one tap (side pads first, then the center).
+- **Recent:** the **Recent** button next to the franchise logos shows the figures you put on the pad most recently,
+  newest first.
 - When you rebuild a vehicle in the game, the pad shows the new build.
 - **Building a new vehicle:** when the game asks you to build a vehicle and *place the model on the central panel*,
   place that vehicle on the center spot. If the game doesn't take it, place **Blank tag** (first in the vehicle list)
@@ -120,6 +122,8 @@ while you use the touch screen.
   Franchise logos come from the [LegoToypad](https://github.com/harrysof/LegoToypad) project (`toypad/logos`). Without internet the figure's name is shown
   instead. To use your own picture for a figure, put it in that folder named by figure number (for example `1.png`
   for Batman, `1000.png` for the Police Car). You can turn the downloads off with the **Figure pictures** switch.
+- **Download all pictures:** pictures are normally downloaded the first time each one is shown. Tap **Download all
+  pictures** to save all of them (about 420 small files) in one go, so the Toy Pad shows every picture even offline.
 - **Background:** tap **Choose background picture** to use any picture on your device behind the Toy Pad, or keep the
   built-in star map.
 

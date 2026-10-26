@@ -2299,10 +2299,10 @@ index 00000000..fc3d5993
 +val CATALOG_BY_ID: Map<Int, CatalogFigure> = CATALOG.associateBy { it.id }
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 new file mode 100644
-index 00000000..eb53d69c
+index 00000000..c4477e17
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,433 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import android.content.Context
@@ -2321,7 +2321,15 @@ index 00000000..eb53d69c
 +import androidx.compose.ui.graphics.asImageBitmap
 +import androidx.compose.ui.platform.LocalContext
 +import info.cemu.cemu.nativeinterface.NativeEmulatedUSBDevices
++import kotlinx.coroutines.CoroutineScope
 +import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.launch
 +import kotlinx.coroutines.sync.Mutex
 +import kotlinx.coroutines.sync.Semaphore
 +import kotlinx.coroutines.sync.withLock
@@ -2331,6 +2339,7 @@ index 00000000..eb53d69c
 +import java.net.HttpURLConnection
 +import java.net.URL
 +import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.atomic.AtomicInteger
 +
 +/** Settings for the Toy Pad on the second screen. */
 +object ToyPadScreenSettings {
@@ -2399,11 +2408,27 @@ index 00000000..eb53d69c
 +        }
 +    }
 +
-+    private suspend fun download(dir: File, id: Int): File? {
++    /**
++     * Makes sure this picture is saved on the device, downloading it if needed (whether or not pictures are switched on).
++     * Returns false only if it should exist but couldn't be downloaded.
++     */
++    suspend fun ensureSaved(context: Context, id: Int): Boolean {
++        if (id <= 0 || urlFor(id) == null) return true
++        val lock = locks.getOrPut(id) { Mutex() }
++        return lock.withLock {
++            withContext(Dispatchers.IO) {
++                val dir = folder(context)
++                val saved = listOf("png", "webp", "jpg", "jpeg").any { ext -> File(dir, "$id.$ext").let { it.isFile && it.length() > 0 } }
++                saved || id in missing || download(dir, id, ignoreRetryWait = true) != null || id in missing
++            }
++        }
++    }
++
++    private suspend fun download(dir: File, id: Int, ignoreRetryWait: Boolean = false): File? {
 +        val url = urlFor(id) ?: return null
 +        if (id in missing) return null
 +        val lastFail = failedAt[id]
-+        if (lastFail != null && System.currentTimeMillis() - lastFail < RETRY_AFTER_MS) return null
++        if (!ignoreRetryWait && lastFail != null && System.currentTimeMillis() - lastFail < RETRY_AFTER_MS) return null
 +        return downloads.withPermit {
 +            try {
 +                dir.mkdirs()
@@ -2588,6 +2613,45 @@ index 00000000..eb53d69c
 +)
 +
 +val ToyTagImages = RemoteImageCache("tags", 256) { TOY_TAG_URLS[it] }
++
++/** Downloads every figure picture, Toy Tag and franchise logo at once, so the Toy Pad screen works offline. */
++object PictureDownloader {
++    data class Progress(val done: Int, val total: Int, val failed: Int, val finished: Boolean)
++
++    private val _progress = MutableStateFlow<Progress?>(null)
++    val progress: StateFlow<Progress?> = _progress
++
++    // not tied to a screen, so leaving the settings screen doesn't stop the download
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private var job: Job? = null
++
++    @Synchronized
++    fun start(context: Context) {
++        if (job?.isActive == true) return
++        val appContext = context.applicationContext
++        val work: List<Pair<RemoteImageCache, Int>> =
++            CATALOG.map { FigureImages to it.id } +
++                    TOY_TAG_URLS.keys.map { ToyTagImages to it } +
++                    FRANCHISES.map { FranchiseLogos to it.index }
++        _progress.value = Progress(0, work.size, 0, false)
++        job = scope.launch {
++            val done = AtomicInteger(0)
++            val failed = AtomicInteger(0)
++            work.map { (cache, id) ->
++                async {
++                    val ok = try {
++                        cache.ensureSaved(appContext, id)
++                    } catch (_: Throwable) {
++                        false
++                    }
++                    if (!ok) failed.incrementAndGet()
++                    _progress.value = Progress(done.incrementAndGet(), work.size, failed.get(), false)
++                }
++            }.awaitAll()
++            _progress.value = Progress(work.size, work.size, failed.get(), true)
++        }
++    }
++}
 +
 +/** Figure numbers of installed figure files, read once per file. */
 +object FigureNumbers {
@@ -2827,10 +2891,10 @@ index 00000000..1b23271a
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
 new file mode 100644
-index 00000000..c82ebedf
+index 00000000..e8c0fe32
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,52 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import android.content.Context
@@ -2840,9 +2904,13 @@ index 00000000..c82ebedf
 +    private const val PREFS = "toypad_screen"
 +    private const val KEY_FAVORITES = "favorites"
 +    private const val KEY_TEAM = "team"
++    private const val KEY_RECENT = "recent"
 +
 +    /** The pad has 7 spots. */
 +    const val TEAM_SIZE = 7
++
++    /** How many recently placed figures are remembered. */
++    const val RECENT_SIZE = 20
 +
 +    private fun read(context: Context, key: String): List<Int> =
 +        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -2867,13 +2935,24 @@ index 00000000..c82ebedf
 +    fun team(context: Context): List<Int> = read(context, KEY_TEAM).take(TEAM_SIZE)
 +
 +    fun setTeam(context: Context, numbers: List<Int>) = write(context, KEY_TEAM, numbers.distinct().take(TEAM_SIZE))
++
++    /** Figures placed on the pad, newest first. */
++    fun recent(context: Context): List<Int> = read(context, KEY_RECENT).take(RECENT_SIZE)
++
++    /** Moves this figure to the front of the recent list and returns the new list. */
++    fun addRecent(context: Context, number: Int): List<Int> {
++        if (number <= 0) return recent(context)
++        val list = (listOf(number) + recent(context).filter { it != number }).take(RECENT_SIZE)
++        write(context, KEY_RECENT, list)
++        return list
++    }
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..63b05bfd
+index 00000000..80837572
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
-@@ -0,0 +1,1589 @@
+@@ -0,0 +1,1612 @@
 +package info.cemu.cemu.emulation.toypadscreen
 +
 +import androidx.compose.animation.core.LinearEasing
@@ -2962,6 +3041,7 @@ index 00000000..63b05bfd
 +// special views in the franchise strip (0 = everything, 1+ = a franchise)
 +private const val FAVORITES_VIEW = -1
 +private const val TEAM_VIEW = -2
++private const val RECENT_VIEW = -3
 +
 +private val TextOnBackground = Color(0xFFF2F5FF)
 +private val TextDim = Color(0xFFB8C3E6)
@@ -3069,6 +3149,7 @@ index 00000000..63b05bfd
 +    val context = LocalContext.current
 +    var favorites by remember { mutableStateOf(ToyPadLists.favorites(context)) }
 +    var team by remember { mutableStateOf(ToyPadLists.team(context)) }
++    var recent by remember { mutableStateOf(ToyPadLists.recent(context)) }
 +    var lastQuickSlot by remember { mutableStateOf<Int?>(null) } // spot filled by the last "put one on the pad"
 +    var lastQuickNumber by remember { mutableIntStateOf(-1) }
 +
@@ -3121,6 +3202,7 @@ index 00000000..63b05bfd
 +            val path = pathFor(entry)
 +            val ok = path != null && NativeEmulatedUSBDevices.loadDimensionsFigure(path, SLOT_PADS[index], index)
 +            errorMessage = if (ok) null else "Couldn't place ${entry.name}"
++            if (ok && ENTRY_BY_ID.containsKey(entry.id)) recent = ToyPadLists.addRecent(context, entry.id)
 +        }
 +        clearSelection()
 +        refresh()
@@ -3282,9 +3364,10 @@ index 00000000..63b05bfd
 +        0 -> true
 +        FAVORITES_VIEW -> e.id in favorites
 +        TEAM_VIEW -> e.id in team
++        RECENT_VIEW -> e.id in recent
 +        else -> e.franchise == franchise
 +    }
-+    val shown = remember(allEntries, franchise, key, ability, favorites, team) {
++    val shown = remember(allEntries, franchise, key, ability, favorites, team, recent) {
 +        allEntries.filter { e ->
 +            inView(e) &&
 +                    (ability == null || ability in abilitiesOf(e.id)) &&
@@ -3294,12 +3377,18 @@ index 00000000..63b05bfd
 +        }
 +    }
 +    // abilities to pick from, with how many figures (in the chosen franchise) have each
-+    val abilityCounts = remember(allEntries, franchise, favorites, team) {
++    val abilityCounts = remember(allEntries, franchise, favorites, team, recent) {
 +        val inFranchise = allEntries.filter { inView(it) }
 +        ALL_ABILITIES.map { a -> a to inFranchise.count { a in abilitiesOf(it.id) } }.filter { it.second > 0 }
 +    }
 +    val characters = remember(shown) { shown.filter { !it.isVehicle }.sortedBy { it.name.lowercase() } }
-+    val teamShown = remember(shown, team) { team.mapNotNull { number -> shown.firstOrNull { it.id == number } } }
++    // the team and recent views keep their own order (team order, newest first)
++    val orderedIds: List<Int>? = when (franchise) {
++        TEAM_VIEW -> team
++        RECENT_VIEW -> recent
++        else -> null
++    }
++    val orderedShown = remember(shown, orderedIds) { orderedIds?.mapNotNull { number -> shown.firstOrNull { it.id == number } } ?: emptyList() }
 +    val padAbilities = remember(onPadNumbers) { onPadNumbers.flatMap { abilitiesOf(it) }.toSet() }
 +    val vehicles = remember(shown, franchise, key, ability) {
 +        val list = shown.filter { it.isVehicle }
@@ -3457,7 +3546,7 @@ index 00000000..63b05bfd
 +                horizontalArrangement = Arrangement.spacedBy(4.dp),
 +                verticalArrangement = Arrangement.spacedBy(6.dp),
 +            ) {
-+                if (ability != null && franchise != TEAM_VIEW) {
++                if (ability != null && orderedIds == null) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) {
 +                        AbilityQuickPlace(
 +                            ability = ability,
@@ -3466,22 +3555,26 @@ index 00000000..63b05bfd
 +                        )
 +                    }
 +                }
-+                if (franchise == TEAM_VIEW) {
++                if (orderedIds != null) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) {
-+                        TeamHeader(count = team.size, onPlace = ::placeTeam)
++                        if (franchise == TEAM_VIEW) TeamHeader(count = team.size, onPlace = ::placeTeam)
++                        else SectionLabel("Recently placed (${orderedShown.size})")
 +                    }
-+                    if (team.isEmpty()) {
++                    if (orderedIds.isEmpty()) {
 +                        item(span = { GridItemSpan(maxLineSpan) }) {
-+                            SectionLabel("Hold a figure and tap Team to add it (up to ${ToyPadLists.TEAM_SIZE}).")
++                            SectionLabel(
++                                if (franchise == TEAM_VIEW) "Hold a figure and tap Team to add it (up to ${ToyPadLists.TEAM_SIZE})."
++                                else "Figures you put on the pad show up here, newest first."
++                            )
 +                        }
 +                    }
-+                    items(teamShown, key = { "t${it.id}" }) { entry ->
++                    items(orderedShown, key = { "o${it.id}" }) { entry ->
 +                        FigureTile(
 +                            entry = entry,
 +                            isSelected = selectedFigure == entry,
 +                            isOnPad = entry.id in onPadNumbers,
 +                            isFavorite = entry.id in favorites,
-+                            inTeam = true,
++                            inTeam = entry.id in team,
 +                            onTap = { onFigureTapped(entry) },
 +                            onLongPress = { infoFigure = entry },
 +                        )
@@ -3495,7 +3588,7 @@ index 00000000..63b05bfd
 +                    }
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel(emptyText) }
 +                }
-+                if (franchise != TEAM_VIEW && characters.isNotEmpty()) {
++                if (orderedIds == null && characters.isNotEmpty()) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Characters (${characters.size})") }
 +                    items(characters, key = { "c${it.id}${it.otherPath ?: ""}" }) { entry ->
 +                        FigureTile(
@@ -3509,7 +3602,7 @@ index 00000000..63b05bfd
 +                        )
 +                    }
 +                }
-+                if (franchise != TEAM_VIEW && vehicles.isNotEmpty()) {
++                if (orderedIds == null && vehicles.isNotEmpty()) {
 +                    item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Vehicles and gadgets (${vehicles.count { it.id != BLANK_TAG.id }})") }
 +                    items(vehicles, key = { "v${it.id}${it.otherPath ?: ""}" }) { entry ->
 +                        FigureTile(
@@ -3647,6 +3740,15 @@ index 00000000..63b05bfd
 +    ) {
 +        item(key = 0) {
 +            FranchiseChip(index = 0, name = "All", isSelected = selected == 0, onTap = { onSelect(0) })
++        }
++        item(key = RECENT_VIEW) {
++            IconChip(
++                icon = R.drawable.ic_toypad_recent,
++                iconTint = TextOnBackground,
++                label = "Recent",
++                isSelected = selected == RECENT_VIEW,
++                onTap = { onSelect(if (selected == RECENT_VIEW) 0 else RECENT_VIEW) },
++            )
 +        }
 +        item(key = FAVORITES_VIEW) {
 +            IconChip(
@@ -4726,16 +4828,17 @@ index 4c61cbd5..066bc1f5 100644
              label = tr("Gamepad"),
              description = tr("Enable audio output for the Wii U Gamepad"),
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
-index 5325cb1e..2e1fa933 100644
+index 5325cb1e..6bad79a2 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
-@@ -1,13 +1,44 @@
+@@ -1,13 +1,47 @@
  package info.cemu.cemu.settings.emulatedusbdevices
  
 +import android.widget.Toast
 +import androidx.activity.compose.rememberLauncherForActivityResult
 +import androidx.activity.result.contract.ActivityResultContracts
  import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
@@ -4747,6 +4850,7 @@ index 5325cb1e..2e1fa933 100644
  import info.cemu.cemu.common.ui.components.ScreenContent
  import info.cemu.cemu.common.ui.components.Toggle
  import info.cemu.cemu.common.ui.localization.tr
++import info.cemu.cemu.emulation.toypadscreen.PictureDownloader
 +import info.cemu.cemu.emulation.toypadscreen.ToyPadBackgroundImage
 +import info.cemu.cemu.emulation.toypadscreen.ToyPadScreenSettings
  import info.cemu.cemu.nativeinterface.NativeSettings
@@ -4757,6 +4861,7 @@ index 5325cb1e..2e1fa933 100644
 +    val context = LocalContext.current
 +    val coroutineScope = rememberCoroutineScope()
 +    var hasCustomBackground by remember { mutableStateOf(ToyPadBackgroundImage.exists(context)) }
++    val downloadProgress by PictureDownloader.progress.collectAsState()
 +
 +    val backgroundPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
 +        if (uri == null) return@rememberLauncherForActivityResult
@@ -4774,7 +4879,7 @@ index 5325cb1e..2e1fa933 100644
      ScreenContent(
          appBarText = tr("Emulated USB Devices settings"),
          navigateBack = navigateBack,
-@@ -29,5 +60,34 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
+@@ -29,5 +63,48 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
              initialCheckedState = NativeSettings::isEmulateDimensionsToypadEnabled,
              onCheckedChanged = NativeSettings::setEmulateDimensionsToypadEnabled,
          )
@@ -4789,6 +4894,20 @@ index 5325cb1e..2e1fa933 100644
 +                    "LegoToypad project) and kept in the toypad folder.",
 +            initialCheckedState = { ToyPadScreenSettings.figurePicturesEnabled(context) },
 +            onCheckedChanged = { ToyPadScreenSettings.setFigurePicturesEnabled(context, it) },
++        )
++
++        val progress = downloadProgress
++        Button(
++            label = "Download all pictures",
++            description = when {
++                progress == null -> "Save every figure picture, Toy Tag and logo now, so the Toy Pad shows them even when " +
++                        "you're offline. Otherwise each one is downloaded the first time it's shown."
++                !progress.finished -> "Downloading… ${progress.done} of ${progress.total}"
++                progress.failed == 0 -> "Done: all ${progress.total} pictures are saved on this device."
++                else -> "Saved ${progress.total - progress.failed} of ${progress.total}. ${progress.failed} couldn't be " +
++                        "downloaded. Check your connection and tap again to retry."
++            },
++            onClick = { PictureDownloader.start(context) },
 +        )
 +
 +        Button(
@@ -4809,6 +4928,21 @@ index 5325cb1e..2e1fa933 100644
 +        }
      }
  }
+diff --git a/src/android/app/src/main/res/drawable/ic_toypad_recent.xml b/src/android/app/src/main/res/drawable/ic_toypad_recent.xml
+new file mode 100644
+index 00000000..0f599ccc
+--- /dev/null
++++ b/src/android/app/src/main/res/drawable/ic_toypad_recent.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="@android:color/white"
++        android:pathData="M13,3c-4.97,0 -9,4.03 -9,9L1,12l3.89,3.89 0.07,0.14L9,12L6,12c0,-3.87 3.13,-7 7,-7s7,3.13 7,7 -3.13,7 -7,7c-1.93,0 -3.68,-0.79 -4.94,-2.06l-1.42,1.42C8.27,19.99 10.51,21 13,21c4.97,0 9,-4.03 9,-9s-4.03,-9 -9,-9zM12,8v5l4.28,2.54 0.72,-1.21 -3.5,-2.08L13.5,8L12,8z" />
++</vector>
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_star.xml b/src/android/app/src/main/res/drawable/ic_toypad_star.xml
 new file mode 100644
 index 00000000..8bb66809
