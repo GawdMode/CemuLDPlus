@@ -1238,7 +1238,7 @@ index 6cb1599a..23f80744 100644
  
  	void AIInitDRCDMA(sint16* sampleData, sint32 size)
 diff --git a/src/Cafe/OS/libs/snd_user/snd_user.cpp b/src/Cafe/OS/libs/snd_user/snd_user.cpp
-index 58e8f4b5..6b1ed12a 100644
+index 58e8f4b5..6c806fa8 100644
 --- a/src/Cafe/OS/libs/snd_user/snd_user.cpp
 +++ b/src/Cafe/OS/libs/snd_user/snd_user.cpp
 @@ -1082,12 +1082,12 @@ namespace snd_user
@@ -1287,8 +1287,8 @@ index 58e8f4b5..6b1ed12a 100644
 +
 +		void Process(const float* input, float* outLeft, float* outRight, size_t count)
 +		{
-+			constexpr float feedback = 0.84f; // room size
-+			constexpr float damp = 0.2f;
++			constexpr float feedback = 0.70f; // room size: about 0.5 s of reverb, like a normal room
++			constexpr float damp = 0.4f; // high frequencies fade faster, so the tail sounds warmer
 +			for (size_t n = 0; n < count; n++)
 +			{
 +				float in = input[n] * 0.015f;
@@ -1383,7 +1383,7 @@ index 58e8f4b5..6b1ed12a 100644
 +		}
 +		float left[512], right[512];
 +		reverb->Process(input, left, right, sampleCount);
-+		constexpr float wet = 0.6f;
++		constexpr float wet = 0.4f;
 +		for (uint32 ch = 0; ch < channelCount; ch++)
 +		{
 +			sint32be* p = auxSamples->channelSamples[ch].GetPtr();
