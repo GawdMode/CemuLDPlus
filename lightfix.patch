@@ -507,6 +507,66 @@ index 01a6d3b2..61c893d4 100644
  
  	// buffer cache
  	virtual void bufferCache_init(const sint32 bufferSize) = 0;
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
+index 15fd66e0..caa05c7e 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
+@@ -10,6 +10,12 @@
+ #include <glslang/SPIRV/GlslangToSpv.h>
+ #include "util/helpers/helpers.h"
+ 
++#if defined(__linux__)
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
+ bool s_isLoadingShadersVk{ false };
+ class FileCache* s_spirvCache{nullptr};
+ 
+@@ -157,6 +163,13 @@ public:
+ 	void CompilerThreadFunc()
+ 	{
+ 		SetThreadName("vkShaderComp");
++#if defined(__linux__)
++		// Cemu LD+: keep one shader compile thread at normal priority and run the others below the emulation threads
++		// (shaders needed right away are compiled on the render thread itself, so this only delays background work)
++		static std::atomic<uint32> s_threadCounter{0};
++		if (s_threadCounter.fetch_add(1) != 0)
++			setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
++#endif
+ 		while (m_threadsActive.load(std::memory_order::relaxed))
+ 		{
+ 			s_compilationQueueCount.decrementWithWait();
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
+index 55b2330e..051105cf 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
+@@ -10,6 +10,12 @@
+ #include "util/helpers/Serializer.h"
+ #include "Cafe/HW/Latte/Common/RegisterSerializer.h"
+ 
++#if defined(__linux__)
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
+ /* rects emulation */
+ 
+ void rectsEmulationGS_outputSingleVertex(std::string& gsSrc, LatteDecompilerShader* vertexShader, LatteShaderPSInputTable* psInputTable, sint32 vIdx, const LatteContextRegister& latteRegister)
+@@ -1132,6 +1138,11 @@ static void compilePipeline_thread(sint32 threadIndex)
+ 	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
+ 	if(threadIndex != 0)
+ 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++#elif defined(__linux__)
++	// Cemu LD+: same as on Windows. On Android every compile thread otherwise competes with the emulation threads for
++	// the fast cores, which makes the frame rate drop whenever a burst of new pipelines is compiled
++	if (threadIndex != 0)
++		setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+ #endif
+ 	while (!s_compileThreadsShutdownSignal)
+ 	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 index 8a93e120..bfa607c2 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h

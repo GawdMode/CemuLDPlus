@@ -176,6 +176,14 @@ Some effects are drawn into 640x368 buffers and read back as 640x360 textures. T
 640x368 version, so at higher resolutions the two couldn't be synced. When a 640x360 texture shares memory with a
 scaled 640x368 buffer, Cemu LD+ now gives it the same scale.
 
+### Smoother shader building (build 23 and later)
+
+The first time an effect appears, Cemu builds a shader for it in the background. On Windows, Cemu runs those builder
+threads at lower priority so they don't take CPU time from the game, but on Android they ran at the same priority and
+competed with the game for the fast cores, so the frame rate dropped whenever many new shaders were built at once
+(new areas, open worlds). Cemu LD+ now lowers their priority on Android too. Objects built in the background can take
+a moment longer to appear the first time, but the game itself keeps running smoothly.
+
 ### Vehicle tags (build 17 and later)
 
 Vehicle and gadget tags keep their vehicle number unencrypted, with a marker that tells the game the tag is a
