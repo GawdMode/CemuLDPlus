@@ -1,3 +1,146 @@
+diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
+index 7809a01..d2ef865 100644
+--- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
++++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
+@@ -322,7 +322,8 @@ void PPCInterpreter_ICBI(PPCInterpreter_t* hCPU, uint32 Opcode)
+ 
+ void PPCInterpreter_EIEIO(PPCInterpreter_t* hCPU, uint32 Opcode)
+ {
+-	// no effect
++	// Cemu LD+: keep memory accesses in order for other cores (matters on ARM hosts in multi-core mode)
++	std::atomic_thread_fence(std::memory_order_seq_cst);
+ 	// next instruction
+ 	PPCInterpreter_nextInstruction(hCPU);
+ }
+@@ -336,7 +337,8 @@ void PPCInterpreter_SC(PPCInterpreter_t* hCPU, uint32 Opcode)
+ 
+ void PPCInterpreter_SYNC(PPCInterpreter_t* hCPU, uint32 Opcode)
+ {
+-	// no-op
++	// Cemu LD+: keep memory accesses in order for other cores (matters on ARM hosts in multi-core mode)
++	std::atomic_thread_fence(std::memory_order_seq_cst);
+ 	// next instruction
+ 	PPCInterpreter_nextInstruction(hCPU);
+ }
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
+index 2555101..5d9042a 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
+@@ -941,6 +941,11 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
+ 		brk(0xf000);
+ 		return true;
+ 	}
++	else if (imlInstruction->operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
++	{
++		dmb(BarOpt::ISH);
++		return true;
++	}
+ 	else if (imlInstruction->operation == PPCREC_IML_MACRO_COUNT_CYCLES)
+ 	{
+ 		uint32 cycleCount = imlInstruction->op_macro.param;
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
+index 20c1711..5b9fc80 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
+@@ -264,6 +264,11 @@ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction,
+ 		x64Gen_int3(x64GenContext);
+ 		return true;
+ 	}
++	else if( imlInstruction->operation == PPCREC_IML_MACRO_MEMORY_BARRIER )
++	{
++		// x86 already keeps loads and stores in the order the game expects
++		return true;
++	}
+ 	else if( imlInstruction->operation == PPCREC_IML_MACRO_COUNT_CYCLES )
+ 	{
+ 		uint32 cycleCount = imlInstruction->op_macro.param;
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
+index cd26986..f5e8282 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
+@@ -406,6 +406,10 @@ void IMLDebug_DisassembleInstruction(const IMLInstruction& inst, std::string& di
+ 		{
+ 			strOutput.addFmt("MACRO COUNT_CYCLES cycles: {}", inst.op_macro.param);
+ 		}
++		else if (inst.operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
++		{
++			strOutput.add("MACRO MEMORY_BARRIER");
++		}
+ 		else
+ 		{
+ 			strOutput.addFmt("MACRO ukn operation {}", inst.operation);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
+index 997de4e..caaca3a 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
+@@ -143,7 +143,7 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
+ 	}
+ 	else if (type == PPCREC_IML_TYPE_MACRO)
+ 	{
+-		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_COUNT_CYCLES || operation == PPCREC_IML_MACRO_HLE)
++		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_COUNT_CYCLES || operation == PPCREC_IML_MACRO_HLE || operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
+ 		{
+ 			// no effect on registers
+ 		}
+@@ -415,7 +415,7 @@ void IMLInstruction::RewriteGPR(const std::unordered_map<IMLRegID, IMLRegID>& tr
+ 	}
+ 	else if (type == PPCREC_IML_TYPE_MACRO)
+ 	{
+-		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_HLE || operation == PPCREC_IML_MACRO_COUNT_CYCLES)
++		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_HLE || operation == PPCREC_IML_MACRO_COUNT_CYCLES || operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
+ 		{
+ 			// no effect on registers
+ 		}
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
+index 4df2a66..40d1859 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
+@@ -178,6 +178,9 @@ enum
+ 	PPCREC_IML_MACRO_LEAVE,			// leaves recompiler and switches to interpeter
+ 	// debugging
+ 	PPCREC_IML_MACRO_DEBUGBREAK,	// throws a debugbreak
++	// Cemu LD+: full memory barrier for PPC sync/lwsync. Only emitted in multi-core mode, where the emulated cores run on
++	// separate host threads and ARM (unlike x86) can reorder memory accesses that the game expects to stay in order
++	PPCREC_IML_MACRO_MEMORY_BARRIER,
+ };
+ 
+ enum class IMLCondition : uint8
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
+index e76a53f..98d8a67 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
+@@ -8,6 +8,11 @@
+ #include "PPCFunctionBoundaryTracker.h"
+ #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
+ 
++namespace coreinit
++{
++	bool __CemuIsMulticoreMode();
++}
++
+ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext);
+ 
+ struct PPCBasicBlockInfo
+@@ -775,6 +780,11 @@ bool PPCRecompilerImlGen_ISYNC(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 
+ bool PPCRecompilerImlGen_SYNC(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
+ {
++	// Cemu LD+: sync and lwsync order the memory accesses before them against the ones after them, which games rely on to
++	// hand data between cores (locks, job queues, audio buffers). x86 hosts keep that order anyway, ARM hosts don't, so in
++	// multi-core mode emit a real barrier
++	if (coreinit::__CemuIsMulticoreMode())
++		ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_MEMORY_BARRIER, 0, 0, 0, IMLREG_INVALID);
+ 	return true;
+ }
+ 
+@@ -3097,6 +3107,7 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+ 					break;
+ 				case PPCREC_IML_MACRO_DEBUGBREAK:
+ 				case PPCREC_IML_MACRO_COUNT_CYCLES:
++				case PPCREC_IML_MACRO_MEMORY_BARRIER:
+ 					break;
+ 				default:
+ 				cemu_assert_unimplemented();
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index 963c49f..ec07b2b 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -50,10 +193,19 @@ index 963c49f..ec07b2b 100644
  	while (true)
  	{
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
-index a3bcb63..3a1c99d 100644
+index a3bcb63..a4c41b7 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 +++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
-@@ -121,3 +121,151 @@ void LattePerformanceMonitor_frameBegin()
+@@ -1,4 +1,8 @@
+ #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
++#include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
++#include "Cafe/OS/libs/snd_core/ax.h"
++#include "Cafe/OS/libs/snd_core/ax_internal.h"
++#include "audio/IAudioAPI.h"
+ #include "Cafe/HW/Latte/Core/LatteOverlay.h"
+ #include "WindowSystem.h"
+ 
+@@ -121,3 +125,185 @@ void LattePerformanceMonitor_frameBegin()
  	performanceMonitor.vk.numDrawBarriersPerFrame.reset();
  	performanceMonitor.vk.numBeginRenderpassPerFrame.reset();
  }
@@ -91,6 +243,35 @@ index a3bcb63..3a1c99d 100644
 +	double s_hitchAvgFrameUs = 0.0;
 +	sint32 s_hitchLogBudget = 400;
 +	sint32 s_hitchSummaryBudget = 360; // one hour of 10 second summaries
++	uint32 s_hitchSummaryIndex = 0;
++
++	// audio and emulated CPU numbers for the same 10 second window
++	void _LatteHitch_LogSystemStats(uint64 windowUs)
++	{
++		const double seconds = (double)windowUs / 1000000.0;
++		// audio
++		const snd_core::AXOutStats ax = snd_core::AXOut_TakeStats();
++		const IAudioAPI::OutputStats out = IAudioAPI::TakeTVOutputStats();
++		std::string lowest = out.lowestBufferUs == UINT32_MAX ? std::string("n/a") : fmt::format("{} ms", out.lowestBufferUs / 1000);
++		const double limiterDb = ax.limiterMinGain > 0.0f && ax.limiterMinGain < 1.0f ? 20.0 * std::log10((double)ax.limiterMinGain) : 0.0;
++		cemuLog_log(LogType::Force, "[Audio] last {:.0f} s: mixed {} frames ({} expected) | ran dry {} times ({} ms of silence) | dropped {} blocks | lowest buffer {} | calls from other cores during mixing {} | limiter {:.1f} dB",
++			seconds, ax.framesMixed, (uint64)(seconds * 1000.0 / 3.0), out.underruns, out.silenceUs / 1000, out.droppedBlocks, lowest, ax.callsDuringMix, limiterDb);
++		// emulated CPU: how much of the time each core had work to do
++		uint64 idleUs[3];
++		coreinit::__OSTakeCoreIdleStats(idleUs);
++		auto busyPercent = [&](uint64 idle) {
++			const double idleShare = std::clamp((double)idle / (double)windowUs, 0.0, 1.0);
++			return (uint32)std::lround((1.0 - idleShare) * 100.0);
++		};
++		if (coreinit::__CemuIsMulticoreMode())
++			cemuLog_log(LogType::Force, "[CPU] last {:.0f} s: core 0 busy {}% | core 1 busy {}% | core 2 busy {}%", seconds, busyPercent(idleUs[0]), busyPercent(idleUs[1]), busyPercent(idleUs[2]));
++		else
++			cemuLog_log(LogType::Force, "[CPU] last {:.0f} s: emulated CPU busy {}% (single-core mode)", seconds, busyPercent(idleUs[0]));
++		// the game's threads, twice: once things have started up and once in gameplay
++		s_hitchSummaryIndex++;
++		if (s_hitchSummaryIndex == 3 || s_hitchSummaryIndex == 12)
++			coreinit::__OSLogThreadList(snd_core::AXIst_GetThread());
++	}
 +
 +	const char* const s_hitchNames[kHitchCategories] = {
 +		"waiting for game", "new shaders", "shader compile", "pipelines", "textures",
@@ -196,10 +377,15 @@ index a3bcb63..3a1c99d 100644
 +		if (s_hitchSummaryBudget > 0)
 +		{
 +			s_hitchSummaryBudget--;
-+			cemuLog_log(LogType::Force, "[Perf] last {:.0f} s: {:.1f} fps, {} hitches, {} frames over 50 ms, longest {} ms{}",
++			// time the graphics thread spent doing its own work (everything except waiting for the game, the display or the GPU)
++			const uint64 waitedUs = s_hitchWindow.us[(uint32)LatteHitch::WaitForGame] + s_hitchWindow.us[(uint32)LatteHitch::Present] +
++				s_hitchWindow.us[(uint32)LatteHitch::Fence] + s_hitchWindow.us[(uint32)LatteHitch::GpuWait];
++			const uint64 workUs = windowUs > waitedUs ? windowUs - waitedUs : 0;
++			cemuLog_log(LogType::Force, "[Perf] last {:.0f} s: {:.1f} fps, {} hitches, {} frames over 50 ms, longest {} ms | graphics work {} ms{}",
 +				(double)windowUs / 1000000.0, (double)s_hitchWindow.frames * 1000000.0 / (double)windowUs, s_hitchWindow.hitches,
-+				s_hitchWindow.framesOver50ms, s_hitchWindow.longestFrameUs / 1000,
++				s_hitchWindow.framesOver50ms, s_hitchWindow.longestFrameUs / 1000, workUs / 1000,
 +				_LatteHitch_Describe(s_hitchWindow.us, s_hitchWindow.count, s_hitchWindow.bytesRead, s_hitchWindow.newTextures, 1000));
++			_LatteHitch_LogSystemStats(windowUs);
 +		}
 +		s_hitchWindow = {};
 +		s_hitchWindow.start = now;
@@ -1111,6 +1297,113 @@ index 1429d08..fe27f06 100644
  			if (transferElementSize == 0)
  				return FSA_RESULT::OK;
  
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
+index 7c7571f..cfe9591 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
+@@ -1282,12 +1282,77 @@ namespace coreinit
+ 
+ 	Fiber* g_idleLoopFiber[3]{};
+ 
++	// Cemu LD+: time each emulated core spent with nothing to run, for the performance log
++	static std::atomic<uint64> s_coreIdleUs[3]{};
++
++	static uint64 _CoreIdleNowUs()
++	{
++		return (uint64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++	}
++
++	void __OSTakeCoreIdleStats(uint64 idleUs[3])
++	{
++		for (sint32 i = 0; i < 3; i++)
++			idleUs[i] = s_coreIdleUs[i].exchange(0, std::memory_order_relaxed);
++	}
++
++	// Cemu LD+: logs the game's threads (name, priority, which emulated cores they may run on) to help with performance and audio issues
++	void __OSLogThreadList(const OSThread_t* audioThread)
++	{
++		struct Entry
++		{
++			std::string name;
++			sint32 priority;
++			uint32 affinity;
++			uint8 state;
++			bool isAudio;
++		};
++		std::vector<Entry> entries;
++		__OSLockScheduler();
++		for (sint32 i = 0; i < activeThreadCount && i < 256; i++)
++		{
++			auto thread = reinterpret_cast<OSThread_t*>(memory_getPointerFromVirtualOffset(activeThread[i]));
++			if (!thread)
++				continue;
++			Entry e;
++			const char* name = thread->threadName.GetPtr();
++			if (name)
++			{
++				for (sint32 c = 0; c < 48 && name[c]; c++)
++					e.name.push_back((name[c] >= 0x20 && name[c] < 0x7F) ? name[c] : '?');
++			}
++			if (e.name.empty())
++				e.name = "(no name)";
++			e.priority = (sint32)thread->effectivePriority;
++			e.affinity = (uint32)thread->context.affinity & 7;
++			e.state = (uint8)(OSThread_t::THREAD_STATE)thread->state;
++			e.isAudio = thread == audioThread;
++			entries.emplace_back(std::move(e));
++		}
++		__OSUnlockScheduler();
++		cemuLog_log(LogType::Force, "[Threads] {} game threads (lower priority number = more important)", entries.size());
++		for (auto& e : entries)
++		{
++			std::string cores;
++			for (uint32 c = 0; c < 3; c++)
++			{
++				if ((e.affinity >> c) & 1)
++					cores.append(cores.empty() ? fmt::format("{}", c) : fmt::format("+{}", c));
++			}
++			const char* stateName = e.state == 1 ? "ready" : e.state == 2 ? "running" : e.state == 4 ? "waiting" : e.state == 8 ? "ending" : "stopped";
++			cemuLog_log(LogType::Force, "[Threads] '{}'{} priority {} core {} ({})", e.name, e.isAudio ? " [audio mixer]" : "", e.priority,
++				cores.empty() ? "any" : cores, stateName);
++		}
++	}
++
+ 	// idle fiber per core if no thread is runnable
+ 	// this is necessary since we can't block in __OSThreadSwitchToNext() (__OSStoreThread + thread switch must happen inside same scheduler lock)
+ 	void __OSThreadCoreIdle(void* unusedParam)
+ 	{
+ 		bool isMainCore = g_isMulticoreMode == false || t_assignedCoreIndex == 1;
+ 		sint32 coreIndex = t_assignedCoreIndex;
++		const sint32 statsCoreIndex = std::clamp<sint32>(t_assignedCoreIndex, 0, 2);
++		uint64 idleSince = _CoreIdleNowUs();
+ 		__OSUnlockScheduler();
+ 		while (true)
+ 		{
+@@ -1298,7 +1363,9 @@ namespace coreinit
+ 				if (nextThread)
+ 				{
+ 					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
++					s_coreIdleUs[statsCoreIndex].fetch_add(_CoreIdleNowUs() - idleSince, std::memory_order_relaxed);
+ 					__OSSwitchToThreadFiber(nextThread, coreIndex);
++					idleSince = _CoreIdleNowUs();
+ 				}
+ 				__OSUnlockScheduler();
+ 			}
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
+index 974b52f..572c802 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
+@@ -513,6 +513,10 @@ namespace coreinit
+ 
+ 	bool __CemuIsMulticoreMode();
+ 
++	// Cemu LD+: performance log helpers
++	void __OSTakeCoreIdleStats(uint64 idleUs[3]);
++	void __OSLogThreadList(const OSThread_t* audioThread);
++
+ 	OSThread_t* OSGetDefaultThread(sint32 coreIndex);
+ 	void* OSGetDefaultThreadStack(sint32 coreIndex, uint32& size);
+ 
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 index b23560f..e937d8c 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
@@ -1417,20 +1710,78 @@ index 00ceff9..38a5726 100644
  		std::queue<std::array<uint8, 32>> m_queries;
  	};
 diff --git a/src/Cafe/OS/libs/snd_core/ax.h b/src/Cafe/OS/libs/snd_core/ax.h
-index 0861e6a..a85281f 100644
+index 0861e6a..5448c9d 100644
 --- a/src/Cafe/OS/libs/snd_core/ax.h
 +++ b/src/Cafe/OS/libs/snd_core/ax.h
-@@ -391,6 +391,9 @@ namespace snd_core
+@@ -263,6 +263,9 @@ namespace snd_core
+ 	void AXResetCallbacks();
+ 
+ 	bool AXIst_IsFrameBeingProcessed();
++	// Cemu LD+: true only for the audio thread itself while it mixes a frame (for example inside a game callback)
++	bool AXIst_IsCurrentThreadMixing();
++	uint32 AXIst_TakeCallsDuringMixCount();
+ 
+ 	sint32 AXSetDeviceUpsampleStage(sint32 device, int upsampleStage);
+ 	sint32 AXGetDeviceUpsampleStage(sint32 device, uint32be* upsampleStage);
+@@ -391,6 +394,18 @@ namespace snd_core
  	void AXOut_reset();
  	void AXOut_update();
  
 +	// extra loudness for the TV output, in dB (0 = off), with a soft limiter so peaks don't crackle
 +	void AXOut_SetVolumeBoostDb(sint32 db);
 +
++	// Cemu LD+: audio numbers for the performance log (each call returns what happened since the previous call)
++	struct AXOutStats
++	{
++		uint32 framesMixed; // 3 ms frames, about 3333 per 10 seconds when audio keeps up
++		uint32 callsDuringMix; // voice protection calls from other cores while a frame was being mixed
++		float limiterMinGain; // 1.0 = the output limiter never had to turn the sound down
++	};
++	AXOutStats AXOut_TakeStats();
++
  	COSModule* GetModuleSndCore1();
  	COSModule* GetModuleSndCore2();
  }
 \ No newline at end of file
+diff --git a/src/Cafe/OS/libs/snd_core/ax_ist.cpp b/src/Cafe/OS/libs/snd_core/ax_ist.cpp
+index 9be0c40..91cd73b 100644
+--- a/src/Cafe/OS/libs/snd_core/ax_ist.cpp
++++ b/src/Cafe/OS/libs/snd_core/ax_ist.cpp
+@@ -606,6 +606,7 @@ namespace snd_core
+ 			internalVPB->src.historySamples[2] = internalShadowCopy->src.historySamples[2];
+ 			internalVPB->src.historySamples[3] = internalShadowCopy->src.historySamples[3];
+ 		}
++		std::atomic_thread_fence(std::memory_order_seq_cst); // Cemu LD+: see protection changes made on other cores
+ 		if (AXVoiceProtection_IsProtectedByAnyThread(vpb))
+ 		{
+ 			// if voice is currently protected, dont sync remaining flags
+@@ -1070,4 +1071,26 @@ namespace snd_core
+ 	{
+ 		return __AXIstIsProcessingFrame.load();
+ 	}
++
++	static std::atomic<uint32> s_callsDuringMix{0};
++
++	// Cemu LD+: the voice protection calls (AXUserBegin/End, AXVoiceBegin/End) used to refuse with -2 whenever a frame was
++	// being mixed. That is meant for calls made from the mixing itself (the game's audio callbacks). In multi-core mode the
++	// game's sound code runs on another core at the same time as the mixing, so its calls were refused at random: protection
++	// counts went out of step, voices stayed marked as protected and their changes (volume, offsets, start/stop) didn't
++	// reach the mixer, which made the sound crunchy. Now only the audio thread itself is refused.
++	bool AXIst_IsCurrentThreadMixing()
++	{
++		if (!__AXIstIsProcessingFrame.load())
++			return false;
++		if (coreinit::OSGetCurrentThread() == __AXIstThread.GetPtr())
++			return true;
++		s_callsDuringMix.fetch_add(1, std::memory_order_relaxed);
++		return false;
++	}
++
++	uint32 AXIst_TakeCallsDuringMixCount()
++	{
++		return s_callsDuringMix.exchange(0, std::memory_order_relaxed);
++	}
+ }
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 index 31a24a4..f94364d 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
@@ -1466,10 +1817,10 @@ index 31a24a4..f94364d 100644
  
  	// mix audio generated from voice into main bus and aux buses
 diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-index 6cb1599..23f8074 100644
+index 6cb1599..36f2de0 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-@@ -216,86 +216,173 @@ namespace snd_core
+@@ -216,86 +216,202 @@ namespace snd_core
  		return nullptr;
  	}
  
@@ -1517,6 +1868,7 @@ index 6cb1599..23f8074 100644
 +				m_envelopeSum += m_envelope - m_envelopeHistory[m_pos];
 +				m_envelopeHistory[m_pos] = m_envelope;
 +				const float gain = std::min(1.0f, (float)(m_envelopeSum / kLookahead));
++				m_minGain = std::min(m_minGain, gain);
 +				const sint32 oldest = (m_pos + 1) % kLookahead;
 +				for (sint32 c = 0; c < channelCount; c++)
 +				{
@@ -1529,6 +1881,14 @@ index 6cb1599..23f8074 100644
 +			m_envelopeSum = 0.0;
 +			for (sint32 k = 0; k < kLookahead; k++)
 +				m_envelopeSum += m_envelopeHistory[k];
++		}
++
++		// lowest gain used since the last call (1.0 = the limiter didn't need to turn anything down)
++		float TakeMinGain()
++		{
++			float g = m_minGain;
++			m_minGain = 1.0f;
++			return g;
 +		}
 +
 +	  private:
@@ -1550,10 +1910,24 @@ index 6cb1599..23f8074 100644
 +		std::array<float, kLookahead> m_envelopeHistory{};
 +		double m_envelopeSum{0.0};
 +		float m_envelope{1.0f};
++		float m_minGain{1.0f};
 +		sint32 m_pos{0};
 +	};
 +
 +	static TVOutputLimiter s_tvLimiter;
++	static std::atomic<float> s_limiterMinGain{1.0f}; // lowest limiter gain since the last stats report
++
++	AXOutStats AXOut_TakeStats()
++	{
++		static uint32 s_lastProcessedFrames = 0;
++		AXOutStats stats{};
++		const uint32 processed = numProcessedFrames;
++		stats.framesMixed = processed >= s_lastProcessedFrames ? processed - s_lastProcessedFrames : processed;
++		s_lastProcessedFrames = processed;
++		stats.callsDuringMix = AXIst_TakeCallsDuringMixCount();
++		stats.limiterMinGain = s_limiterMinGain.exchange(1.0f);
++		return stats;
++	}
 +
 +	static inline sint16 _AXOutFloatToSample(float v)
 +	{
@@ -1573,14 +1947,6 @@ index 6cb1599..23f8074 100644
 +		else if (__AXMode[AX_DEV_TV] == AX_MODE_MONO)
 +			channelCount = 1;
 +		else
-+		{
-+			assert_dbg();
-+			return;
-+		}
-+		// planar float copy of the mix with the boost applied, then the limiter
-+		static float s_planar[TVOutputLimiter::kMaxChannels][AX_SAMPLES_PER_3MS_48KHZ];
-+		float* planar[TVOutputLimiter::kMaxChannels];
-+		for (sint32 c = 0; c < channelCount; c++)
  		{
 -			sint32* inputChannel0 = __AXTVBuffer48.GetPtr() + numSamples * 0;
 -			sint32* inputChannel1 = __AXTVBuffer48.GetPtr() + numSamples * 1;
@@ -1588,12 +1954,26 @@ index 6cb1599..23f8074 100644
 -			sint32* inputChannel3 = __AXTVBuffer48.GetPtr() + numSamples * 3;
 -			sint32* inputChannel4 = __AXTVBuffer48.GetPtr() + numSamples * 4;
 -			sint32* inputChannel5 = __AXTVBuffer48.GetPtr() + numSamples * 5;
++			assert_dbg();
++			return;
++		}
++		// planar float copy of the mix with the boost applied, then the limiter
++		static float s_planar[TVOutputLimiter::kMaxChannels][AX_SAMPLES_PER_3MS_48KHZ];
++		float* planar[TVOutputLimiter::kMaxChannels];
++		for (sint32 c = 0; c < channelCount; c++)
++		{
 +			const sint32* input = __AXTVBuffer48.GetPtr() + AIGetSamplesPerChannel(AX_DEV_TV) * c;
 +			for (sint32 i = 0; i < numSamples; i++)
 +				s_planar[c][i] = (float)_swapEndianS32(input[i]) * boostGain;
 +			planar[c] = s_planar[c];
 +		}
 +		s_tvLimiter.Process(planar, channelCount, numSamples);
++		{
++			const float frameMin = s_tvLimiter.TakeMinGain();
++			float current = s_limiterMinGain.load(std::memory_order_relaxed);
++			while (frameMin < current && !s_limiterMinGain.compare_exchange_weak(current, frameMin, std::memory_order_relaxed))
++				;
++		}
 +
 +		if (channelCount == 6)
 +		{
@@ -1696,6 +2076,92 @@ index 6cb1599..23f8074 100644
  	}
  
  	void AIInitDRCDMA(sint16* sampleData, sint32 size)
+diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
+index d4e562e..3f225ff 100644
+--- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
++++ b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
+@@ -117,7 +117,7 @@ namespace snd_core
+ 		// to prevent this from happening we extend the current thread's quantum while the protection is raised
+ 		PPCCore_boostQuantum(10000);
+ 
+-		if (AXIst_IsFrameBeingProcessed())
++		if (AXIst_IsCurrentThreadMixing())
+ 		{
+ 			return -2;
+ 		}
+@@ -128,6 +128,7 @@ namespace snd_core
+ 			{
+ 				sint32 newCount = __AXUserProtectionArray[i].count + 1;
+ 				__AXUserProtectionArray[i].count = newCount;
++				std::atomic_thread_fence(std::memory_order_seq_cst);
+ 				return newCount;
+ 			}
+ 		}
+@@ -144,13 +145,14 @@ namespace snd_core
+ 		__AXUserProtectionArray[entryIndex].threadMPTR = currentThreadMPTR;
+ 		__AXUserProtectionArray[entryIndex].count = 1;
+ 		__AXUserProtectionArraySize++;
++		std::atomic_thread_fence(std::memory_order_seq_cst);
+ 		return 1;
+ 	}
+ 
+ 	sint32 AXUserEnd()
+ 	{
+ 		PPCCore_deboostQuantum(10000);
+-		if (AXIst_IsFrameBeingProcessed())
++		if (AXIst_IsCurrentThreadMixing())
+ 			return -2;
+ 		MPTR currentThreadMPTR = memory_getVirtualOffsetFromPointer(coreinit::OSGetCurrentThread());
+ 		for (sint32 i = __AXUserProtectionArraySize - 1; i >= 0; i--)
+@@ -204,7 +206,7 @@ namespace snd_core
+ 	{
+ 		sint32 index = vpb->index;
+ 		bool isProtected = false;
+-		if (AXIst_IsFrameBeingProcessed())
++		if (AXIst_IsCurrentThreadMixing())
+ 			isProtected = __AXVoiceProtection[index].threadMPTR != MPTR_NULL;
+ 		else
+ 			isProtected = __AXVoiceProtection[index].threadMPTR != memory_getVirtualOffsetFromPointer(coreinit::OSGetCurrentThread());
+@@ -216,12 +218,13 @@ namespace snd_core
+ 		sint32 index = vpb->index;
+ 		if (AXUserIsProtected() == false)
+ 			return;
+-		if (AXIst_IsFrameBeingProcessed())
++		if (AXIst_IsCurrentThreadMixing())
+ 			return;
+ 		if (__AXVoiceProtection[index].threadMPTR == MPTR_NULL)
+ 		{
+ 			__AXVoiceProtection[index].threadMPTR = memory_getVirtualOffsetFromPointer(coreinit::OSGetCurrentThread());
+ 			// does not set count?
++			std::atomic_thread_fence(std::memory_order_seq_cst);
+ 		}
+ 	}
+ 
+@@ -245,13 +248,14 @@ namespace snd_core
+ 			cemuLog_log(LogType::Force, "AXVoiceBegin(): Invalid voice index");
+ 			return -1;
+ 		}
+-		if (AXIst_IsFrameBeingProcessed())
++		if (AXIst_IsCurrentThreadMixing())
+ 			return -2;
+ 		MPTR currentThreadMPTR = memory_getVirtualOffsetFromPointer(coreinit::OSGetCurrentThread());
+ 		if (__AXVoiceProtection[index].threadMPTR == MPTR_NULL)
+ 		{
+ 			__AXVoiceProtection[index].threadMPTR = currentThreadMPTR;
+ 			__AXVoiceProtection[index].count = 1;
++			std::atomic_thread_fence(std::memory_order_seq_cst);
+ 			return 1;
+ 		}
+ 		else if (__AXVoiceProtection[index].threadMPTR == currentThreadMPTR)
+@@ -285,7 +289,7 @@ namespace snd_core
+ 			cemuLog_log(LogType::Force, "AXVoiceBegin(): Invalid voice index");
+ 			return -1;
+ 		}
+-		if (AXIst_IsFrameBeingProcessed())
++		if (AXIst_IsCurrentThreadMixing())
+ 			return -2;
+ 		MPTR currentThreadMPTR = memory_getVirtualOffsetFromPointer(coreinit::OSGetCurrentThread());
+ 		if (__AXVoiceProtection[index].threadMPTR == currentThreadMPTR)
 diff --git a/src/Cafe/OS/libs/snd_user/snd_user.cpp b/src/Cafe/OS/libs/snd_user/snd_user.cpp
 index 58e8f4b..6c806fa 100644
 --- a/src/Cafe/OS/libs/snd_user/snd_user.cpp
@@ -5458,3 +5924,132 @@ index 053d3be..71202a3 100644
      <string name="cemu_original_authors" translatable="false">Exzap, Petergov</string>
      <string name="cemu_website" translatable="false">https://cemu.info</string>
      <string name="cemu_online_guide" translatable="false">https://cemu.info/online-guide</string>
+diff --git a/src/audio/CubebAPI.cpp b/src/audio/CubebAPI.cpp
+index f6d5d51..0a5198d 100644
+--- a/src/audio/CubebAPI.cpp
++++ b/src/audio/CubebAPI.cpp
+@@ -39,14 +39,19 @@ long CubebAPI::data_cb(cubeb_stream* stream, void* user, const void* inputbuffer
+ 	const auto size = (size_t)nframes * thisptr->m_channels * (thisptr->m_bitsPerSample/8);
+ 
+ 	std::unique_lock lock(thisptr->m_mutex);
++	thisptr->StatsCountBufferLevel(thisptr->m_buffer.size());
+ 	if (thisptr->m_buffer.empty())
+ 	{
+ 		// we got no data, just write silence
+ 		memset(outputbuffer, 0x00, size);
++		if (thisptr->m_is_playing)
++			thisptr->StatsCountUnderrun(size);
+ 	}
+ 	else
+ 	{
+ 		const auto copied = std::min(thisptr->m_buffer.size(), size);
++		if (copied < size)
++			thisptr->StatsCountUnderrun(size - copied);
+ 		memcpy(outputbuffer, thisptr->m_buffer.data(), copied);
+ 		thisptr->m_buffer.erase(thisptr->m_buffer.begin(), std::next(thisptr->m_buffer.begin(), copied));
+ 		lock.unlock();
+@@ -123,6 +128,7 @@ bool CubebAPI::FeedBlock(sint16* data)
+ 	if (m_buffer.capacity() <= m_buffer.size() + m_bytesPerBlock)
+ 	{
+ 		cemuLog_logDebug(LogType::Force, "dropped direct sound block since too many buffers are queued");
++		StatsCountDroppedBlock();
+ 		return false;
+ 	}
+ 
+diff --git a/src/audio/IAudioAPI.cpp b/src/audio/IAudioAPI.cpp
+index 05b9ac1..d11db55 100644
+--- a/src/audio/IAudioAPI.cpp
++++ b/src/audio/IAudioAPI.cpp
+@@ -129,6 +129,7 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
+ 
+ 	audioAPIDev = CreateDevice(audio_api, device_description, rate, channels, samples_per_block, bits_per_sample);
+ 	audioAPIDev->SetVolume(GetVolumeFromType(type));
++	audioAPIDev->m_countStats = (type == TV);
+ 
+ 	return audioAPIDev;
+ }
+@@ -206,6 +207,50 @@ void IAudioAPI::SetAudioDelayOverride(uint32 delay)
+ 	m_audioDelayOverride = delay;
+ }
+ 
++namespace
++{
++	std::atomic<uint64> s_statUnderruns{0};
++	std::atomic<uint64> s_statSilenceUs{0};
++	std::atomic<uint64> s_statDroppedBlocks{0};
++	std::atomic<uint32> s_statLowestBufferUs{UINT32_MAX};
++}
++
++void IAudioAPI::StatsCountBufferLevel(size_t bufferedBytes)
++{
++	if (!m_countStats || m_samplerate == 0 || m_channels == 0 || m_bitsPerSample < 8)
++		return;
++	const uint64 frames = bufferedBytes / (m_channels * (m_bitsPerSample / 8));
++	const uint32 us = (uint32)std::min<uint64>(frames * 1000000ull / m_samplerate, UINT32_MAX - 1);
++	uint32 current = s_statLowestBufferUs.load(std::memory_order_relaxed);
++	while (us < current && !s_statLowestBufferUs.compare_exchange_weak(current, us, std::memory_order_relaxed))
++		;
++}
++
++void IAudioAPI::StatsCountUnderrun(size_t missingBytes)
++{
++	if (!m_countStats || m_samplerate == 0 || m_channels == 0 || m_bitsPerSample < 8)
++		return;
++	const uint64 frames = missingBytes / (m_channels * (m_bitsPerSample / 8));
++	s_statUnderruns.fetch_add(1, std::memory_order_relaxed);
++	s_statSilenceUs.fetch_add(frames * 1000000ull / m_samplerate, std::memory_order_relaxed);
++}
++
++void IAudioAPI::StatsCountDroppedBlock()
++{
++	if (m_countStats)
++		s_statDroppedBlocks.fetch_add(1, std::memory_order_relaxed);
++}
++
++IAudioAPI::OutputStats IAudioAPI::TakeTVOutputStats()
++{
++	OutputStats stats{};
++	stats.underruns = s_statUnderruns.exchange(0, std::memory_order_relaxed);
++	stats.silenceUs = s_statSilenceUs.exchange(0, std::memory_order_relaxed);
++	stats.droppedBlocks = s_statDroppedBlocks.exchange(0, std::memory_order_relaxed);
++	stats.lowestBufferUs = s_statLowestBufferUs.exchange(UINT32_MAX, std::memory_order_relaxed);
++	return stats;
++}
++
+ uint32 IAudioAPI::GetAudioDelay() const
+ {
+ 	return m_audioDelayOverride > 0 ? m_audioDelayOverride : s_audioDelay;
+diff --git a/src/audio/IAudioAPI.h b/src/audio/IAudioAPI.h
+index 40e42e0..2aa9eac 100644
+--- a/src/audio/IAudioAPI.h
++++ b/src/audio/IAudioAPI.h
+@@ -72,6 +72,16 @@ public:
+ 	static std::unique_ptr<IAudioAPI> CreateDeviceFromConfig(AudioType type, sint32 rate, sint32 samples_per_block, sint32 bits_per_sample);
+ 	static std::unique_ptr<IAudioAPI> CreateDeviceFromConfig(AudioType type, sint32 rate, sint32 channels, sint32 samples_per_block, sint32 bits_per_sample);
+ 	static std::unique_ptr<IAudioAPI> CreateDevice(AudioAPI api, const DeviceDescriptionPtr& device, sint32 samplerate, sint32 channels, sint32 samples_per_block, sint32 bits_per_sample);
++
++	// Cemu LD+: health of the TV sound output for the performance log (each call returns what happened since the previous call)
++	struct OutputStats
++	{
++		uint64 underruns; // times the speaker asked for sound and the buffer ran short
++		uint64 silenceUs; // how much silence was played because of that
++		uint64 droppedBlocks; // blocks thrown away because the buffer was full
++		uint32 lowestBufferUs; // lowest amount of buffered sound seen (UINT32_MAX if no data)
++	};
++	static OutputStats TakeTVOutputStats();
+ 	static std::vector<DeviceDescriptionPtr> GetDevices(AudioAPI api);
+ 
+ protected:
+@@ -88,6 +98,12 @@ protected:
+ 	static std::array<bool, AudioAPIEnd> s_availableApis;
+ 	uint32 m_audioDelayOverride = 0;
+ 
++	// Cemu LD+: output health counters (only the TV device counts)
++	bool m_countStats = false;
++	void StatsCountBufferLevel(size_t bufferedBytes);
++	void StatsCountUnderrun(size_t missingBytes);
++	void StatsCountDroppedBlock();
++
+ private:
+ 	static uint32 s_audioDelay;
+ 	void InitWFX(sint32 samplerate, sint32 channels, sint32 bits_per_sample);

@@ -155,7 +155,10 @@ Open an [Issue](../../issues) with:
 
 **Reporting stutter:** play a few minutes where it happens, then share the log. From build 24 the log lists every
 slow frame (`[Hitch]`) and a summary every 10 seconds (`[Perf]`) with what that time was spent on: waiting for the game,
-new shaders, textures, the GPU, reading game files and so on. That shows where the stutter comes from.
+new shaders, textures, the GPU, reading game files and so on. That shows where the stutter comes from. From build 25 each
+summary is followed by an `[Audio]` line (whether the sound output ran dry or had to be turned down) and a `[CPU]` line
+(how busy each emulated Wii U CPU core was), and the game's threads are listed once after about 30 seconds and again
+after 2 minutes.
 
 ## What the fix changes (technical)
 
@@ -187,6 +190,20 @@ threads at lower priority so they don't take CPU time from the game, but on Andr
 competed with the game for the fast cores, so the frame rate dropped whenever many new shaders were built at once
 (new areas, open worlds). Cemu LD+ now lowers their priority on Android too. Objects built in the background can take
 a moment longer to appear the first time, but the game itself keeps running smoothly.
+
+### Multi-core fixes (build 25 and later)
+
+Two problems that only show up with **CPU mode: Multi-core recompiler**, where the three emulated Wii U CPU cores run
+on separate threads at the same time:
+
+- **Crunchy sound.** The game's sound code protects a voice while it changes several of its settings, so the audio
+  mixer never picks up half the changes. Cemu refused that protection whenever the mixer was working on a frame, which
+  is meant only for calls made from inside the mixer. With multi-core, the game's sound code runs on another core at
+  the same time as the mixer, so its calls were refused at random. Protection counts went out of step and voices kept
+  their old volume, position or state. Now only calls from the mixer itself are refused.
+- **Memory order on ARM.** Games use `sync`/`lwsync` instructions to make sure data written on one core is complete
+  before another core reads it. On a PC the processor keeps that order anyway, so Cemu skips those instructions. ARM
+  processors can reorder memory accesses, so in multi-core mode Cemu LD+ now turns them into real memory barriers.
 
 ### Vehicle tags (build 17 and later)
 
