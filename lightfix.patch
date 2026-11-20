@@ -1,5 +1,303 @@
+diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
+index 963c49f..ec07b2b 100644
+--- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
+@@ -142,12 +142,19 @@ void LatteCP_signalEnterWait()
+ */
+ uint32 LatteCP_readU32Deprc()
+ {
++	uint64 hitchWaitStart = 0; // Cemu LD+: time spent waiting for commands from the game
+ 	// no display list active
+ 	while (true)
+ 	{
+ 		uint32 cmdWord;
+ 		if ( TCL::TCLGPUReadRBWord(cmdWord) )
++		{
++			if (hitchWaitStart != 0)
++				LatteHitch_Add(LatteHitch::WaitForGame, LatteHitch_NowUs() - hitchWaitStart);
+ 			return cmdWord;
++		}
++		if (hitchWaitStart == 0)
++			hitchWaitStart = LatteHitch_NowUs();
+ 
+ 		g_renderer->NotifyLatteCommandProcessorIdle(); // let the renderer know in case it wants to flush any commands
+ 		performanceMonitor.gpuTime_idleTime.beginMeasuring();
+@@ -159,7 +166,10 @@ uint32 LatteCP_readU32Deprc()
+ 		LatteThread_HandleOSScreen(); // check if new frame was presented via OSScreen API
+ 
+ 		if ( TCL::TCLGPUReadRBWord(cmdWord) )
++		{
++			LatteHitch_Add(LatteHitch::WaitForGame, LatteHitch_NowUs() - hitchWaitStart);
+ 			return cmdWord;
++		}
+ 		if (Latte_GetStopSignal())
+ 			LatteThread_Exit();
+ 
+@@ -423,6 +433,7 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
+ 	{
+ 		// wait for memory address
+ 		performanceMonitor.gpuTime_fenceTime.beginMeasuring();
++		LatteHitchScope hitchScope(LatteHitch::Fence);
+ 		while (true)
+ 		{
+ 			uint32 fenceMemValue = _swapEndianU32(*fencePtr);
+@@ -905,6 +916,7 @@ LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
+ 	cemu_assert_debug(nWords == 1);
+ 	MPTR reserved1 = LatteReadCMD(); // reserved
+ 	// wait for flip
++	LatteHitchScope hitchScope(LatteHitch::Present);
+ 	uint32 currentFlipCount = LatteGPUState.flipCounter;
+ 	while (true)
+ 	{
+diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
+index a3bcb63..3a1c99d 100644
+--- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
++++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
+@@ -121,3 +121,151 @@ void LattePerformanceMonitor_frameBegin()
+ 	performanceMonitor.vk.numDrawBarriersPerFrame.reset();
+ 	performanceMonitor.vk.numBeginRenderpassPerFrame.reset();
+ }
++
++// ---- Cemu LD+ hitch monitor ----
++
++namespace
++{
++	constexpr uint32 kHitchCategories = (uint32)LatteHitch::Count;
++
++	// what happened since the last frame (some categories are added from other threads)
++	struct
++	{
++		std::atomic<uint64> us[kHitchCategories]{};
++		std::atomic<uint32> count[kHitchCategories]{};
++		std::atomic<uint64> bytesRead{};
++		std::atomic<uint32> newTextures{};
++	} s_hitchFrame;
++
++	// totals for the current 10 second window (render thread only)
++	struct
++	{
++		uint64 start{};
++		uint32 frames{};
++		uint32 hitches{};
++		uint32 framesOver50ms{};
++		uint64 longestFrameUs{};
++		uint64 us[kHitchCategories]{};
++		uint32 count[kHitchCategories]{};
++		uint64 bytesRead{};
++		uint32 newTextures{};
++	} s_hitchWindow;
++
++	uint64 s_hitchLastFrameEnd = 0;
++	double s_hitchAvgFrameUs = 0.0;
++	sint32 s_hitchLogBudget = 400;
++	sint32 s_hitchSummaryBudget = 360; // one hour of 10 second summaries
++
++	const char* const s_hitchNames[kHitchCategories] = {
++		"waiting for game", "new shaders", "shader compile", "pipelines", "textures",
++		"readback", "fences", "GPU busy", "present", "disc reads"};
++	// categories where the number of events is worth showing
++	const bool s_hitchShowCount[kHitchCategories] = {false, true, true, true, true, true, false, false, false, false};
++
++	std::string _LatteHitch_Describe(const uint64* us, const uint32* count, uint64 bytesRead, uint32 newTextures, uint64 minUs)
++	{
++		std::string text;
++		for (uint32 i = 0; i < kHitchCategories; i++)
++		{
++			const bool counted = s_hitchShowCount[i] && count[i] > 0;
++			if (us[i] < minUs && !counted)
++				continue;
++			text.append(fmt::format(" | {}", s_hitchNames[i]));
++			if (counted)
++				text.append(fmt::format(" x{}", count[i]));
++			text.append(fmt::format(" {} ms", us[i] / 1000));
++			if (i == (uint32)LatteHitch::DiscRead && bytesRead > 0)
++				text.append(fmt::format(" ({:.1f} MB)", (double)bytesRead / (1024.0 * 1024.0)));
++		}
++		if (newTextures > 0)
++			text.append(fmt::format(" | new textures {}", newTextures));
++		return text;
++	}
++}
++
++uint64 LatteHitch_NowUs()
++{
++	return (uint64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++void LatteHitch_Add(LatteHitch category, uint64 microseconds)
++{
++	const uint32 i = (uint32)category;
++	if (i >= kHitchCategories)
++		return;
++	s_hitchFrame.us[i].fetch_add(microseconds, std::memory_order_relaxed);
++	s_hitchFrame.count[i].fetch_add(1, std::memory_order_relaxed);
++}
++
++void LatteHitch_AddBytesRead(uint64 bytes)
++{
++	s_hitchFrame.bytesRead.fetch_add(bytes, std::memory_order_relaxed);
++}
++
++void LatteHitch_CountNewTexture()
++{
++	s_hitchFrame.newTextures.fetch_add(1, std::memory_order_relaxed);
++}
++
++void LatteHitch_FrameEnd()
++{
++	const uint64 now = LatteHitch_NowUs();
++	uint64 us[kHitchCategories];
++	uint32 count[kHitchCategories];
++	for (uint32 i = 0; i < kHitchCategories; i++)
++	{
++		us[i] = s_hitchFrame.us[i].exchange(0, std::memory_order_relaxed);
++		count[i] = s_hitchFrame.count[i].exchange(0, std::memory_order_relaxed);
++	}
++	const uint64 bytesRead = s_hitchFrame.bytesRead.exchange(0, std::memory_order_relaxed);
++	const uint32 newTextures = s_hitchFrame.newTextures.exchange(0, std::memory_order_relaxed);
++	if (s_hitchLastFrameEnd == 0)
++	{
++		s_hitchLastFrameEnd = now;
++		s_hitchWindow.start = now;
++		return;
++	}
++	const uint64 frameUs = now - s_hitchLastFrameEnd;
++	s_hitchLastFrameEnd = now;
++
++	// a hitch is a frame that took much longer than usual (and long enough to notice)
++	const bool isHitch = s_hitchAvgFrameUs > 0.0 && frameUs > 34000 && (double)frameUs > s_hitchAvgFrameUs * 2.0;
++	if (frameUs < 1000000) // ignore pauses and loading screens for the average
++		s_hitchAvgFrameUs = s_hitchAvgFrameUs == 0.0 ? (double)frameUs : s_hitchAvgFrameUs * 0.95 + (double)frameUs * 0.05;
++
++	if (isHitch && s_hitchLogBudget > 0)
++	{
++		s_hitchLogBudget--;
++		cemuLog_log(LogType::Force, "[Hitch] {} ms frame (usual {} ms){}", frameUs / 1000, (uint64)(s_hitchAvgFrameUs / 1000.0),
++			_LatteHitch_Describe(us, count, bytesRead, newTextures, 1000));
++	}
++
++	s_hitchWindow.frames++;
++	if (isHitch)
++		s_hitchWindow.hitches++;
++	if (frameUs > 50000)
++		s_hitchWindow.framesOver50ms++;
++	s_hitchWindow.longestFrameUs = std::max(s_hitchWindow.longestFrameUs, frameUs);
++	for (uint32 i = 0; i < kHitchCategories; i++)
++	{
++		s_hitchWindow.us[i] += us[i];
++		s_hitchWindow.count[i] += count[i];
++	}
++	s_hitchWindow.bytesRead += bytesRead;
++	s_hitchWindow.newTextures += newTextures;
++
++	const uint64 windowUs = now - s_hitchWindow.start;
++	if (windowUs >= 10000000)
++	{
++		if (s_hitchSummaryBudget > 0)
++		{
++			s_hitchSummaryBudget--;
++			cemuLog_log(LogType::Force, "[Perf] last {:.0f} s: {:.1f} fps, {} hitches, {} frames over 50 ms, longest {} ms{}",
++				(double)windowUs / 1000000.0, (double)s_hitchWindow.frames * 1000000.0 / (double)windowUs, s_hitchWindow.hitches,
++				s_hitchWindow.framesOver50ms, s_hitchWindow.longestFrameUs / 1000,
++				_LatteHitch_Describe(s_hitchWindow.us, s_hitchWindow.count, s_hitchWindow.bytesRead, s_hitchWindow.newTextures, 1000));
++		}
++		s_hitchWindow = {};
++		s_hitchWindow.start = now;
++	}
++}
+diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
+index dbc3cff..6745b97 100644
+--- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
++++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
+@@ -145,5 +145,40 @@ extern performanceMonitor_t performanceMonitor;
+ void LattePerformanceMonitor_frameEnd();
+ void LattePerformanceMonitor_frameBegin();
+ 
++// Cemu LD+: hitch monitor. Times what each frame spends its time on and writes slow frames ("hitches") and a summary
++// every 10 seconds to the log, so stutter can be traced to its cause.
++enum class LatteHitch : uint32
++{
++	WaitForGame,   // render thread had no new commands from the emulated CPU (the game itself was busy)
++	ShaderCreate,  // translating new shaders
++	ShaderCompile, // compiling a shader on the render thread because it was needed right away
++	PipelineSync,  // building a pipeline on the render thread
++	TextureUpload, // decoding and uploading texture data from game memory
++	Readback,      // copying rendered textures back for the game, and waiting for that
++	Fence,         // command processor waiting for a memory fence or semaphore
++	GpuWait,       // waiting for the GPU to finish earlier work
++	Present,       // showing the frame (swapchain, vsync, waiting for flip)
++	DiscRead,      // reading game files (any thread)
++	Count
++};
++uint64 LatteHitch_NowUs();
++void LatteHitch_Add(LatteHitch category, uint64 microseconds);
++void LatteHitch_AddBytesRead(uint64 bytes);
++void LatteHitch_CountNewTexture();
++void LatteHitch_FrameEnd();
++
++class LatteHitchScope
++{
++  public:
++	explicit LatteHitchScope(LatteHitch category) : m_category(category), m_start(LatteHitch_NowUs()) {}
++	~LatteHitchScope() { LatteHitch_Add(m_category, LatteHitch_NowUs() - m_start); }
++	LatteHitchScope(const LatteHitchScope&) = delete;
++	LatteHitchScope& operator=(const LatteHitchScope&) = delete;
++
++  private:
++	LatteHitch m_category;
++	uint64 m_start;
++};
++
+ #define beginPerfMonProfiling(__obj) if( THasProfiling ) __obj.beginMeasuring()
+ #define endPerfMonProfiling(__obj) if( THasProfiling ) __obj.endMeasuring()
+\ No newline at end of file
+diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
+index 18a2f2f..0d3b014 100644
+--- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
+@@ -688,7 +688,11 @@ void LatteRenderTarget_itHLESwapScanBuffer()
+ 		performanceMonitor.gpuTime_frameTime.endMeasuring();
+ 	LattePerformanceMonitor_frameEnd();
+ 	LatteGPUState.frameCounter++;
+-	g_renderer->SwapBuffers(true, true);
++	{
++		LatteHitchScope hitchScope(LatteHitch::Present);
++		g_renderer->SwapBuffers(true, true);
++	}
++	LatteHitch_FrameEnd();
+ 
+ 	catchOpenGLError();
+ 	performanceMonitor.gpuTime_frameTime.beginMeasuring();
+diff --git a/src/Cafe/HW/Latte/Core/LatteShader.cpp b/src/Cafe/HW/Latte/Core/LatteShader.cpp
+index 91de631..48e2eb1 100644
+--- a/src/Cafe/HW/Latte/Core/LatteShader.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteShader.cpp
+@@ -823,6 +823,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableVertexShader2(uint64 baseHash
+ // compile new vertex shader (relies partially on current state)
+ LatteDecompilerShader* LatteShader_CompileSeparableVertexShader(uint64 baseHash, uint64& vsAuxHash, uint8* vertexShaderPtr, uint32 vertexShaderSize, bool usesGeometryShader, LatteFetchShader* fetchShader)
+ {
++	LatteHitchScope hitchScope(LatteHitch::ShaderCreate);
+ 	// new decompiler test
+ 	//LatteShader_CompileSeparableVertexShader2(baseHash, vsAuxHash, vertexShaderPtr, vertexShaderSize, usesGeometryShader, fetchShader);
+ 
+@@ -858,6 +859,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableVertexShader(uint64 baseHash,
+ 
+ LatteDecompilerShader* LatteShader_CompileSeparableGeometryShader(uint64 baseHash, uint8* geometryShaderPtr, uint32 geometryShaderSize, uint8* geometryCopyShader, uint32 geometryCopyShaderSize)
+ {
++	LatteHitchScope hitchScope(LatteHitch::ShaderCreate);
+ 	LatteDecompilerOptions options;
+ 	LatteShader_GetDecompilerOptions(options, LatteConst::ShaderType::Geometry, true);
+ 
+@@ -887,6 +889,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableGeometryShader(uint64 baseHas
+ 
+ LatteDecompilerShader* LatteShader_CompileSeparablePixelShader(uint64 baseHash, uint64& psAuxHash, uint8* pixelShaderPtr, uint32 pixelShaderSize, bool usesGeometryShader)
+ {
++	LatteHitchScope hitchScope(LatteHitch::ShaderCreate);
+ 	LatteDecompilerOptions options;
+ 	LatteShader_GetDecompilerOptions(options, LatteConst::ShaderType::Pixel, usesGeometryShader);
+ 
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 4445fb26..5c09567c 100644
+index 4445fb2..d207809 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 @@ -7,6 +7,7 @@
@@ -459,7 +757,15 @@ index 4445fb26..5c09567c 100644
  						}
  					}
  				}
-@@ -1303,6 +1720,10 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+@@ -1216,6 +1633,7 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+ 	Latte::E_HWTILEMODE tileMode, bool isDepth)
+ {
+ 	_AddTextureToGlobalList(this);
++	LatteHitch_CountNewTexture();
+ 	if (depth < 1)
+ 		depth = 1;
+ 	// setup texture object
+@@ -1303,6 +1721,10 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
  			}
  		}
  	}
@@ -471,7 +777,7 @@ index 4445fb26..5c09567c 100644
  	if (this->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
  	{
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.h b/src/Cafe/HW/Latte/Core/LatteTexture.h
-index 6c09e840..9d95036f 100644
+index 6c09e84..9d95036 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.h
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.h
 @@ -273,6 +273,11 @@ struct LatteTextureRelation
@@ -486,8 +792,47 @@ index 6c09e840..9d95036f 100644
  };
  
  // used if external modules want to retrieve texture cache information
+diff --git a/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp b/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp
+index 589b3bd..dfb56e4 100644
+--- a/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp
+@@ -1,3 +1,4 @@
++#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
+ #include "Cafe/HW/Latte/Renderer/Renderer.h"
+ #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
+ #include "config/ActiveSettings.h"
+@@ -591,6 +592,7 @@ void LatteTextureLoader_loadTextureDataIntoSlice(LatteTexture* hostTexture, sint
+ 
+ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIndex, uint32 mipIndex, MPTR physImagePtr, MPTR physMipPtr, Latte::E_DIM dim, uint32 width, uint32 height, uint32 depth, uint32 mipLevels, uint32 pitch, Latte::E_HWTILEMODE tileMode, uint32 swizzle, bool dumpTex)
+ {
++	LatteHitchScope hitchScope(LatteHitch::TextureUpload);
+ 	LatteTextureLoaderCtx textureLoader = { 0 };
+ 
+ 	Latte::E_GX2SURFFMT format = tex->format;
+diff --git a/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp b/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp
+index 8df5dce..1b0703f 100644
+--- a/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp
+@@ -78,6 +78,7 @@ void LatteTextureReadback_NotifyTextureDeletion(LatteTexture* texture)
+ 
+ void LatteTextureReadback_Initate(LatteTextureView* textureView)
+ {
++	LatteHitch_Add(LatteHitch::Readback, 0); // counts readbacks
+ 	// currently we don't support readback for resized textures
+ 	if (textureView->baseTexture->overwriteInfo.hasResolutionOverwrite)
+ 	{
+@@ -104,6 +105,9 @@ void LatteTextureReadback_Initate(LatteTextureView* textureView)
+ 
+ void LatteTextureReadback_UpdateFinishedTransfers(bool forceFinish)
+ {
++	std::optional<LatteHitchScope> hitchScope;
++	if (forceFinish)
++		hitchScope.emplace(LatteHitch::Readback);
+ 	if (forceFinish)
+ 	{
+ 		// start any delayed transfers
 diff --git a/src/Cafe/HW/Latte/Renderer/Renderer.h b/src/Cafe/HW/Latte/Renderer/Renderer.h
-index 01a6d3b2..61c893d4 100644
+index 01a6d3b..61c893d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Renderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Renderer.h
 @@ -120,6 +120,16 @@ public:
@@ -508,23 +853,24 @@ index 01a6d3b2..61c893d4 100644
  	// buffer cache
  	virtual void bufferCache_init(const sint32 bufferSize) = 0;
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
-index 15fd66e0..caa05c7e 100644
+index 15fd66e..85c581d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
-@@ -10,6 +10,12 @@
+@@ -9,6 +9,13 @@
+ #include <glslang/Public/ShaderLang.h>
  #include <glslang/SPIRV/GlslangToSpv.h>
  #include "util/helpers/helpers.h"
- 
++#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
++
 +#if defined(__linux__)
 +#include <sys/resource.h>
 +#include <sys/syscall.h>
 +#include <unistd.h>
 +#endif
-+
+ 
  bool s_isLoadingShadersVk{ false };
  class FileCache* s_spirvCache{nullptr};
- 
-@@ -157,6 +163,13 @@ public:
+@@ -157,6 +164,13 @@ public:
  	void CompilerThreadFunc()
  	{
  		SetThreadName("vkShaderComp");
@@ -538,8 +884,18 @@ index 15fd66e0..caa05c7e 100644
  		while (m_threadsActive.load(std::memory_order::relaxed))
  		{
  			s_compilationQueueCount.decrementWithWait();
+@@ -395,6 +409,9 @@ void RendererShaderVk::CompileInternal(bool isRenderThread)
+ 
+ void RendererShaderVk::PreponeCompilation(bool isRenderThread)
+ {
++	std::optional<LatteHitchScope> hitchScope;
++	if (isRenderThread)
++		hitchScope.emplace(LatteHitch::ShaderCompile);
+ 	ShaderVkThreadPool.s_compilationQueueMutex.lock();
+ 	bool isStillQueued = m_compilationState.hasState(COMPILATION_STATE::QUEUED);
+ 	if (isStillQueued)
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 55b2330e..051105cf 100644
+index 55b2330..051105c 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 @@ -10,6 +10,12 @@
@@ -567,8 +923,25 @@ index 55b2330e..051105cf 100644
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
+index f6d7228..ae85f94 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
+@@ -2180,7 +2180,11 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
+ {
+ 	cemu_assert_debug(m_commandBufferSyncIndex != m_commandBufferIndex);
+ 	// wait on least recently submitted command buffer
+-	VkResult result = vkWaitForFences(m_logicalDevice, 1, &m_cmd_buffer_fences[m_commandBufferSyncIndex], true, UINT64_MAX);
++	VkResult result;
++	{
++		LatteHitchScope hitchScope(LatteHitch::GpuWait);
++		result = vkWaitForFences(m_logicalDevice, 1, &m_cmd_buffer_fences[m_commandBufferSyncIndex], true, UINT64_MAX);
++	}
+ 	if (result == VK_TIMEOUT)
+ 	{
+ 		cemuLog_log(LogType::Force, "vkWaitForFences: Returned VK_TIMEOUT on infinite fence");
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index 8a93e120..bfa607c2 100644
+index 8a93e12..bfa607c 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 @@ -310,10 +310,11 @@ public:
@@ -584,8 +957,24 @@ index 8a93e120..bfa607c2 100644
  
  	void surfaceCopy_cleanup();
  
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
+index a681418..70e2639 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
+@@ -260,7 +260,10 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
+ 	else
+ 	{
+ 		// synchronous compilation
+-		pipelineCompiler->Compile(true, true, true);
++		{
++			LatteHitchScope hitchScope(LatteHitch::PipelineSync);
++			pipelineCompiler->Compile(true, true, true);
++		}
+ 		delete pipelineCompiler;
+ 	}
+ 
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
-index e3e42012..198fb98f 100644
+index e3e4201..198fb98 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
 @@ -579,7 +579,7 @@ VKRObjectDescriptorSet* VulkanRenderer::surfaceCopy_getOrCreateDescriptorSet(VkC
@@ -677,15 +1066,25 @@ index e3e42012..198fb98f 100644
  // it is guaranteed that the texture is not in use and all associated resources (descriptor sets, framebuffers) can be destroyed safely
  void VulkanRenderer::surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture)
 diff --git a/src/Cafe/IOSU/fsa/iosu_fsa.cpp b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-index 1429d083..8d4c2b5b 100644
+index 1429d08..fe27f06 100644
 --- a/src/Cafe/IOSU/fsa/iosu_fsa.cpp
 +++ b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-@@ -469,7 +469,31 @@ namespace iosu
+@@ -6,6 +6,7 @@
+ 
+ #include "Cafe/OS/libs/coreinit/coreinit_FS.h"	 // get rid of this dependency, requires reworking some of the IPC stuff. See locations where we use coreinit::FSCmdBlockBody_t
+ #include "Cafe/HW/Latte/Core/LatteBufferCache.h" // also remove this dependency
++#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
+ 
+ #include "Cafe/HW/MMU/MMU.h"
+ 
+@@ -469,7 +470,33 @@ namespace iosu
  			if ((flags & FSA_CMD_FLAG_SET_POS) != 0)
  				fsc_setFileSeek(fscFile, filePos);
  			// todo: File permissions
 +			auto readStart = std::chrono::steady_clock::now();
  			uint32 bytesSuccessfullyRead = fsc_readFile(fscFile, destPtr, bytesToRead);
++			LatteHitch_Add(LatteHitch::DiscRead, (uint64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - readStart).count());
++			LatteHitch_AddBytesRead(bytesSuccessfullyRead);
 +			{
 +				// how much loading time is spent reading game files, logged every 5 seconds for the first 3 minutes
 +				static std::mutex s_ioStatMutex;
@@ -713,7 +1112,7 @@ index 1429d083..8d4c2b5b 100644
  				return FSA_RESULT::OK;
  
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
-index b23560f1..e937d8c9 100644
+index b23560f..e937d8c 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 @@ -575,6 +575,8 @@ namespace nsyshid
@@ -971,7 +1370,7 @@ index b23560f1..e937d8c9 100644
  	DimensionsUSB::GetFigureByIndex(uint8 index)
  	{
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.h b/src/Cafe/OS/libs/nsyshid/Dimensions.h
-index 00ceff9e..38a57263 100644
+index 00ceff9..38a5726 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.h
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.h
 @@ -78,6 +78,21 @@ namespace nsyshid
@@ -1018,7 +1417,7 @@ index 00ceff9e..38a57263 100644
  		std::queue<std::array<uint8, 32>> m_queries;
  	};
 diff --git a/src/Cafe/OS/libs/snd_core/ax.h b/src/Cafe/OS/libs/snd_core/ax.h
-index 0861e6a7..a85281f2 100644
+index 0861e6a..a85281f 100644
 --- a/src/Cafe/OS/libs/snd_core/ax.h
 +++ b/src/Cafe/OS/libs/snd_core/ax.h
 @@ -391,6 +391,9 @@ namespace snd_core
@@ -1033,7 +1432,7 @@ index 0861e6a7..a85281f2 100644
  }
 \ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a44..f94364d8 100644
+index 31a24a4..f94364d 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 @@ -751,15 +751,24 @@ namespace snd_core
@@ -1067,7 +1466,7 @@ index 31a24a44..f94364d8 100644
  
  	// mix audio generated from voice into main bus and aux buses
 diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-index 6cb1599a..23f80744 100644
+index 6cb1599..23f8074 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
 @@ -216,86 +216,173 @@ namespace snd_core
@@ -1298,7 +1697,7 @@ index 6cb1599a..23f80744 100644
  
  	void AIInitDRCDMA(sint16* sampleData, sint32 size)
 diff --git a/src/Cafe/OS/libs/snd_user/snd_user.cpp b/src/Cafe/OS/libs/snd_user/snd_user.cpp
-index 58e8f4b5..6c806fa8 100644
+index 58e8f4b..6c806fa 100644
 --- a/src/Cafe/OS/libs/snd_user/snd_user.cpp
 +++ b/src/Cafe/OS/libs/snd_user/snd_user.cpp
 @@ -1082,12 +1082,12 @@ namespace snd_user
@@ -1463,7 +1862,7 @@ index 58e8f4b5..6c806fa8 100644
  
  	/* AXFXReverbStd */
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 3c1587e7..479b43eb 100644
+index 3c1587e..479b43e 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -45,7 +45,8 @@ android {
@@ -1477,7 +1876,7 @@ index 3c1587e7..479b43eb 100644
          targetSdk = 35
          versionName = getVersionName()
 diff --git a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
-index 1190bf43..77319a1a 100644
+index 1190bf4..77319a1 100644
 --- a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 +++ b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 @@ -334,6 +334,9 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsFigure
@@ -1540,7 +1939,7 @@ index 1190bf43..77319a1a 100644
 +	return result;
 +}
 diff --git a/src/android/app/src/main/cpp/NativeLogging.cpp b/src/android/app/src/main/cpp/NativeLogging.cpp
-index 19a75475..27b96a6f 100644
+index 19a7547..27b96a6 100644
 --- a/src/android/app/src/main/cpp/NativeLogging.cpp
 +++ b/src/android/app/src/main/cpp/NativeLogging.cpp
 @@ -1,6 +1,11 @@
@@ -1566,7 +1965,7 @@ index 19a75475..27b96a6f 100644
 +	snd_core::AXOut_SetVolumeBoostDb(db);
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
-index 29a5c740..342d30c8 100644
+index 29a5c74..342d30c 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
 @@ -25,6 +25,8 @@ import info.cemu.cemu.emulation.input.DeviceMotionHandler
@@ -1616,7 +2015,7 @@ index 29a5c740..342d30c8 100644
  
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt
 new file mode 100644
-index 00000000..c991f02c
+index 0000000..c991f02
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt
 @@ -0,0 +1,366 @@
@@ -1988,7 +2387,7 @@ index 00000000..c991f02c
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt
 new file mode 100644
-index 00000000..fc3d5993
+index 0000000..fc3d599
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt
 @@ -0,0 +1,365 @@
@@ -2359,7 +2758,7 @@ index 00000000..fc3d5993
 +val CATALOG_BY_ID: Map<Int, CatalogFigure> = CATALOG.associateBy { it.id }
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 new file mode 100644
-index 00000000..c4477e17
+index 0000000..c4477e1
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 @@ -0,0 +1,433 @@
@@ -2798,7 +3197,7 @@ index 00000000..c4477e17
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt
 new file mode 100644
-index 00000000..1b23271a
+index 0000000..1b23271
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt
 @@ -0,0 +1,147 @@
@@ -2951,7 +3350,7 @@ index 00000000..1b23271a
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
 new file mode 100644
-index 00000000..e8c0fe32
+index 0000000..e8c0fe3
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
 @@ -0,0 +1,52 @@
@@ -3009,7 +3408,7 @@ index 00000000..e8c0fe32
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 00000000..80837572
+index 0000000..8083757
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 @@ -0,0 +1,1612 @@
@@ -4627,7 +5026,7 @@ index 00000000..80837572
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
 new file mode 100644
-index 00000000..457ffbf6
+index 0000000..457ffbf
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
 @@ -0,0 +1,153 @@
@@ -4786,7 +5185,7 @@ index 00000000..457ffbf6
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
 new file mode 100644
-index 00000000..2cdc70af
+index 0000000..2cdc70a
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
 @@ -0,0 +1,29 @@
@@ -4820,7 +5219,7 @@ index 00000000..2cdc70af
 +    }
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
-index 5c178c2f..3d1bfb75 100644
+index 5c178c2..3d1bfb7 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
 @@ -85,6 +85,18 @@ object NativeEmulatedUSBDevices {
@@ -4843,7 +5242,7 @@ index 5c178c2f..3d1bfb75 100644
      external fun clearDimensionsFigure(pad: Int, index: Int)
  
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
-index 4c61cbd5..066bc1f5 100644
+index 4c61cbd..066bc1f 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
 @@ -1,11 +1,13 @@
@@ -4888,7 +5287,7 @@ index 4c61cbd5..066bc1f5 100644
              label = tr("Gamepad"),
              description = tr("Enable audio output for the Wii U Gamepad"),
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
-index 5325cb1e..6bad79a2 100644
+index 5325cb1..6bad79a 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 @@ -1,13 +1,47 @@
@@ -4990,7 +5389,7 @@ index 5325cb1e..6bad79a2 100644
  }
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_recent.xml b/src/android/app/src/main/res/drawable/ic_toypad_recent.xml
 new file mode 100644
-index 00000000..0f599ccc
+index 0000000..0f599cc
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_recent.xml
 @@ -0,0 +1,9 @@
@@ -5005,7 +5404,7 @@ index 00000000..0f599ccc
 +</vector>
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_star.xml b/src/android/app/src/main/res/drawable/ic_toypad_star.xml
 new file mode 100644
-index 00000000..8bb66809
+index 0000000..8bb6680
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_star.xml
 @@ -0,0 +1,9 @@
@@ -5020,7 +5419,7 @@ index 00000000..8bb66809
 +</vector>
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml b/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml
 new file mode 100644
-index 00000000..7aed0363
+index 0000000..7aed036
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml
 @@ -0,0 +1,9 @@
@@ -5035,7 +5434,7 @@ index 00000000..7aed0363
 +</vector>
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_team.xml b/src/android/app/src/main/res/drawable/ic_toypad_team.xml
 new file mode 100644
-index 00000000..133e382f
+index 0000000..133e382
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_team.xml
 @@ -0,0 +1,9 @@
@@ -5049,7 +5448,7 @@ index 00000000..133e382f
 +        android:pathData="M16,11c1.66,0 2.99,-1.34 2.99,-3S17.66,5 16,5c-1.66,0 -3,1.34 -3,3s1.34,3 3,3zM8,11c1.66,0 2.99,-1.34 2.99,-3S9.66,5 8,5C6.34,5 5,6.34 5,8s1.34,3 3,3zM8,13c-2.33,0 -7,1.17 -7,3.5L1,19h14v-2.5c0,-2.33 -4.67,-3.5 -7,-3.5zM16,13c-0.29,0 -0.62,0.02 -0.97,0.05 1.16,0.84 1.97,1.97 1.97,3.45L17,19h6v-2.5c0,-2.33 -4.67,-3.5 -7,-3.5z" />
 +</vector>
 diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
-index 053d3be8..71202a35 100644
+index 053d3be..71202a3 100644
 --- a/src/android/app/src/main/res/values/strings.xml
 +++ b/src/android/app/src/main/res/values/strings.xml
 @@ -1,5 +1,5 @@

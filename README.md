@@ -153,6 +153,10 @@ Open an [Issue](../../issues) with:
 - what went wrong (a screenshot helps a lot)
 - your log file: in Cemu LD+, open the game list menu, tap **Share log file**, and attach it
 
+**Reporting stutter:** play a few minutes where it happens, then share the log. From build 24 the log lists every
+slow frame (`[Hitch]`) and a summary every 10 seconds (`[Perf]`) with what that time was spent on: waiting for the game,
+new shaders, textures, the GPU, reading game files and so on. That shows where the stutter comes from.
+
 ## What the fix changes (technical)
 
 Cemu only kept textures in sync when they start at the same memory address. LEGO Dimensions renders its
