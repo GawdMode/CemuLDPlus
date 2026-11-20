@@ -1,5 +1,5 @@
 diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
-index 7809a01..d2ef865 100644
+index 7809a01..3c28c01 100644
 --- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
 +++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
 @@ -322,7 +322,8 @@ void PPCInterpreter_ICBI(PPCInterpreter_t* hCPU, uint32 Opcode)
@@ -12,7 +12,7 @@ index 7809a01..d2ef865 100644
  	// next instruction
  	PPCInterpreter_nextInstruction(hCPU);
  }
-@@ -336,7 +337,8 @@ void PPCInterpreter_SC(PPCInterpreter_t* hCPU, uint32 Opcode)
+@@ -336,14 +337,16 @@ void PPCInterpreter_SC(PPCInterpreter_t* hCPU, uint32 Opcode)
  
  void PPCInterpreter_SYNC(PPCInterpreter_t* hCPU, uint32 Opcode)
  {
@@ -22,17 +22,27 @@ index 7809a01..d2ef865 100644
  	// next instruction
  	PPCInterpreter_nextInstruction(hCPU);
  }
+ 
+ void PPCInterpreter_ISYNC(PPCInterpreter_t* hCPU, uint32 Opcode)
+ {
+-	// no-op
++	// Cemu LD+: don't let later reads happen early (matters on ARM hosts in multi-core mode)
++	std::atomic_thread_fence(std::memory_order_acquire);
+ 	// next instruction
+ 	PPCInterpreter_nextInstruction(hCPU);
+ }
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
-index 2555101..5d9042a 100644
+index 2555101..987e170 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
-@@ -941,6 +941,11 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
+@@ -941,6 +941,12 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
  		brk(0xf000);
  		return true;
  	}
 +	else if (imlInstruction->operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
 +	{
-+		dmb(BarOpt::ISH);
++		// param 0: full barrier (sync/lwsync), param 1: load barrier (isync)
++		dmb(imlInstruction->op_macro.param == 1 ? BarOpt::ISHLD : BarOpt::ISH);
 +		return true;
 +	}
  	else if (imlInstruction->operation == PPCREC_IML_MACRO_COUNT_CYCLES)
@@ -92,7 +102,7 @@ index 997de4e..caaca3a 100644
  			// no effect on registers
  		}
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
-index 4df2a66..40d1859 100644
+index 4df2a66..ac658f7 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
 @@ -178,6 +178,9 @@ enum
@@ -101,12 +111,12 @@ index 4df2a66..40d1859 100644
  	PPCREC_IML_MACRO_DEBUGBREAK,	// throws a debugbreak
 +	// Cemu LD+: full memory barrier for PPC sync/lwsync. Only emitted in multi-core mode, where the emulated cores run on
 +	// separate host threads and ARM (unlike x86) can reorder memory accesses that the game expects to stay in order
-+	PPCREC_IML_MACRO_MEMORY_BARRIER,
++	PPCREC_IML_MACRO_MEMORY_BARRIER, // param 0 = full barrier (sync/lwsync), 1 = load barrier (isync)
  };
  
  enum class IMLCondition : uint8
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index e76a53f..98d8a67 100644
+index e76a53f..57ac7c4 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,11 @@
@@ -121,7 +131,16 @@ index e76a53f..98d8a67 100644
  bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext);
  
  struct PPCBasicBlockInfo
-@@ -775,6 +780,11 @@ bool PPCRecompilerImlGen_ISYNC(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+@@ -770,11 +775,20 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 
+ bool PPCRecompilerImlGen_ISYNC(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
+ {
++	// Cemu LD+: games put isync after taking a lock or after waiting for a flag, so that what they read next isn't read
++	// early. ARM hosts can read ahead past a branch, so in multi-core mode emit a load barrier (param 1)
++	if (coreinit::__CemuIsMulticoreMode())
++		ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_MEMORY_BARRIER, 1, 0, 0, IMLREG_INVALID);
+ 	return true;
+ }
  
  bool PPCRecompilerImlGen_SYNC(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
  {
@@ -133,7 +152,7 @@ index e76a53f..98d8a67 100644
  	return true;
  }
  
-@@ -3097,6 +3107,7 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+@@ -3097,6 +3111,7 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
  					break;
  				case PPCREC_IML_MACRO_DEBUGBREAK:
  				case PPCREC_IML_MACRO_COUNT_CYCLES:
@@ -193,7 +212,7 @@ index 963c49f..ec07b2b 100644
  	while (true)
  	{
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
-index a3bcb63..03da02f 100644
+index a3bcb63..cfe10ac 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 +++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 @@ -1,4 +1,8 @@
@@ -298,9 +317,9 @@ index a3bcb63..03da02f 100644
 +
 +	const char* const s_hitchNames[kHitchCategories] = {
 +		"waiting for game", "new shaders", "shader compile", "pipelines", "textures",
-+		"readback", "fences", "GPU busy", "present", "disc reads"};
++		"readback", "fences", "GPU busy", "present", "disc reads", "background pipelines", "pipelines made again"};
 +	// categories where the number of events is worth showing
-+	const bool s_hitchShowCount[kHitchCategories] = {false, true, true, true, true, true, false, false, false, false};
++	const bool s_hitchShowCount[kHitchCategories] = {false, true, true, true, true, true, false, false, false, false, true, true};
 +
 +	std::string _LatteHitch_Describe(const uint64* us, const uint32* count, uint64 bytesRead, uint32 newTextures, uint64 minUs)
 +	{
@@ -415,10 +434,10 @@ index a3bcb63..03da02f 100644
 +	}
 +}
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
-index dbc3cff..6745b97 100644
+index dbc3cff..ebfa097 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
 +++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
-@@ -145,5 +145,40 @@ extern performanceMonitor_t performanceMonitor;
+@@ -145,5 +145,42 @@ extern performanceMonitor_t performanceMonitor;
  void LattePerformanceMonitor_frameEnd();
  void LattePerformanceMonitor_frameBegin();
  
@@ -436,6 +455,8 @@ index dbc3cff..6745b97 100644
 +	GpuWait,       // waiting for the GPU to finish earlier work
 +	Present,       // showing the frame (swapchain, vsync, waiting for flip)
 +	DiscRead,      // reading game files (any thread)
++	PipelineBackground, // pipelines built on the background compile threads (counted when they finish)
++	PipelineRepeat,     // pipelines that had to be made again although they were made before in this session
 +	Count
 +};
 +uint64 LatteHitch_NowUs();
@@ -1104,10 +1125,15 @@ index 15fd66e..85c581d 100644
  	bool isStillQueued = m_compilationState.hasState(COMPILATION_STATE::QUEUED);
  	if (isStillQueued)
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 55b2330..051105c 100644
+index 55b2330..40a4e3f 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-@@ -10,6 +10,12 @@
+@@ -1,3 +1,4 @@
++#include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
+ #include "Cafe/HW/Latte/Core/FetchShader.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h"
+@@ -10,6 +11,12 @@
  #include "util/helpers/Serializer.h"
  #include "Cafe/HW/Latte/Common/RegisterSerializer.h"
  
@@ -1120,7 +1146,7 @@ index 55b2330..051105c 100644
  /* rects emulation */
  
  void rectsEmulationGS_outputSingleVertex(std::string& gsSrc, LatteDecompilerShader* vertexShader, LatteShaderPSInputTable* psInputTable, sint32 vIdx, const LatteContextRegister& latteRegister)
-@@ -1132,6 +1138,11 @@ static void compilePipeline_thread(sint32 threadIndex)
+@@ -1132,13 +1139,25 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -1129,9 +1155,23 @@ index 55b2330..051105c 100644
 +	// the fast cores, which makes the frame rate drop whenever a burst of new pipelines is compiled
 +	if (threadIndex != 0)
 +		setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
++	// Cemu LD+: pipelines needed during gameplay are built in the background (the draw is skipped until it's ready), so
++	// the extra compile threads use the slow power-saving CPUs and leave the fast ones to the game and the renderer.
++	// The first thread may still use any CPU so a burst of new pipelines doesn't wait too long.
++	if (threadIndex != 0)
++		coreinit::__CemuSetHostThreadCpus(false, fmt::format("pipeline compile thread {}", threadIndex).c_str());
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
+ 		PipelineCompiler* request = s_pipelineCompileRequests.pop();
+ 		if (!request)
+ 			continue;
++		const uint64 compileStart = LatteHitch_NowUs();
+ 		request->Compile(true, false, true);
++		LatteHitch_Add(LatteHitch::PipelineBackground, LatteHitch_NowUs() - compileStart);
+ 		delete request;
+ 	}
+ }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 index f6d7228..ae85f94 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
@@ -1167,10 +1207,25 @@ index 8a93e12..bfa607c 100644
  	void surfaceCopy_cleanup();
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index a681418..70e2639 100644
+index a681418..22e06ba 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-@@ -260,7 +260,10 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
+@@ -222,6 +222,14 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
+ 	uint64 minimalStateHash = draw_calculateMinimalGraphicsPipelineHash(fetchShader, LatteGPUState.contextNew);
+ 	uint64 pipelineHash = draw_calculateGraphicsPipelineHash(fetchShader, vertexShader, geometryShader, pixelShader, cachedFboVk->GetRenderPassObj(), LatteGPUState.contextNew);
+ 
++	// Cemu LD+: count pipelines that are made again within a session (for the performance log)
++	{
++		static std::unordered_set<uint64> s_madePipelines;
++		const uint64 sessionKey = pipelineHash ^ (vertexShader->baseHash * 0x9E3779B97F4A7C15ull);
++		if (!s_madePipelines.emplace(sessionKey).second)
++			LatteHitch_Add(LatteHitch::PipelineRepeat, 0);
++	}
++
+ 	// create PipelineInfo
+ 	auto vkFBO = (CachedFBOVk*)(VulkanRenderer::GetInstance()->m_state.activeFBO);
+ 	PipelineInfo* pipelineInfo = new PipelineInfo(minimalStateHash, pipelineHash, fetchShader, vertexShader, pixelShader, geometryShader);
+@@ -260,7 +268,10 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
  	else
  	{
  		// synchronous compilation
@@ -1321,7 +1376,7 @@ index 1429d08..fe27f06 100644
  				return FSA_RESULT::OK;
  
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 7c7571f..376399b 100644
+index 7c7571f..fb47f84 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -14,6 +14,11 @@
@@ -1456,88 +1511,100 @@ index 7c7571f..376399b 100644
  
  		//if (ppcInterpreterCurrentInstance)
  		//	debug_printf("Core %d store thread %08x (t = %d)\n", hostThread->ppcInstance.sprNew.UPIR, memory_getVirtualOffsetFromPointer(hostThread->thread), t_assignedCoreIndex);
-@@ -1426,9 +1523,76 @@ namespace coreinit
+@@ -1426,9 +1523,88 @@ namespace coreinit
  	}
  #endif
  
-+#if defined(__linux__)
-+	// Cemu LD+: phones mix fast CPU cores with slow power-saving ones. In multi-core mode each emulated Wii U core runs on
-+	// its own thread, and Android may put a lightly loaded one on a slow core. The cores have to keep pace with each other
-+	// and with real time (the audio mixer runs on one of them), so keep them on the faster CPUs.
-+	static void _KeepOnFastHostCpus(uintptr_t coreIndex)
++	// Cemu LD+: phones mix fast CPU cores with slow power-saving ones. Works out which host CPUs are which (once).
++	// Returns false when there is no clear split, in which case everything is left to the OS.
++	bool __CemuGetHostCpuSplit(uint64& fastMask, uint64& slowMask)
 +	{
-+		static std::mutex s_mutex;
-+		static bool s_checked = false;
-+		static uint64 s_fastMask = 0;
-+		{
-+			std::unique_lock _l(s_mutex);
-+			if (!s_checked)
++#if defined(__linux__)
++		static uint64 s_fastMask = 0, s_slowMask = 0;
++		static std::once_flag s_once;
++		std::call_once(s_once, []() {
++			const long cpuCount = std::clamp<long>(sysconf(_SC_NPROCESSORS_CONF), 0, 64);
++			std::vector<uint64> maxKHz((size_t)cpuCount, 0);
++			uint64 fastest = 0;
++			for (long cpu = 0; cpu < cpuCount; cpu++)
 +			{
-+				s_checked = true;
-+				const long cpuCount = std::clamp<long>(sysconf(_SC_NPROCESSORS_CONF), 0, 64);
-+				std::vector<uint64> maxKHz((size_t)cpuCount, 0);
-+				uint64 fastest = 0;
-+				for (long cpu = 0; cpu < cpuCount; cpu++)
++				std::ifstream f(fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu));
++				uint64 v = 0;
++				if (f >> v)
++					maxKHz[(size_t)cpu] = v;
++				fastest = std::max(fastest, maxKHz[(size_t)cpu]);
++			}
++			std::string speeds;
++			uint32 fastCount = 0, knownCount = 0;
++			uint64 fast = 0, slow = 0;
++			for (long cpu = 0; cpu < cpuCount; cpu++)
++			{
++				if (maxKHz[(size_t)cpu] == 0)
++					continue;
++				knownCount++;
++				speeds.append(fmt::format("{}{}:{}", speeds.empty() ? "" : " ", cpu, maxKHz[(size_t)cpu] / 1000));
++				if (maxKHz[(size_t)cpu] * 10 >= fastest * 7)
 +				{
-+					std::ifstream f(fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu));
-+					uint64 v = 0;
-+					if (f >> v)
-+						maxKHz[(size_t)cpu] = v;
-+					fastest = std::max(fastest, maxKHz[(size_t)cpu]);
-+				}
-+				std::string speeds;
-+				uint32 fastCount = 0, knownCount = 0;
-+				for (long cpu = 0; cpu < cpuCount; cpu++)
-+				{
-+					if (maxKHz[(size_t)cpu] == 0)
-+						continue;
-+					knownCount++;
-+					speeds.append(fmt::format("{}{}:{}", speeds.empty() ? "" : " ", cpu, maxKHz[(size_t)cpu] / 1000));
-+					if (maxKHz[(size_t)cpu] * 10 >= fastest * 7)
-+					{
-+						s_fastMask |= (1ull << cpu);
-+						fastCount++;
-+					}
-+				}
-+				cemuLog_log(LogType::Force, "[CPU] host CPU top speeds in MHz (cpu:speed): {}", speeds.empty() ? "unknown" : speeds);
-+				if (fastCount < 3 || fastCount >= knownCount)
-+				{
-+					s_fastMask = 0; // no clear split between fast and slow CPUs, leave it to Android
-+					cemuLog_log(LogType::Force, "[CPU] emulated CPU cores can use any host CPU");
++					fast |= (1ull << cpu);
++					fastCount++;
 +				}
 +				else
-+				{
-+					std::string list;
-+					for (uint32 cpu = 0; cpu < 64; cpu++)
-+						if ((s_fastMask >> cpu) & 1)
-+							list.append(fmt::format("{}{}", list.empty() ? "" : ",", cpu));
-+					cemuLog_log(LogType::Force, "[CPU] keeping the emulated CPU cores on the faster host CPUs ({})", list);
-+				}
++					slow |= (1ull << cpu);
 +			}
-+		}
-+		if (s_fastMask == 0)
-+			return;
-+		uint64 mask = s_fastMask;
-+		if (syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask) != 0)
-+			cemuLog_log(LogType::Force, "[CPU] could not set host CPUs for emulated core {} (error {})", coreIndex, errno);
-+	}
++			cemuLog_log(LogType::Force, "[CPU] host CPU top speeds in MHz (cpu:speed): {}", speeds.empty() ? "unknown" : speeds);
++			if (fastCount < 3 || fastCount >= knownCount)
++			{
++				cemuLog_log(LogType::Force, "[CPU] no clear split between fast and slow host CPUs, leaving thread placement to the system");
++				return;
++			}
++			s_fastMask = fast;
++			s_slowMask = slow;
++		});
++		fastMask = s_fastMask;
++		slowMask = s_slowMask;
++		return s_fastMask != 0 && s_slowMask != 0;
++#else
++		fastMask = slowMask = 0;
++		return false;
 +#endif
++	}
++
++	// Cemu LD+: keeps the calling host thread on the given host CPUs (no effect without a fast/slow split)
++	void __CemuSetHostThreadCpus(bool fastCpus, const char* what)
++	{
++#if defined(__linux__)
++		uint64 fastMask, slowMask;
++		if (!__CemuGetHostCpuSplit(fastMask, slowMask))
++			return;
++		uint64 mask = fastCpus ? fastMask : slowMask;
++		if (syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask) != 0)
++		{
++			cemuLog_log(LogType::Force, "[CPU] could not set host CPUs for {} (error {})", what, errno);
++			return;
++		}
++		std::string list;
++		for (uint32 cpu = 0; cpu < 64; cpu++)
++			if ((mask >> cpu) & 1)
++				list.append(fmt::format("{}{}", list.empty() ? "" : ",", cpu));
++		cemuLog_log(LogType::Force, "[CPU] {} kept on host CPUs {}", what, list);
++#endif
++	}
 +
  	void OSSchedulerCoreEmulationThread(void* _assignedCoreIndex)
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
-+#if defined(__linux__)
++		// Cemu LD+: in multi-core mode each emulated core has its own host thread. The cores have to keep pace with each
++		// other and with real time (the audio mixer runs on one of them), so keep them off the slow power-saving CPUs
 +		if (g_isMulticoreMode)
-+			_KeepOnFastHostCpus((uintptr_t)_assignedCoreIndex);
-+#endif
++			__CemuSetHostThreadCpus(true, fmt::format("emulated core {}", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
  
  		enableFlushDenormalsToZero();
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-index 974b52f..5da9584 100644
+index 974b52f..0ab04cd 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-@@ -513,6 +513,12 @@ namespace coreinit
+@@ -513,6 +513,14 @@ namespace coreinit
  
  	bool __CemuIsMulticoreMode();
  
@@ -1546,6 +1613,8 @@ index 974b52f..5da9584 100644
 +	constexpr uint32 kHostCpuSampleSlots = 16;
 +	void __OSTakeHostCpuStats(uint32 samples[3][kHostCpuSampleSlots]);
 +	void __OSLogThreadList(const OSThread_t* audioThread);
++	bool __CemuGetHostCpuSplit(uint64& fastMask, uint64& slowMask);
++	void __CemuSetHostThreadCpus(bool fastCpus, const char* what);
 +
  	OSThread_t* OSGetDefaultThread(sint32 coreIndex);
  	void* OSGetDefaultThreadStack(sint32 coreIndex, uint32& size);
@@ -2600,6 +2669,32 @@ index 58e8f4b..6c806fa 100644
  	}
  
  	/* AXFXReverbStd */
+diff --git a/src/Common/ExceptionHandler/ExceptionHandler.cpp b/src/Common/ExceptionHandler/ExceptionHandler.cpp
+index 7530a2e..0d0d225 100644
+--- a/src/Common/ExceptionHandler/ExceptionHandler.cpp
++++ b/src/Common/ExceptionHandler/ExceptionHandler.cpp
+@@ -78,6 +78,21 @@ void ExceptionHandler_LogGeneralInfo()
+         uint32 threadPtr = memory_getVirtualOffsetFromPointer(coreinit::OSGetCurrentThread());
+         sprintf(dumpLine, "IP 0x%08x LR 0x%08x Thread 0x%08x", hCPU->instructionPointer, hCPU->spr.LR, threadPtr);
+         CrashLog_WriteLine(dumpLine);
++        // Cemu LD+: name the game thread and emulated core, to tell crashes apart
++        if (currentThread)
++        {
++            std::string threadName;
++            const MPTR nameAddr = currentThread->threadName.GetMPTR();
++            for (uint32 c = 0; nameAddr != MPTR_NULL && c < 48 && memory_isAddressRangeAccessible(nameAddr + c, 1); c++)
++            {
++                const char ch = (char)memory_readU8(nameAddr + c);
++                if (ch == 0)
++                    break;
++                threadName.push_back((ch >= 0x20 && ch < 0x7F) ? ch : '?');
++            }
++            CrashLog_WriteLine(fmt::format("Thread name: '{}' | emulated core {} | CPU mode: {}", threadName.empty() ? "(no name)" : threadName,
++                (uint32)hCPU->spr.UPIR, coreinit::__CemuIsMulticoreMode() ? "multi-core" : "single-core"));
++        }
+ 
+         // GPR info
+         CrashLog_WriteLine("");
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
 index 3c1587e..479b43e 100644
 --- a/src/android/app/build.gradle.kts

@@ -48,15 +48,16 @@ copy the save back. Build 3 and later can all be installed as normal updates.
 Not a bug: side-quest characters in the Adventure Worlds (for example Hans Moleman in Springfield) only play a short
 greeting sound and then speak in text. That's how the original game works too.
 
-## Important: game profile settings (fixes stuttering, crunchy audio)
+## Important: game profile settings (CPU mode)
 
-Cemu LD+ is a separate app, so it starts with its own default settings. With the defaults, LEGO Dimensions
-audio can stutter and sound crunchy or rumbly, especially in the hub, even though the frame rate is fine.
+Cemu LD+ is a separate app, so it starts with its own default settings. On the game list, **long-press LEGO
+Dimensions → Edit game profile** and pick the **CPU mode**:
 
-On the game list, **long-press LEGO Dimensions → Edit game profile** and set:
-
-- **CPU mode:** Single-core recompiler
-- **Thread quantum:** 100000
+- **Multi-core recompiler** (recommended from build 26): runs the three emulated Wii U CPU cores at the same time,
+  which gives a clearly better frame rate in the open worlds. Before build 26 this mode made the sound crunchy. That's
+  fixed now (see *Multi-core fixes* below).
+- **Single-core recompiler** with **Thread quantum: 100000**: the safe fallback. Slower in the open worlds, but use it
+  if multi-core crashes or misbehaves for you, and please report it.
 
 These are tested on an AYN Thor. If you use a custom GPU driver in your regular Cemu, pick the same one here too.
 
@@ -208,6 +209,13 @@ same time:
   complete before another core reads it. On a PC the processor keeps that order anyway, so Cemu skips those
   instructions. ARM processors can reorder memory accesses, so in multi-core mode Cemu LD+ turns them into real memory
   barriers.
+- **Memory order after locks (build 27).** Games also use `isync` after taking a lock or waiting for a flag, so the
+  data they read next isn't read too early. In multi-core mode that's now a load barrier too. A null-pointer crash in
+  the Wizard of Oz world may have been caused by this; the crash log now also names the game thread and emulated core.
+- **Background pipeline building (build 27).** Pipelines needed during gameplay are built in the background while the
+  game skips that draw. The extra compile threads now use the slow power-saving CPUs, so a burst of new pipelines
+  doesn't slow down the game and renderer on the fast ones. The `[Perf]` line shows how many were built in the
+  background and whether any had to be made again.
 - **Voice protection (build 25).** Cemu refused the game's "don't touch this voice while I change it" calls whenever a
   sound frame was being mixed, even when the call came from another core. Now only calls from inside the mixer are
   refused.
