@@ -193,7 +193,7 @@ index 963c49f..ec07b2b 100644
  	while (true)
  	{
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
-index a3bcb63..a4c41b7 100644
+index a3bcb63..03da02f 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 +++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 @@ -1,4 +1,8 @@
@@ -205,7 +205,7 @@ index a3bcb63..a4c41b7 100644
  #include "Cafe/HW/Latte/Core/LatteOverlay.h"
  #include "WindowSystem.h"
  
-@@ -121,3 +125,185 @@ void LattePerformanceMonitor_frameBegin()
+@@ -121,3 +125,208 @@ void LattePerformanceMonitor_frameBegin()
  	performanceMonitor.vk.numDrawBarriersPerFrame.reset();
  	performanceMonitor.vk.numBeginRenderpassPerFrame.reset();
  }
@@ -263,10 +263,33 @@ index a3bcb63..a4c41b7 100644
 +			const double idleShare = std::clamp((double)idle / (double)windowUs, 0.0, 1.0);
 +			return (uint32)std::lround((1.0 - idleShare) * 100.0);
 +		};
++		// which host CPUs each emulated core ran on (biggest shares first)
++		uint32 hostSamples[3][coreinit::kHostCpuSampleSlots];
++		coreinit::__OSTakeHostCpuStats(hostSamples);
++		auto hostCpus = [&](sint32 core) {
++			uint64 total = 0;
++			for (uint32 i = 0; i < coreinit::kHostCpuSampleSlots; i++)
++				total += hostSamples[core][i];
++			if (total == 0)
++				return std::string();
++			std::vector<std::pair<uint32, uint32>> shares;
++			for (uint32 i = 0; i < coreinit::kHostCpuSampleSlots; i++)
++			{
++				const uint32 pct = (uint32)(hostSamples[core][i] * 100 / total);
++				if (pct >= 5)
++					shares.emplace_back(pct, i);
++			}
++			std::sort(shares.begin(), shares.end(), [](auto& a, auto& b) { return a.first > b.first; });
++			std::string text = " on host CPU";
++			for (size_t i = 0; i < shares.size() && i < 3; i++)
++				text.append(fmt::format("{} {} ({}%)", i == 0 ? "" : ",", shares[i].second, shares[i].first));
++			return text;
++		};
 +		if (coreinit::__CemuIsMulticoreMode())
-+			cemuLog_log(LogType::Force, "[CPU] last {:.0f} s: core 0 busy {}% | core 1 busy {}% | core 2 busy {}%", seconds, busyPercent(idleUs[0]), busyPercent(idleUs[1]), busyPercent(idleUs[2]));
++			cemuLog_log(LogType::Force, "[CPU] last {:.0f} s: core 0 busy {}%{} | core 1 busy {}%{} | core 2 busy {}%{}", seconds,
++				busyPercent(idleUs[0]), hostCpus(0), busyPercent(idleUs[1]), hostCpus(1), busyPercent(idleUs[2]), hostCpus(2));
 +		else
-+			cemuLog_log(LogType::Force, "[CPU] last {:.0f} s: emulated CPU busy {}% (single-core mode)", seconds, busyPercent(idleUs[0]));
++			cemuLog_log(LogType::Force, "[CPU] last {:.0f} s: emulated CPU busy {}%{} (single-core mode)", seconds, busyPercent(idleUs[0]), hostCpus(0));
 +		// the game's threads, twice: once things have started up and once in gameplay
 +		s_hitchSummaryIndex++;
 +		if (s_hitchSummaryIndex == 3 || s_hitchSummaryIndex == 12)
@@ -1298,10 +1321,22 @@ index 1429d08..fe27f06 100644
  				return FSA_RESULT::OK;
  
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 7c7571f..cfe9591 100644
+index 7c7571f..376399b 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-@@ -1282,12 +1282,77 @@ namespace coreinit
+@@ -14,6 +14,11 @@
+ #include "util/Fiber/Fiber.h"
+ 
+ #include "util/helpers/helpers.h"
++#if defined(__linux__)
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <fstream>
++#endif
+ 
+ #ifdef __arm64__
+ #if defined(__clang__)
+@@ -1282,12 +1287,101 @@ namespace coreinit
  
  	Fiber* g_idleLoopFiber[3]{};
  
@@ -1317,6 +1352,30 @@ index 7c7571f..cfe9591 100644
 +	{
 +		for (sint32 i = 0; i < 3; i++)
 +			idleUs[i] = s_coreIdleUs[i].exchange(0, std::memory_order_relaxed);
++	}
++
++	// Cemu LD+: which host (phone) CPU each emulated core ran on, sampled now and then
++	static std::atomic<uint32> s_hostCpuSamples[3][kHostCpuSampleSlots]{};
++
++	static void _SampleHostCpu()
++	{
++#if defined(__linux__)
++		static thread_local uint32 t_sampleCounter = 0;
++		if (((++t_sampleCounter) & 15) != 0)
++			return;
++		unsigned int cpu = 0;
++		if (syscall(SYS_getcpu, &cpu, nullptr, nullptr) != 0 || cpu >= kHostCpuSampleSlots)
++			return;
++		const sint32 core = std::clamp<sint32>(t_assignedCoreIndex, 0, 2);
++		s_hostCpuSamples[core][cpu].fetch_add(1, std::memory_order_relaxed);
++#endif
++	}
++
++	void __OSTakeHostCpuStats(uint32 samples[3][kHostCpuSampleSlots])
++	{
++		for (sint32 c = 0; c < 3; c++)
++			for (uint32 i = 0; i < kHostCpuSampleSlots; i++)
++				samples[c][i] = s_hostCpuSamples[c][i].exchange(0, std::memory_order_relaxed);
 +	}
 +
 +	// Cemu LD+: logs the game's threads (name, priority, which emulated cores they may run on) to help with performance and audio issues
@@ -1379,7 +1438,7 @@ index 7c7571f..cfe9591 100644
  		__OSUnlockScheduler();
  		while (true)
  		{
-@@ -1298,7 +1363,9 @@ namespace coreinit
+@@ -1298,7 +1392,9 @@ namespace coreinit
  				if (nextThread)
  				{
  					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
@@ -1389,16 +1448,103 @@ index 7c7571f..cfe9591 100644
  				}
  				__OSUnlockScheduler();
  			}
+@@ -1324,6 +1420,7 @@ namespace coreinit
+ 
+ 		OSHostThread* hostThread = (OSHostThread*)Fiber::GetFiberPrivateData();
+         cemu_assert_debug(hostThread);
++		_SampleHostCpu();
+ 
+ 		//if (ppcInterpreterCurrentInstance)
+ 		//	debug_printf("Core %d store thread %08x (t = %d)\n", hostThread->ppcInstance.sprNew.UPIR, memory_getVirtualOffsetFromPointer(hostThread->thread), t_assignedCoreIndex);
+@@ -1426,9 +1523,76 @@ namespace coreinit
+ 	}
+ #endif
+ 
++#if defined(__linux__)
++	// Cemu LD+: phones mix fast CPU cores with slow power-saving ones. In multi-core mode each emulated Wii U core runs on
++	// its own thread, and Android may put a lightly loaded one on a slow core. The cores have to keep pace with each other
++	// and with real time (the audio mixer runs on one of them), so keep them on the faster CPUs.
++	static void _KeepOnFastHostCpus(uintptr_t coreIndex)
++	{
++		static std::mutex s_mutex;
++		static bool s_checked = false;
++		static uint64 s_fastMask = 0;
++		{
++			std::unique_lock _l(s_mutex);
++			if (!s_checked)
++			{
++				s_checked = true;
++				const long cpuCount = std::clamp<long>(sysconf(_SC_NPROCESSORS_CONF), 0, 64);
++				std::vector<uint64> maxKHz((size_t)cpuCount, 0);
++				uint64 fastest = 0;
++				for (long cpu = 0; cpu < cpuCount; cpu++)
++				{
++					std::ifstream f(fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu));
++					uint64 v = 0;
++					if (f >> v)
++						maxKHz[(size_t)cpu] = v;
++					fastest = std::max(fastest, maxKHz[(size_t)cpu]);
++				}
++				std::string speeds;
++				uint32 fastCount = 0, knownCount = 0;
++				for (long cpu = 0; cpu < cpuCount; cpu++)
++				{
++					if (maxKHz[(size_t)cpu] == 0)
++						continue;
++					knownCount++;
++					speeds.append(fmt::format("{}{}:{}", speeds.empty() ? "" : " ", cpu, maxKHz[(size_t)cpu] / 1000));
++					if (maxKHz[(size_t)cpu] * 10 >= fastest * 7)
++					{
++						s_fastMask |= (1ull << cpu);
++						fastCount++;
++					}
++				}
++				cemuLog_log(LogType::Force, "[CPU] host CPU top speeds in MHz (cpu:speed): {}", speeds.empty() ? "unknown" : speeds);
++				if (fastCount < 3 || fastCount >= knownCount)
++				{
++					s_fastMask = 0; // no clear split between fast and slow CPUs, leave it to Android
++					cemuLog_log(LogType::Force, "[CPU] emulated CPU cores can use any host CPU");
++				}
++				else
++				{
++					std::string list;
++					for (uint32 cpu = 0; cpu < 64; cpu++)
++						if ((s_fastMask >> cpu) & 1)
++							list.append(fmt::format("{}{}", list.empty() ? "" : ",", cpu));
++					cemuLog_log(LogType::Force, "[CPU] keeping the emulated CPU cores on the faster host CPUs ({})", list);
++				}
++			}
++		}
++		if (s_fastMask == 0)
++			return;
++		uint64 mask = s_fastMask;
++		if (syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask) != 0)
++			cemuLog_log(LogType::Force, "[CPU] could not set host CPUs for emulated core {} (error {})", coreIndex, errno);
++	}
++#endif
++
+ 	void OSSchedulerCoreEmulationThread(void* _assignedCoreIndex)
+ 	{
+ 		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
++#if defined(__linux__)
++		if (g_isMulticoreMode)
++			_KeepOnFastHostCpus((uintptr_t)_assignedCoreIndex);
++#endif
+ 		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
+ 
+ 		enableFlushDenormalsToZero();
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-index 974b52f..572c802 100644
+index 974b52f..5da9584 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-@@ -513,6 +513,10 @@ namespace coreinit
+@@ -513,6 +513,12 @@ namespace coreinit
  
  	bool __CemuIsMulticoreMode();
  
 +	// Cemu LD+: performance log helpers
 +	void __OSTakeCoreIdleStats(uint64 idleUs[3]);
++	constexpr uint32 kHostCpuSampleSlots = 16;
++	void __OSTakeHostCpuStats(uint32 samples[3][kHostCpuSampleSlots]);
 +	void __OSLogThreadList(const OSThread_t* audioThread);
 +
  	OSThread_t* OSGetDefaultThread(sint32 coreIndex);
@@ -1710,10 +1856,16 @@ index 00ceff9..38a5726 100644
  		std::queue<std::array<uint8, 32>> m_queries;
  	};
 diff --git a/src/Cafe/OS/libs/snd_core/ax.h b/src/Cafe/OS/libs/snd_core/ax.h
-index 0861e6a..5448c9d 100644
+index 0861e6a..b755fb2 100644
 --- a/src/Cafe/OS/libs/snd_core/ax.h
 +++ b/src/Cafe/OS/libs/snd_core/ax.h
-@@ -263,6 +263,9 @@ namespace snd_core
+@@ -258,11 +258,14 @@ namespace snd_core
+ 
+ 	void AXIst_Init();
+ 	void AXIst_ThreadEntry(PPCInterpreter_t* hCPU);
+-	void AXIst_QueueFrame();
++	bool AXIst_QueueFrame(); // false if the audio thread's queue is full
+ 
  	void AXResetCallbacks();
  
  	bool AXIst_IsFrameBeingProcessed();
@@ -1744,7 +1896,7 @@ index 0861e6a..5448c9d 100644
  }
 \ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_ist.cpp b/src/Cafe/OS/libs/snd_core/ax_ist.cpp
-index 9be0c40..91cd73b 100644
+index 9be0c40..6864268 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_ist.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_ist.cpp
 @@ -606,6 +606,7 @@ namespace snd_core
@@ -1755,6 +1907,23 @@ index 9be0c40..91cd73b 100644
  		if (AXVoiceProtection_IsProtectedByAnyThread(vpb))
  		{
  			// if voice is currently protected, dont sync remaining flags
+@@ -1042,14 +1043,14 @@ namespace snd_core
+ 
+ 	SysAllocator<coreinit::OSMessage> _queueFrameMsg;
+ 
+-	void AXIst_QueueFrame()
++	bool AXIst_QueueFrame()
+ 	{
+ 		coreinit::OSMessage* msg = _queueFrameMsg.GetPtr();
+ 		msg->message = 1;
+ 		msg->data0 = 0;
+ 		msg->data1 = 0;
+ 		msg->data2 = 0;
+-		OSSendMessage(__AXIstThreadMsgQueue.GetPtr(), msg, 0);
++		return OSSendMessage(__AXIstThreadMsgQueue.GetPtr(), msg, 0) != 0;
+ 	}
+ 
+ 	void AXIst_StopThread()
 @@ -1070,4 +1071,26 @@ namespace snd_core
  	{
  		return __AXIstIsProcessingFrame.load();
@@ -1817,7 +1986,7 @@ index 31a24a4..f94364d 100644
  
  	// mix audio generated from voice into main bus and aux buses
 diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-index 6cb1599..36f2de0 100644
+index 6cb1599..fd75205 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
 @@ -216,86 +216,202 @@ namespace snd_core
@@ -1947,13 +2116,7 @@ index 6cb1599..36f2de0 100644
 +		else if (__AXMode[AX_DEV_TV] == AX_MODE_MONO)
 +			channelCount = 1;
 +		else
- 		{
--			sint32* inputChannel0 = __AXTVBuffer48.GetPtr() + numSamples * 0;
--			sint32* inputChannel1 = __AXTVBuffer48.GetPtr() + numSamples * 1;
--			sint32* inputChannel2 = __AXTVBuffer48.GetPtr() + numSamples * 2;
--			sint32* inputChannel3 = __AXTVBuffer48.GetPtr() + numSamples * 3;
--			sint32* inputChannel4 = __AXTVBuffer48.GetPtr() + numSamples * 4;
--			sint32* inputChannel5 = __AXTVBuffer48.GetPtr() + numSamples * 5;
++		{
 +			assert_dbg();
 +			return;
 +		}
@@ -1961,7 +2124,13 @@ index 6cb1599..36f2de0 100644
 +		static float s_planar[TVOutputLimiter::kMaxChannels][AX_SAMPLES_PER_3MS_48KHZ];
 +		float* planar[TVOutputLimiter::kMaxChannels];
 +		for (sint32 c = 0; c < channelCount; c++)
-+		{
+ 		{
+-			sint32* inputChannel0 = __AXTVBuffer48.GetPtr() + numSamples * 0;
+-			sint32* inputChannel1 = __AXTVBuffer48.GetPtr() + numSamples * 1;
+-			sint32* inputChannel2 = __AXTVBuffer48.GetPtr() + numSamples * 2;
+-			sint32* inputChannel3 = __AXTVBuffer48.GetPtr() + numSamples * 3;
+-			sint32* inputChannel4 = __AXTVBuffer48.GetPtr() + numSamples * 4;
+-			sint32* inputChannel5 = __AXTVBuffer48.GetPtr() + numSamples * 5;
 +			const sint32* input = __AXTVBuffer48.GetPtr() + AIGetSamplesPerChannel(AX_DEV_TV) * c;
 +			for (sint32 i = 0; i < numSamples; i++)
 +				s_planar[c][i] = (float)_swapEndianS32(input[i]) * boostGain;
@@ -2076,6 +2245,110 @@ index 6cb1599..36f2de0 100644
  	}
  
  	void AIInitDRCDMA(sint16* sampleData, sint32 size)
+@@ -475,12 +591,18 @@ namespace snd_core
+ 	}
+ 
+ 	// called periodically to check for AX updates
++	// Cemu LD+: every 3 ms tick that passes is now counted as a frame the game owes, and missed ticks are made up by
++	// queueing several frames at once. Before, a tick was simply skipped when the previous frame wasn't mixed yet. In
++	// multi-core mode the audio thread runs on another emulated core and often needed a little longer than one tick to get
++	// its turn, so in busy areas up to a third of all audio frames were skipped, which made the sound crunchy and choppy.
+ 	void AXOut_update()
+ 	{
+ 		constexpr static auto kTimeout = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(((IAudioAPI::kBlockCount * 3) / 4) * (AX_FRAMES_PER_GROUP * 3)));
+ 		constexpr static auto kWaitDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(3));
+ 		constexpr static auto kWaitDurationFast = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(2900));
+ 		constexpr static auto kWaitDurationMinimum = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(1700));
++		constexpr static uint32 kMaxFramesInFlight = 4; // queued but not yet mixed (12 ms of audio); the audio thread's message queue holds 16
++		constexpr static uint32 kMaxFramesOwed = (uint32)(kTimeout / kWaitDuration); // beyond this we're too far behind and skip forward
+ 
+ 		// if we haven't buffered any blocks, we will wait less time than usual
+ 		bool additional_blocks_required = false;
+@@ -492,40 +614,61 @@ namespace snd_core
+ 
+ 		const auto wait_duration = additional_blocks_required ? kWaitDurationFast : kWaitDuration;
+ 
+-		// s_ax_interval_timer increases by the wait period
+-		// it can lag behind by multiple periods (up to kTimeout) if there is minor stutter in the CPU thread
+-		// s_last_check is always set to the timestamp at the time of firing
+-		// it's used to enforce the minimum wait delay (we want to avoid calling AX update in quick succession because other threads may need to do work first) 
+-
++		// s_ax_interval_timer increases by the wait period for every frame that becomes due
++		// s_last_check enforces the minimum delay between queueing rounds (other threads may need to do work first)
+ 		static auto s_ax_interval_timer = now_cached() - kWaitDuration;
+ 		static auto s_last_check = now_cached();
++		static uint32 s_framesOwed = 0;
+ 
+ 		const auto now = now_cached();
+-		const auto diff = (now - s_ax_interval_timer);
++		auto diff = (now - s_ax_interval_timer);
+ 
+-		if (diff < wait_duration)
++		// if we're too far behind (long stall or pause), skip forward
++		if (diff >= kTimeout)
++		{
++			s_ax_interval_timer = now - wait_duration;
++			diff = wait_duration;
++			s_framesOwed = 0;
++		}
++		while (diff >= wait_duration)
++		{
++			s_framesOwed++;
++			s_ax_interval_timer += wait_duration;
++			diff -= wait_duration;
++		}
++		if (s_framesOwed > kMaxFramesOwed)
++			s_framesOwed = kMaxFramesOwed;
++		if (s_framesOwed == 0)
+ 			return;
+ 
+-		// handle minimum wait time (1.7MS)
+-		if ((now - s_last_check) < kWaitDurationMinimum)
++		// handle minimum wait time (1.7MS), unless we're catching up
++		if (s_framesOwed < 2 && (now - s_last_check) < kWaitDurationMinimum)
+ 			return;
+ 		s_last_check = now;
+ 
+-		// if we're too far behind, skip forward
+-		if (diff >= kTimeout)
+-			s_ax_interval_timer = (now - wait_duration);
+-		else
+-			s_ax_interval_timer += wait_duration;
+-
+-
+-		if (snd_core::isInitialized())
++		if (!snd_core::isInitialized())
+ 		{
+-			if (numQueuedFramesSndGeneric == snd_core::getNumProcessedFrames())
+-			{
+-				AXOut_updateDevicePlayState(true);
+-				snd_core::AXIst_QueueFrame();
+-				numQueuedFramesSndGeneric++;
+-			}
++			s_framesOwed = 0;
++			return;
++		}
++		uint32 inFlight = numQueuedFramesSndGeneric - snd_core::getNumProcessedFrames();
++		if (inFlight > 16)
++		{
++			// the counters got out of step (more than the audio thread's queue can hold), start over from the processed count
++			numQueuedFramesSndGeneric = snd_core::getNumProcessedFrames();
++			inFlight = 0;
++		}
++		if (inFlight >= kMaxFramesInFlight)
++			return;
++		AXOut_updateDevicePlayState(true);
++		uint32 toQueue = std::min(s_framesOwed, kMaxFramesInFlight - inFlight);
++		while (toQueue > 0)
++		{
++			if (!snd_core::AXIst_QueueFrame())
++				break; // queue full, try again next time
++			numQueuedFramesSndGeneric++;
++			s_framesOwed--;
++			toQueue--;
+ 		}
+ 	}
+ 
 diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 index d4e562e..3f225ff 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
@@ -2404,6 +2677,19 @@ index 1190bf4..77319a1 100644
 +	env->SetIntArrayRegion(result, 0, 12, values);
 +	return result;
 +}
+diff --git a/src/android/app/src/main/cpp/NativeEmulation.cpp b/src/android/app/src/main/cpp/NativeEmulation.cpp
+index 82c1117..ac07e81 100644
+--- a/src/android/app/src/main/cpp/NativeEmulation.cpp
++++ b/src/android/app/src/main/cpp/NativeEmulation.cpp
+@@ -46,6 +46,8 @@ namespace NativeEmulation
+ 				snd_core::AX_SAMPLES_PER_3MS_48KHZ * AX_FRAMES_PER_GROUP,
+ 				16);
+ 			audioDevice->SetVolume(volume);
++			if (isTV)
++				audioDevice->EnableOutputStats(); // Cemu LD+: sound output health in the performance log
+ 			break;
+ 		}
+ #endif // HAS_CUBEB
 diff --git a/src/android/app/src/main/cpp/NativeLogging.cpp b/src/android/app/src/main/cpp/NativeLogging.cpp
 index 19a7547..27b96a6 100644
 --- a/src/android/app/src/main/cpp/NativeLogging.cpp
@@ -5957,18 +6243,19 @@ index f6d5d51..0a5198d 100644
  	}
  
 diff --git a/src/audio/IAudioAPI.cpp b/src/audio/IAudioAPI.cpp
-index 05b9ac1..d11db55 100644
+index 05b9ac1..6b193f9 100644
 --- a/src/audio/IAudioAPI.cpp
 +++ b/src/audio/IAudioAPI.cpp
-@@ -129,6 +129,7 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
+@@ -129,6 +129,8 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
  
  	audioAPIDev = CreateDevice(audio_api, device_description, rate, channels, samples_per_block, bits_per_sample);
  	audioAPIDev->SetVolume(GetVolumeFromType(type));
-+	audioAPIDev->m_countStats = (type == TV);
++	if (type == TV)
++		audioAPIDev->EnableOutputStats();
  
  	return audioAPIDev;
  }
-@@ -206,6 +207,50 @@ void IAudioAPI::SetAudioDelayOverride(uint32 delay)
+@@ -206,6 +208,50 @@ void IAudioAPI::SetAudioDelayOverride(uint32 delay)
  	m_audioDelayOverride = delay;
  }
  
@@ -6020,10 +6307,10 @@ index 05b9ac1..d11db55 100644
  {
  	return m_audioDelayOverride > 0 ? m_audioDelayOverride : s_audioDelay;
 diff --git a/src/audio/IAudioAPI.h b/src/audio/IAudioAPI.h
-index 40e42e0..2aa9eac 100644
+index 40e42e0..93fb736 100644
 --- a/src/audio/IAudioAPI.h
 +++ b/src/audio/IAudioAPI.h
-@@ -72,6 +72,16 @@ public:
+@@ -72,6 +72,17 @@ public:
  	static std::unique_ptr<IAudioAPI> CreateDeviceFromConfig(AudioType type, sint32 rate, sint32 samples_per_block, sint32 bits_per_sample);
  	static std::unique_ptr<IAudioAPI> CreateDeviceFromConfig(AudioType type, sint32 rate, sint32 channels, sint32 samples_per_block, sint32 bits_per_sample);
  	static std::unique_ptr<IAudioAPI> CreateDevice(AudioAPI api, const DeviceDescriptionPtr& device, sint32 samplerate, sint32 channels, sint32 samples_per_block, sint32 bits_per_sample);
@@ -6037,10 +6324,11 @@ index 40e42e0..2aa9eac 100644
 +		uint32 lowestBufferUs; // lowest amount of buffered sound seen (UINT32_MAX if no data)
 +	};
 +	static OutputStats TakeTVOutputStats();
++	void EnableOutputStats() { m_countStats = true; } // call on the TV device
  	static std::vector<DeviceDescriptionPtr> GetDevices(AudioAPI api);
  
  protected:
-@@ -88,6 +98,12 @@ protected:
+@@ -88,6 +99,12 @@ protected:
  	static std::array<bool, AudioAPIEnd> s_availableApis;
  	uint32 m_audioDelayOverride = 0;
  

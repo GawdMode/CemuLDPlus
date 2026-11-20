@@ -193,17 +193,24 @@ a moment longer to appear the first time, but the game itself keeps running smoo
 
 ### Multi-core fixes (build 25 and later)
 
-Two problems that only show up with **CPU mode: Multi-core recompiler**, where the three emulated Wii U CPU cores run
-on separate threads at the same time:
+Fixes for **CPU mode: Multi-core recompiler**, where the three emulated Wii U CPU cores run on separate threads at the
+same time:
 
-- **Crunchy sound.** The game's sound code protects a voice while it changes several of its settings, so the audio
-  mixer never picks up half the changes. Cemu refused that protection whenever the mixer was working on a frame, which
-  is meant only for calls made from inside the mixer. With multi-core, the game's sound code runs on another core at
-  the same time as the mixer, so its calls were refused at random. Protection counts went out of step and voices kept
-  their old volume, position or state. Now only calls from the mixer itself are refused.
-- **Memory order on ARM.** Games use `sync`/`lwsync` instructions to make sure data written on one core is complete
-  before another core reads it. On a PC the processor keeps that order anyway, so Cemu skips those instructions. ARM
-  processors can reorder memory accesses, so in multi-core mode Cemu LD+ now turns them into real memory barriers.
+- **Crunchy sound (build 26).** The game's sound is mixed in 3 ms pieces by an audio thread that runs on one of the
+  emulated cores. Cemu only asked for the next piece once the previous one was finished, and silently skipped a piece
+  whenever the audio thread hadn't gotten its turn yet. With multi-core, the audio thread often needed a bit longer than
+  3 ms to get its turn in busy areas, so up to a third of the sound was skipped (the build 25 log showed 2090 of 3340
+  pieces in 10 seconds). Now every missed piece is counted and made up, a few at a time.
+- **Fast CPU cores (build 26).** Phones mix fast CPU cores with slow power-saving ones. Android sometimes put an
+  emulated core that wasn't fully busy on a slow one, so it fell behind the others. The emulated cores are now kept on
+  the faster CPUs (the log lists which ones).
+- **Memory order on ARM (build 25).** Games use `sync`/`lwsync` instructions to make sure data written on one core is
+  complete before another core reads it. On a PC the processor keeps that order anyway, so Cemu skips those
+  instructions. ARM processors can reorder memory accesses, so in multi-core mode Cemu LD+ turns them into real memory
+  barriers.
+- **Voice protection (build 25).** Cemu refused the game's "don't touch this voice while I change it" calls whenever a
+  sound frame was being mixed, even when the call came from another core. Now only calls from inside the mixer are
+  refused.
 
 ### Vehicle tags (build 17 and later)
 
