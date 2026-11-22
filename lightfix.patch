@@ -4125,6 +4125,26 @@ index 4223eaa1..38da9be9 100644
  
          // GPR info
          CrashLog_WriteLine("");
+diff --git a/src/Common/unix/FileStream_unix.cpp b/src/Common/unix/FileStream_unix.cpp
+index 6ae9d71e..19923127 100644
+--- a/src/Common/unix/FileStream_unix.cpp
++++ b/src/Common/unix/FileStream_unix.cpp
+@@ -243,12 +243,13 @@ void FileStreamUnix::SyncReadWriteSeek(bool nextOpIsWrite)
+ 	m_prevOperationWasWrite = nextOpIsWrite;
+ }
+ 
+-bool FileStream::WriteFileAtomic(const fs::path& path, std::span<uint8> fileData, bool allowTargetFileRename)
++// Cemu LD+: spelled out as FileStreamUnix because FileStream is FileStreamAndroid on Android
++bool FileStreamUnix::WriteFileAtomic(const fs::path& path, std::span<uint8> fileData, bool allowTargetFileRename)
+ {
+ 	std::error_code ec;
+ 	fs::path altPath = path;
+ 	altPath.replace_extension( _utf8ToPath(_pathToUtf8(altPath.extension()).append("_tmp")));
+-	FileStream* fsAlt = FileStream::createFile2(altPath);
++	FileStreamUnix* fsAlt = FileStreamUnix::createFile2(altPath);
+ 	if (!fsAlt)
+ 		return false;
+ 	if (fsAlt->writeData(fileData.data(), fileData.size()) != fileData.size())
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
 index be9929f6..4f17194e 100644
 --- a/src/android/app/build.gradle.kts
