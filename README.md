@@ -7,9 +7,10 @@ An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco
 - **Toy Pad on the second screen** (for example the AYN Thor's bottom screen) with every character and vehicle
   ready to place, pictures, Toy Tags, franchise logos, search and every figure's abilities.
 - **Better sound:** fixed sound filter, balanced left/right with a simple reverb, and an optional volume boost.
-
 - **Newer, faster Cemu (build 30):** based on the current official Cemu (November 2026) instead of the April
   version, plus some speedups ported from [Fractal](https://github.com/dfdx047/Fractal). See *Performance* below.
+- **Its own icon (build 32):** a red brick on a blue vortex, so it's easy to tell apart from regular Cemu on your
+  home screen.
 
 Everything else matches SSimco's Android Cemu, including the built-in emulated Toy Pad.
 
