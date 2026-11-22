@@ -8,6 +8,9 @@ An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco
   ready to place, pictures, Toy Tags, franchise logos, search and every figure's abilities.
 - **Better sound:** fixed sound filter, balanced left/right with a simple reverb, and an optional volume boost.
 
+- **Newer, faster Cemu (build 28):** based on the current official Cemu (November 2026) instead of the April
+  version, plus some speedups ported from [Fractal](https://github.com/dfdx047/Fractal). See *Performance* below.
+
 Everything else matches SSimco's Android Cemu, including the built-in emulated Toy Pad.
 
 > This project used to be called **Cemu Light Fix**. Old links and the installed app keep working: new builds
@@ -192,6 +195,25 @@ competed with the game for the fast cores, so the frame rate dropped whenever ma
 (new areas, open worlds). Cemu LD+ now lowers their priority on Android too. Objects built in the background can take
 a moment longer to appear the first time, but the game itself keeps running smoothly.
 
+### Performance (build 28 and later)
+
+Build 28 moves Cemu LD+ from the April 2026 Cemu to the official Cemu of November 20, 2026, merged into SSimco's
+current Android port. That brings the Cemu team's work since April, including a much lighter render thread
+(incremental state checks, faster shader and pipeline lookups) and faster ARM code for floating point stores. On top
+of that, these changes come from [Fractal](https://github.com/dfdx047/Fractal), another Cemu fork for Android:
+
+- **Turnip fence fix.** On Turnip drivers (including custom ones like PurpleVK), checking whether the GPU finished a
+  command buffer blocks until it has, so the render thread waited for every command buffer. Each command buffer now
+  writes a marker when it's done, and the fence is only checked once the marker says so.
+- **Faster recompiled code.** The cycle counter stays in a CPU register, recompiled functions sit next to each other
+  in one code area, and some common checks are shorter. Fractal measured about 5% in CPU-bound games.
+- **Recompiler fixes.** Very large functions stay within ARM branch range, `stwcx.` on an unaligned address no longer
+  crashes, fused multiply-add matches the real Wii U CPU, and `ps_nabs`/`dcbt` no longer fall back to the slower
+  interpreter.
+- **Precompiled pipelines.** Pipelines prepared at boot from the shader cache are built from the stored render state,
+  so they're not thrown away and built again in game.
+- **Flush-to-zero on Android.** Tiny floating point values are rounded to zero like on the Wii U and on PC builds.
+
 ### Multi-core fixes (build 25 and later)
 
 Fixes for **CPU mode: Multi-core recompiler**, where the three emulated Wii U CPU cores run on separate threads at the
@@ -251,14 +273,18 @@ technique might also benefit, and might also have new issues. Reports are welcom
 
 ## How it's built
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) downloads SSimco/Cemu at a fixed commit, applies
-`lightfix.patch`, builds the APK on GitHub Actions, and publishes it to Releases. The full source for every
-build is SSimco's code at that commit plus the patch in this repo.
+[`.github/workflows/build.yml`](.github/workflows/build.yml) downloads SSimco/Cemu's `android` branch at a fixed
+commit, merges the official Cemu main branch at a fixed commit into it (where both changed the same lines,
+SSimco's side is kept and `lightfix.patch` carries the rest of the merge), applies `lightfix.patch`, builds the APK
+on GitHub Actions, and publishes it to Releases. The full source for every build is that merge plus the patch in
+this repo.
 
 ## Credits and license
 
 - [Cemu](https://github.com/cemu-project/Cemu) by the Cemu team
 - [Android port](https://github.com/SSimco/Cemu) by SSimco
+- Recompiler speedups, the Turnip fence fix, the precompiled pipeline fix and a few other fixes ported from
+  [Fractal](https://github.com/dfdx047/Fractal) by dfdx047 (MPL-2.0)
 - Lighting fix by GawdMode
 - Figure pictures (downloaded on your device, not included here) from the
   [LEGO-Dimensions-NFC](https://github.com/skylandersNFC/LEGO-Dimensions-NFC) community collection (Chteupnin's assets)

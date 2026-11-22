@@ -1,5 +1,46 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 90491352..86017f26 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -242,6 +242,10 @@ if (ENABLE_HIDAPI)
+ 	add_compile_definitions(HAS_HIDAPI)
+ endif ()
+ 
++if (HAS_WIIMOTE)
++	add_compile_definitions(HAS_WIIMOTE=1)
++endif ()
++
+ if(UNIX AND NOT APPLE AND NOT ANDROID)
+ 	if(ENABLE_FERAL_GAMEMODE)
+ 		add_compile_definitions(ENABLE_FERAL_GAMEMODE)
+diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterLoadStore.hpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterLoadStore.hpp
+index ea7bb038..3f2fc4a8 100644
+--- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterLoadStore.hpp
++++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterLoadStore.hpp
+@@ -71,7 +71,20 @@ static void PPCInterpreter_STWCX(PPCInterpreter_t* hCPU, uint32 Opcode)
+ 			wordPtr = _rawPtrToAtomic((uint32be*)memory_getPointerFromVirtualOffset(ea));
+ 		}
+ 		uint32be newValue = hCPU->gpr[rS];
+-		if (!wordPtr->compare_exchange_strong(reservedValue, newValue))
++		// Fractal: an atomic compare-exchange on an address that is not 4 byte aligned faults on ARM (SIGBUS); x86 allows
++		// it. Same plain compare and store as the AArch64 recompiler there (see AArch64GenContext_t::atomic_cmp_store)
++		bool stored;
++		if ((ea & 3) != 0)
++		{
++			uint32be current;
++			memcpy(&current, (void*)wordPtr, 4);
++			stored = current == reservedValue;
++			if (stored)
++				memcpy((void*)wordPtr, &newValue, 4);
++		}
++		else
++			stored = wordPtr->compare_exchange_strong(reservedValue, newValue);
++		if (!stored)
+ 		{
+ 			// failed
+ 			ppc_setCRBit(hCPU, CR_BIT_LT, 0);
 diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
-index 7809a01..3c28c01 100644
+index 7809a01d..3c28c01e 100644
 --- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
 +++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterOPC.cpp
 @@ -322,7 +322,8 @@ void PPCInterpreter_ICBI(PPCInterpreter_t* hCPU, uint32 Opcode)
@@ -32,96 +73,1000 @@ index 7809a01..3c28c01 100644
  	PPCInterpreter_nextInstruction(hCPU);
  }
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
-index 2555101..987e170 100644
+index f1f77b31..32d5ac60 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
-@@ -941,6 +941,12 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
+@@ -7,6 +7,7 @@
+ #include <xbyak_aarch64_util.h>
+ 
+ #include <cstddef>
++#include <sys/mman.h>
+ 
+ #include "../PPCRecompiler.h"
+ #include "Common/precompiled.h"
+@@ -58,6 +59,18 @@ static const GPReg LR{TEMP_GPR_2_ID};
+ 
+ static const FPReg TEMP_FPR{TEMP_FPR_ID};
+ 
++// remainingCycles is decremented at the start of every segment and tested on every backward jump.
++// Kept in memory, each segment pays a load, a subtract and a store, and the next test reloads it:
++// one long dependency chain through store-to-load forwarding. With the register it is one sub.
++// Synchronised with PPCInterpreter_t::remainingCycles when entering and leaving recompiled code and
++// around HLE calls (the only C++ code that runs in between and reads or changes it).
++static const GPReg CYCLES_REG{IMLArchAArch64::PHYSREG_GPR_CYCLES};
++bool PPCRecompilerAArch64_cyclesInRegister()
++{
++	static const bool s_enabled = 1 /* Fractal tunable jit_cycles_reg */ != 0;
++	return s_enabled;
++}
++
+ static const util::Cpu s_cpu;
+ 
+ class AArch64Allocator : public Allocator
+@@ -97,6 +110,59 @@ class AArch64Allocator : public Allocator
+ 	}
+ };
+ 
++
++// Recompiled functions are packed into one large executable mapping. xbyak's allocator gives every
++// function its own page-aligned buffer: all function entries then share the same few L1 instruction
++// cache sets and every call lands on another page (iTLB), and each function wastes at least 4 KB.
++// Code is generated into a temporary buffer as before and copied here; it only uses PC-relative
++// references inside the function and absolute addresses for everything else, so it can move.
++// Functions are never freed (the old buffers weren't either). perf/tuning.txt jit_arena=0 disables it.
++class JitCodeArena
++{
++  public:
++	static void* Put(const void* code, size_t size)
++	{
++		static JitCodeArena s_arena;
++		return s_arena.put(code, size);
++	}
++
++  private:
++	static constexpr size_t RESERVE = 512 * 1024 * 1024;
++	static constexpr size_t ALIGN = 64;
++
++	JitCodeArena()
++	{
++		if (1 /* Fractal tunable jit_arena */ == 0)
++			return;
++		void* p = mmap(nullptr, RESERVE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++		if (p == MAP_FAILED)
++		{
++			cemuLog_log(LogType::Force, "Recompiler: could not map the code arena, using one buffer per function");
++			return;
++		}
++		m_base = (uint8*)p;
++	}
++
++	void* put(const void* code, size_t size)
++	{
++		if (!m_base)
++			return nullptr;
++		std::lock_guard lock(m_mutex);
++		size_t offset = (m_used + ALIGN - 1) & ~(ALIGN - 1);
++		if (offset + size > RESERVE)
++			return nullptr;
++		uint8* dst = m_base + offset;
++		memcpy(dst, code, size);
++		__builtin___clear_cache((char*)dst, (char*)dst + size);
++		m_used = offset + size;
++		return dst;
++	}
++
++	uint8* m_base = nullptr;
++	size_t m_used = 0;
++	std::mutex m_mutex;
++};
++
+ struct UnconditionalJumpInfo
+ {
+ 	IMLSegment* target;
+@@ -107,6 +173,9 @@ struct ConditionalRegJumpInfo
+ 	IMLSegment* target;
+ 	WReg regBool;
+ 	bool mustBeTrue;
++	// regBool is cset(cond) and the flags still hold that compare: branch on the flags (b.cond)
++	bool useFlags = false;
++	Cond cond = Cond::EQ;
+ };
+ 
+ struct NegativeRegValueJumpInfo
+@@ -152,22 +221,198 @@ struct AArch64GenContext_t : CodeGenerator
+ 	void jump(IMLSegment* imlSegment);
+ 	void conditionalJumpCycleCheck(IMLSegment* imlSegment);
+ 
++	// operands of the last cmp and the code size right after its cset (see compare())
++	struct
++	{
++		size_t end = SIZE_MAX;
++		uint32 a, b;
++		sint32 imm;
++		bool isImm;
++	} m_lastCmp;
++
++	// bool registers produced by cset from the current NZCV (one PPC compare sets up to 3 of them
++	// from the same cmp). Cleared when an instruction that may change the flags is emitted
++	struct FlagsBool
++	{
++		uint32 reg;
++		Cond cond;
++	};
++	std::array<FlagsBool, 4> m_flagsBools;
++	size_t m_flagsBoolCount = 0;
++	void flagsBoolSet(uint32 reg, Cond cond, bool flagsReused)
++	{
++		if (!flagsReused)
++			m_flagsBoolCount = 0;
++		flagsBoolForget(reg);
++		if (m_flagsBoolCount < m_flagsBools.size())
++			m_flagsBools[m_flagsBoolCount++] = {reg, cond};
++	}
++	void flagsBoolForget(uint32 reg)
++	{
++		for (size_t i = 0; i < m_flagsBoolCount;)
++		{
++			if (m_flagsBools[i].reg == reg)
++				m_flagsBools[i] = m_flagsBools[--m_flagsBoolCount];
++			else
++				i++;
++		}
++	}
++	const FlagsBool* flagsBoolFind(uint32 reg) const
++	{
++		for (size_t i = 0; i < m_flagsBoolCount; i++)
++			if (m_flagsBools[i].reg == reg)
++				return &m_flagsBools[i];
++		return nullptr;
++	}
++	// after emitting an instruction other than compare/cjump
++	void flagsBoolTrackBefore(const IMLInstruction* imlInstruction)
++	{
++		if (m_flagsBoolCount == 0)
++			return;
++		switch (imlInstruction->type)
++		{
++		// emitters that never write NZCV nor call out
++		case IMLType::R_NAME:
++		case IMLType::NAME_R:
++		case IMLType::R_R:
++		case IMLType::R_S32:
++		case IMLType::R_R_S32:
++		case IMLType::LOAD:
++		case IMLType::LOAD_INDEXED:
++		case IMLType::STORE:
++		case IMLType::STORE_INDEXED:
++		case IMLType::NO_OP:
++		case IMLType::FPR_LOAD:
++		case IMLType::FPR_LOAD_INDEXED:
++		case IMLType::FPR_R_R:
++		case IMLType::FPR_R_R_R:
++		case IMLType::FPR_R:
++		{
++			IMLUsedRegisters used;
++			imlInstruction->CheckRegisterUsage(&used);
++			used.ForEachWrittenGPR([&](IMLReg r) { flagsBoolForget(r.GetRegID()); });
++			return;
++		}
++		default:
++			m_flagsBoolCount = 0;
++			return;
++		}
++	}
++	static bool flagBranchEnabled()
++	{
++		static const bool s_enabled = 1 /* Fractal tunable jit_flag_branch */ != 0;
++		return s_enabled;
++	}
+ 	static constexpr size_t MAX_JUMP_INSTR_COUNT = 2;
++	// instructions reserved per jump. Functions are first generated with 1 (every conditional jump
++	// within reach of a single tbz/cbz, no nop left behind) and regenerated with 2 if one doesn't fit
++	size_t m_jumpSlots = MAX_JUMP_INSTR_COUNT;
+ 	std::list<std::pair<size_t, JumpInfo>> jumps;
++
++	// immediate add/sub/cmp in one instruction where an imm12 (optionally << 12) fits, also for
++	// negative values (sub/add/cmn of the magnitude). xbyak's *_imm helpers only do positive imm12
++	static bool shortImmEnabled()
++	{
++		static const bool s_enabled = 1 /* Fractal tunable jit_short_imm */ != 0;
++		return s_enabled;
++	}
++	static bool fitsAddSubImm(uint32 v) { return v < 0x1000 || ((v & 0xfff) == 0 && v < 0x1000000); }
++	void emitAddSubImm(const WReg& dst, const WReg& src, uint32 v, bool isSub)
++	{
++		uint32 sh = v < 0x1000 ? 0 : 12;
++		uint32 imm = sh ? (v >> 12) : v;
++		if (isSub)
++			sub(dst, src, imm, sh);
++		else
++			add(dst, src, imm, sh);
++	}
++	void addImm32(const WReg& dst, const WReg& src, sint32 imm, const WReg& tmp)
++	{
++		uint32 v = (uint32)imm;
++		if (shortImmEnabled() && fitsAddSubImm(v))
++			emitAddSubImm(dst, src, v, false);
++		else if (shortImmEnabled() && imm < 0 && fitsAddSubImm(0u - v))
++			emitAddSubImm(dst, src, 0u - v, true);
++		else
++			add_imm(dst, src, imm, tmp);
++	}
++	void subImm32(const WReg& dst, const WReg& src, sint32 imm, const WReg& tmp)
++	{
++		if (imm == std::numeric_limits<sint32>::min())
++		{
++			sub_imm(dst, src, imm, tmp);
++			return;
++		}
++		addImm32(dst, src, -imm, tmp);
++	}
++	void cmpImm32(const WReg& a, sint32 imm, const WReg& tmp)
++	{
++		uint32 v = (uint32)imm;
++		if (shortImmEnabled() && fitsAddSubImm(v))
++			cmp(a, v < 0x1000 ? v : (v >> 12), v < 0x1000 ? 0 : 12);
++		else if (shortImmEnabled() && imm < 0 && fitsAddSubImm(0u - v))
++		{
++			// cmn a, #k sets the same NZCV as cmp a, #-k for k != 0
++			uint32 k = 0u - v;
++			cmn(a, k < 0x1000 ? k : (k >> 12), k < 0x1000 ? 0 : 12);
++		}
++		else
++			cmp_imm(a, imm, tmp);
++	}
++	// 32-bit guest address memReg + offset (+ indexReg) for an access through MEM_BASE_REG
++	WReg guestAddress(WReg memReg, sint32 offset, WReg indexReg, bool indexed)
++	{
++		if (offset == 0 && !indexed)
++			return memReg; // no add needed
++		if (offset == 0)
++		{
++			add(TEMP_GPR1.WReg, memReg, indexReg);
++			return TEMP_GPR1.WReg;
++		}
++		addImm32(TEMP_GPR1.WReg, memReg, offset, TEMP_GPR1.WReg);
++		if (indexed)
++			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
++		return TEMP_GPR1.WReg;
++	}
++
+ 	void prepareJump(JumpInfo&& jumpInfo)
+ 	{
+ 		jumps.emplace_back(getSize(), jumpInfo);
+-		for (int i = 0; i < MAX_JUMP_INSTR_COUNT; ++i)
++		for (size_t i = 0; i < m_jumpSlots; ++i)
+ 			nop();
+ 	}
+ 
+ 	// cold code emitted after the main code
+ 	std::vector<std::function<void()>> m_coldCode;
++	size_t m_coldCodeFirstUse = 0; // code offset of the first branch into the pending cold code
++
++	void addColdCode(std::function<void()>&& code)
++	{
++		if (m_coldCode.empty())
++			m_coldCodeFirstUse = getSize();
++		m_coldCode.emplace_back(std::move(code));
++	}
++
++	// cold code is entered by b.cond (+/-1MB). Functions can generate more than that (Ninja Gaiden 3: Razor's Edge), so
++	// pending cold code is emitted between segments, behind a branch, before the first branch into it gets out of reach
++	void flushColdCodeIfFar()
++	{
++		if (m_coldCode.empty() || getSize() - m_coldCodeFirstUse < 0x40000)
++			return;
++		Label skipColdCode;
++		b(skipColdCode);
++		for (auto& code : m_coldCode)
++			code();
++		m_coldCode.clear();
++		L(skipColdCode);
++	}
+ 
+ 	std::map<IMLSegment*, size_t> segmentStarts;
+ 	void storeSegmentStart(IMLSegment* imlSegment)
+ 	{
+ 		segmentStarts[imlSegment] = getSize();
++		m_lastCmp.end = SIZE_MAX; // a segment can be entered by a jump: flags are unknown there
++		m_flagsBoolCount = 0;
+ 	}
+ 
+ 	bool processAllJumps()
+@@ -209,6 +454,29 @@ struct AArch64GenContext_t : CodeGenerator
+ 	bool handleJump(sint64 addressOffset, const ConditionalRegJumpInfo& jump)
+ 	{
+ 		bool mustBeTrue = jump.mustBeTrue;
++		if (jump.useFlags)
++		{
++			Cond cond = mustBeTrue ? jump.cond : static_cast<Cond>(jump.cond ^ 1);
++			// in +/-1MB
++			if (-0x100000 <= addressOffset && addressOffset <= 0xfffff)
++			{
++				b(cond, addressOffset);
++				return true;
++			}
++			if (m_jumpSlots < 2)
++				return false;
++			Label skipJump;
++			b(static_cast<Cond>(cond ^ 1), skipJump);
++			addressOffset -= 4;
++			if (-0x8000000 <= addressOffset && addressOffset <= 0x7ffffff)
++			{
++				b(addressOffset);
++				L(skipJump);
++				return true;
++			}
++			cemu_assert_suspicious();
++			return false;
++		}
+ 
+ 		// in +/-32KB
+ 		if (-0x8000 <= addressOffset && addressOffset <= 0x7fff)
+@@ -230,6 +498,8 @@ struct AArch64GenContext_t : CodeGenerator
+ 			return true;
+ 		}
+ 
++		if (m_jumpSlots < 2)
++			return false;
+ 		Label skipJump;
+ 		if (mustBeTrue)
+ 			tbz(jump.regBool, 0, skipJump);
+@@ -258,6 +528,8 @@ struct AArch64GenContext_t : CodeGenerator
+ 			tbnz(jump.regValue, 31, addressOffset);
+ 			return true;
+ 		}
++		if (m_jumpSlots < 2)
++			return false;
+ 
+ 		// in +/-1MB
+ 		if (-0x100000 <= addressOffset && addressOffset <= 0xfffff)
+@@ -611,11 +883,11 @@ bool AArch64GenContext_t::r_r_s32(IMLInstruction* imlInstruction)
+ 
+ 	if (imlInstruction->operation == IMLOperation::OP_ADD)
+ 	{
+-		add_imm(regR, regA, immS32, TEMP_GPR1.WReg);
++		addImm32(regR, regA, immS32, TEMP_GPR1.WReg);
+ 	}
+ 	else if (imlInstruction->operation == IMLOperation::OP_SUB)
+ 	{
+-		sub_imm(regR, regA, immS32, TEMP_GPR1.WReg);
++		subImm32(regR, regA, immS32, TEMP_GPR1.WReg);
+ 	}
+ 	else if (imlInstruction->operation == IMLOperation::OP_AND)
+ 	{
+@@ -848,8 +1120,17 @@ void AArch64GenContext_t::compare(IMLInstruction* imlInstruction)
+ 	WReg regA = gpReg<WReg>(imlInstruction->op_compare.regA);
+ 	WReg regB = gpReg<WReg>(imlInstruction->op_compare.regB);
+ 	Cond cond = ImlCondToArm64Cond(imlInstruction->op_compare.cond);
+-	cmp(regA, regB);
++	// PPC compares set lt, gt and eq with three IML compares of the same operands: when nothing was
++	// emitted since the previous cmp and its cset did not overwrite an operand, the flags still hold
++	bool flagsReused = m_lastCmp.end == getSize() && !m_lastCmp.isImm && m_lastCmp.a == regA.getIdx() && m_lastCmp.b == regB.getIdx();
++	if (!flagsReused)
++		cmp(regA, regB);
+ 	cset(regR, cond);
++	flagsBoolSet(regR.getIdx(), cond, flagsReused);
++	if (regR.getIdx() != regA.getIdx() && regR.getIdx() != regB.getIdx())
++		m_lastCmp = {getSize(), regA.getIdx(), regB.getIdx(), 0, false};
++	else
++		m_lastCmp.end = SIZE_MAX;
+ }
+ 
+ void AArch64GenContext_t::compare_s32(IMLInstruction* imlInstruction)
+@@ -858,18 +1139,29 @@ void AArch64GenContext_t::compare_s32(IMLInstruction* imlInstruction)
+ 	WReg regA = gpReg<WReg>(imlInstruction->op_compare.regA);
+ 	sint32 imm = imlInstruction->op_compare_s32.immS32;
+ 	auto cond = ImlCondToArm64Cond(imlInstruction->op_compare.cond);
+-	cmp_imm(regA, imm, TEMP_GPR1.WReg);
++	bool flagsReused = m_lastCmp.end == getSize() && m_lastCmp.isImm && m_lastCmp.a == regA.getIdx() && m_lastCmp.imm == imm;
++	if (!flagsReused)
++		cmpImm32(regA, imm, TEMP_GPR1.WReg);
+ 	cset(regR, cond);
++	flagsBoolSet(regR.getIdx(), cond, flagsReused);
++	if (regR.getIdx() != regA.getIdx())
++		m_lastCmp = {getSize(), regA.getIdx(), 0, imm, true};
++	else
++		m_lastCmp.end = SIZE_MAX;
+ }
+ 
+ void AArch64GenContext_t::cjump(IMLInstruction* imlInstruction, IMLSegment* imlSegment)
+ {
+ 	auto regBool = gpReg<WReg>(imlInstruction->op_conditional_jump.registerBool);
++	const FlagsBool* fb = flagBranchEnabled() ? flagsBoolFind(regBool.getIdx()) : nullptr;
+ 	prepareJump(ConditionalRegJumpInfo{
+ 		.target = imlSegment->nextSegmentBranchTaken,
+ 		.regBool = regBool,
+ 		.mustBeTrue = imlInstruction->op_conditional_jump.mustBeTrue,
++		.useFlags = fb != nullptr,
++		.cond = fb ? fb->cond : Cond::EQ,
+ 	});
++	m_flagsBoolCount = 0;
+ }
+ 
+ void AArch64GenContext_t::jump(IMLSegment* imlSegment)
+@@ -879,6 +1171,14 @@ void AArch64GenContext_t::jump(IMLSegment* imlSegment)
+ 
+ void AArch64GenContext_t::conditionalJumpCycleCheck(IMLSegment* imlSegment)
+ {
++	if (PPCRecompilerAArch64_cyclesInRegister())
++	{
++		prepareJump(NegativeRegValueJumpInfo{
++			.target = imlSegment->nextSegmentBranchTaken,
++			.regValue = CYCLES_REG.WReg,
++		});
++		return;
++	}
+ 	ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+ 	prepareJump(NegativeRegValueJumpInfo{
+ 		.target = imlSegment->nextSegmentBranchTaken,
+@@ -958,9 +1258,20 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
  		brk(0xf000);
  		return true;
  	}
-+	else if (imlInstruction->operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
++	else if (imlInstruction->operation == IMLOperation::MACRO_MEMORY_BARRIER)
 +	{
-+		// param 0: full barrier (sync/lwsync), param 1: load barrier (isync)
++		// Cemu LD+: param 0: full barrier (sync/lwsync), param 1: load barrier (isync)
 +		dmb(imlInstruction->op_macro.param == 1 ? BarOpt::ISHLD : BarOpt::ISH);
 +		return true;
 +	}
- 	else if (imlInstruction->operation == PPCREC_IML_MACRO_COUNT_CYCLES)
+ 	else if (imlInstruction->operation == IMLOperation::MACRO_COUNT_CYCLES)
  	{
  		uint32 cycleCount = imlInstruction->op_macro.param;
++		if (PPCRecompilerAArch64_cyclesInRegister())
++		{
++			sub_imm(CYCLES_REG.WReg, CYCLES_REG.WReg, cycleCount, TEMP_GPR1.WReg);
++			return true;
++		}
+ 		AdrUimm adrCycles = AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles));
+ 		ldr(TEMP_GPR1.WReg, adrCycles);
+ 		sub_imm(TEMP_GPR1.WReg, TEMP_GPR1.WReg, cycleCount, TEMP_GPR2.WReg);
+@@ -978,6 +1289,8 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
+ 		str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+ 		// set parameters
+ 		str(x30, AdrPreImm(sp, -16));
++		if (PPCRecompilerAArch64_cyclesInRegister())
++			str(CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+ 
+ 		mov(x0, HCPU_REG);
+ 		mov(w1, funcId);
+@@ -986,13 +1299,22 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
+ 		mov(TEMP_GPR1.XReg, (uint64)PPCRecompiler_virtualHLE);
+ 		blr(TEMP_GPR1.XReg);
+ 
++		// the HLE call can switch to another thread, whose state is returned in x0
+ 		mov(HCPU_REG, x0);
+ 
+ 		ldr(x30, AdrPostImm(sp, 16));
+ 
+ 		// check if cycles where decreased beyond zero, if yes -> leave recompiler
+-		ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+-		tbz(TEMP_GPR1.WReg, 31, cyclesLeftLabel); // check if negative
++		if (PPCRecompilerAArch64_cyclesInRegister())
++		{
++			ldr(CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
++			tbz(CYCLES_REG.WReg, 31, cyclesLeftLabel); // check if negative
++		}
++		else
++		{
++			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
++			tbz(TEMP_GPR1.WReg, 31, cyclesLeftLabel); // check if negative
++		}
+ 
+ 		mov(TEMP_GPR1.XReg, offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable));
+ 		ldr(TEMP_GPR1.XReg, AdrReg(PPC_REC_INSTANCE_REG, TEMP_GPR1.XReg));
+@@ -1032,11 +1354,7 @@ bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
+ 	WReg memReg = gpReg<WReg>(imlInstruction->op_storeLoad.registerMem);
+ 	WReg dataReg = gpReg<WReg>(imlInstruction->op_storeLoad.registerData);
+ 
+-	add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
+-	if (indexed)
+-		add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+-
+-	auto adr = AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW);
++	auto adr = AdrExt(MEM_BASE_REG, guestAddress(memReg, memOffset, indexed ? gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2) : memReg, indexed), ExtMod::UXTW);
+ 	if (imlInstruction->op_storeLoad.copyWidth == 32)
+ 	{
+ 		ldr(dataReg, adr);
+@@ -1088,10 +1406,7 @@ bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
+ 	sint32 memOffset = imlInstruction->op_storeLoad.immS32;
+ 	bool swapEndian = imlInstruction->op_storeLoad.flags2.swapEndian;
+ 
+-	add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
+-	if (indexed)
+-		add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+-	AdrExt adr = AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW);
++	AdrExt adr = AdrExt(MEM_BASE_REG, guestAddress(memReg, memOffset, indexed ? gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2) : memReg, indexed), ExtMod::UXTW);
+ 	if (imlInstruction->op_storeLoad.copyWidth == 32)
+ 	{
+ 		if (swapEndian)
+@@ -1135,30 +1450,40 @@ void AArch64GenContext_t::atomic_cmp_store(IMLInstruction* imlInstruction)
+ 	WReg valReg = gpReg<WReg>(imlInstruction->op_atomic_compare_store.regWriteValue);
+ 	WReg cmpValReg = gpReg<WReg>(imlInstruction->op_atomic_compare_store.regCompareValue);
+ 
++	Label unaligned;
++	Label done;
++	add(TEMP_GPR1.XReg, MEM_BASE_REG, eaReg, ExtMod::UXTW);
++	// Fractal: CASAL and LDAXR/STLXR fault (SIGBUS) on an address that is not 4 byte aligned, where x86's lock cmpxchg
++	// just works. Sonic Lost World runs stwcx. on an odd address after the title screen: compare and store without
++	// atomicity there, like the PC build effectively does
++	tst(eaReg, 3);
++	bne(unaligned);
+ 	if (s_cpu.isAtomicSupported())
+ 	{
+ 		mov(TEMP_GPR2.WReg, cmpValReg);
+-		add(TEMP_GPR1.XReg, MEM_BASE_REG, eaReg, ExtMod::UXTW);
+ 		casal(TEMP_GPR2.WReg, valReg, AdrNoOfs(TEMP_GPR1.XReg));
+ 		cmp(TEMP_GPR2.WReg, cmpValReg);
+-		cset(outReg, Cond::EQ);
++		b(done);
+ 	}
+ 	else
+ 	{
+-		Label notEqual;
+ 		Label storeFailed;
+-
+-		add(TEMP_GPR1.XReg, MEM_BASE_REG, eaReg, ExtMod::UXTW);
+ 		L(storeFailed);
+ 		ldaxr(TEMP_GPR2.WReg, AdrNoOfs(TEMP_GPR1.XReg));
+ 		cmp(TEMP_GPR2.WReg, cmpValReg);
+-		bne(notEqual);
++		bne(done);
+ 		stlxr(TEMP_GPR2.WReg, valReg, AdrNoOfs(TEMP_GPR1.XReg));
+ 		cbnz(TEMP_GPR2.WReg, storeFailed);
+-
+-		L(notEqual);
+-		cset(outReg, Cond::EQ);
++		// flags still EQ from the compare
++		b(done);
+ 	}
++	L(unaligned);
++	ldr(TEMP_GPR2.WReg, AdrNoOfs(TEMP_GPR1.XReg));
++	cmp(TEMP_GPR2.WReg, cmpValReg);
++	bne(done);
++	str(valReg, AdrNoOfs(TEMP_GPR1.XReg));
++	L(done);
++	cset(outReg, Cond::EQ);
+ }
+ 
+ bool AArch64GenContext_t::fpr_load(IMLInstruction* imlInstruction, bool indexed)
+@@ -1173,10 +1498,8 @@ bool AArch64GenContext_t::fpr_load(IMLInstruction* imlInstruction, bool indexed)
+ 
+ 	if (mode == PPCREC_FPR_LD_MODE_SINGLE)
+ 	{
+-		add_imm(TEMP_GPR1.WReg, realRegisterMem, adrOffset, TEMP_GPR1.WReg);
+-		if (indexed)
+-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
+-		ldr(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
++		WReg guestAdr = guestAddress(realRegisterMem, adrOffset, indexReg, indexed);
++		ldr(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, guestAdr, ExtMod::UXTW));
+ 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
+ 		fmov(dataSReg, TEMP_GPR2.WReg);
+ 
+@@ -1191,10 +1514,8 @@ bool AArch64GenContext_t::fpr_load(IMLInstruction* imlInstruction, bool indexed)
+ 	}
+ 	else if (mode == PPCREC_FPR_LD_MODE_DOUBLE)
+ 	{
+-		add_imm(TEMP_GPR1.WReg, realRegisterMem, adrOffset, TEMP_GPR1.WReg);
+-		if (indexed)
+-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
+-		ldr(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
++		WReg guestAdr = guestAddress(realRegisterMem, adrOffset, indexReg, indexed);
++		ldr(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, guestAdr, ExtMod::UXTW));
+ 		rev(TEMP_GPR2.XReg, TEMP_GPR2.XReg);
+ 		fmov(dataDReg, TEMP_GPR2.XReg);
+ 	}
+@@ -1242,7 +1563,7 @@ bool AArch64GenContext_t::fpr_store(IMLInstruction* imlInstruction, bool indexed
+ 			ubfx(TEMP_GPR2.XReg, TEMP_GPR2.XReg, 29, 30);
+ 			orr(TEMP_GPR2.WReg, TEMP_GPR2.WReg, TEMP_GPR1.WReg, ShMod::LSL, 30);
+ 			L(done);
+-			m_coldCode.emplace_back([this, denormal, done, dataDReg]() mutable
++			addColdCode([this, denormal, done, dataDReg]() mutable
+ 			{
+ 				// scale denormals before extracting the mantissa
+ 				L(denormal);
+@@ -1256,29 +1577,23 @@ bool AArch64GenContext_t::fpr_store(IMLInstruction* imlInstruction, bool indexed
+ 				b(done);
+ 			});
+ 		}
+-		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
+-		if (indexed)
+-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
++		WReg guestAdr = guestAddress(memReg, memOffset, indexReg, indexed);
+ 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
+-		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
++		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, guestAdr, ExtMod::UXTW));
+ 	}
+ 	else if (mode == PPCREC_FPR_ST_MODE_DOUBLE)
+ 	{
+-		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
+-		if (indexed)
+-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
++		WReg guestAdr = guestAddress(memReg, memOffset, indexReg, indexed);
+ 		fmov(TEMP_GPR2.XReg, dataDReg);
+ 		rev(TEMP_GPR2.XReg, TEMP_GPR2.XReg);
+-		str(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
++		str(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, guestAdr, ExtMod::UXTW));
+ 	}
+ 	else if (mode == PPCREC_FPR_ST_MODE_UI32_FROM_PS0)
+ 	{
+-		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
+-		if (indexed)
+-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
++		WReg guestAdr = guestAddress(memReg, memOffset, indexReg, indexed);
+ 		fmov(TEMP_GPR2.WReg, dataSReg);
+ 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
+-		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
++		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, guestAdr, ExtMod::UXTW));
+ 	}
+ 	else
+ 	{
+@@ -1400,6 +1715,25 @@ void AArch64GenContext_t::fpr_r_r_r_r(IMLInstruction* imlInstruction)
+ 		fcmp(regA, 0.0);
+ 		fcsel(regR, regC, regB, Cond::GE);
+ 	}
++	else if (imlInstruction->operation == IMLOperation::OP_FPR_FMADD)
++	{
++		fmadd(regR, regA, regC, regB); // B + A*C
++	}
++	else if (imlInstruction->operation == IMLOperation::OP_FPR_FMSUB)
++	{
++		fnmsub(regR, regA, regC, regB); // A*C - B
++	}
++	else if (imlInstruction->operation == IMLOperation::OP_FPR_FNMADD)
++	{
++		// negate after the fused op so an exact zero becomes -0 like on Espresso
++		fmadd(regR, regA, regC, regB);
++		fneg(regR, regR);
++	}
++	else if (imlInstruction->operation == IMLOperation::OP_FPR_FNMSUB)
++	{
++		fnmsub(regR, regA, regC, regB);
++		fneg(regR, regR);
++	}
+ 	else
+ 	{
+ 		cemu_assert_suspicious();
+@@ -1484,10 +1818,46 @@ void AArch64GenContext_t::call_imm(IMLInstruction* imlInstruction)
+ 	ldr(x30, AdrPostImm(sp, 16));
+ }
+ 
++static bool PPCRecompiler_generateAArch64CodeWithJumpSlots(struct PPCRecFunction_t* PPCRecFunction, struct ppcImlGenContext_t* ppcImlGenContext, size_t jumpSlots, bool& jumpsOutOfReach);
++static bool PPCRecompiler_generateAArch64CodeInner(struct PPCRecFunction_t* PPCRecFunction, struct ppcImlGenContext_t* ppcImlGenContext);
++
++// xbyak throws on operands it can't encode (an immediate or offset out of range). Losing one function to the interpreter
++// is better than the uncaught exception aborting the process (Ninja Gaiden 3: Razor's Edge, right after boot)
+ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, struct ppcImlGenContext_t* ppcImlGenContext)
++{
++	try
++	{
++		return PPCRecompiler_generateAArch64CodeInner(PPCRecFunction, ppcImlGenContext);
++	}
++	catch (const std::exception& e)
++	{
++		static std::atomic<uint32> s_logged = 0;
++		if (s_logged.fetch_add(1) < 20)
++			cemuLog_log(LogType::Force, "Recompiler: AArch64 code generation for {:08x} failed ({}), function stays interpreted", PPCRecFunction->ppcAddress, e.what());
++		return false;
++	}
++}
++
++static bool PPCRecompiler_generateAArch64CodeInner(struct PPCRecFunction_t* PPCRecFunction, struct ppcImlGenContext_t* ppcImlGenContext)
++{
++	static const bool s_singleSlotJumps = 1 /* Fractal tunable jit_short_jumps */ != 0;
++	bool jumpsOutOfReach = false;
++	if (s_singleSlotJumps)
++	{
++		if (PPCRecompiler_generateAArch64CodeWithJumpSlots(PPCRecFunction, ppcImlGenContext, 1, jumpsOutOfReach))
++			return true;
++		if (!jumpsOutOfReach)
++			return false;
++	}
++	return PPCRecompiler_generateAArch64CodeWithJumpSlots(PPCRecFunction, ppcImlGenContext, AArch64GenContext_t::MAX_JUMP_INSTR_COUNT, jumpsOutOfReach);
++}
++
++static bool PPCRecompiler_generateAArch64CodeWithJumpSlots(struct PPCRecFunction_t* PPCRecFunction, struct ppcImlGenContext_t* ppcImlGenContext, size_t jumpSlots, bool& jumpsOutOfReach)
+ {
+ 	AArch64Allocator allocator;
+ 	AArch64GenContext_t aarch64GenContext{&allocator};
++	aarch64GenContext.m_jumpSlots = jumpSlots;
++	jumpsOutOfReach = false;
+ 
+ 	// generate iml instruction code
+ 	bool codeGenerationFailed = false;
+@@ -1495,6 +1865,7 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction,
+ 	{
+ 		if (codeGenerationFailed)
+ 			break;
++		aarch64GenContext.flushColdCodeIfFar();
+ 		segIt->x64Offset = aarch64GenContext.getSize();
+ 
+ 		aarch64GenContext.storeSegmentStart(segIt);
+@@ -1502,6 +1873,8 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction,
+ 		for (size_t i = 0; i < segIt->imlList.size(); i++)
+ 		{
+ 			IMLInstruction* imlInstruction = segIt->imlList.data() + i;
++			if (imlInstruction->type != IMLType::COMPARE && imlInstruction->type != IMLType::COMPARE_S32 && imlInstruction->type != IMLType::CONDITIONAL_JUMP)
++				aarch64GenContext.flagsBoolTrackBefore(imlInstruction);
+ 			if (imlInstruction->type == IMLType::R_NAME)
+ 			{
+ 				aarch64GenContext.r_name(imlInstruction);
+@@ -1658,12 +2031,22 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction,
+ 	const size_t codeSize = aarch64GenContext.getSize();
+ 	if (!aarch64GenContext.processAllJumps())
+ 	{
+-		cemuLog_log(LogType::Recompiler, "PPCRecompiler_generateAArch64Code(): some jumps exceeded the +/-128MB offset.");
++		jumpsOutOfReach = true;
++		if (jumpSlots >= AArch64GenContext_t::MAX_JUMP_INSTR_COUNT)
++			cemuLog_log(LogType::Recompiler, "PPCRecompiler_generateAArch64Code(): some jumps exceeded the +/-128MB offset.");
+ 		return false;
+ 	}
+ 	aarch64GenContext.setSize(codeSize);
+ 
+-	aarch64GenContext.readyRE();
++	// resolve the jumps, keep the buffer writable and try to move the code into the arena
++	aarch64GenContext.ready(CodeArray::PROTECT_RW);
++	if (void* packed = JitCodeArena::Put(aarch64GenContext.getCode<const void*>(), codeSize))
++	{
++		PPCRecFunction->x86Code = packed;
++		PPCRecFunction->x86Size = codeSize;
++		return true; // the temporary buffer is freed by the CodeGenerator destructor
++	}
++	aarch64GenContext.setProtectMode(CodeArray::PROTECT_RE);
+ 
+ 	// set code
+ 	PPCRecFunction->x86Code = aarch64GenContext.getCode<void*>();
+@@ -1699,6 +2082,8 @@ void AArch64GenContext_t::enterRecompilerCode()
+ 	mov(HCPU_REG, x1); // call argument 2
+ 	mov(PPC_REC_INSTANCE_REG, (uint64)ppcRecompilerInstanceData);
+ 	mov(MEM_BASE_REG, (uint64)memory_base);
++	if (PPCRecompilerAArch64_cyclesInRegister())
++		ldr(CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+ 
+ 	// branch to recFunc
+ 	blr(x0); // call argument 1
+@@ -1721,6 +2106,8 @@ void AArch64GenContext_t::enterRecompilerCode()
+ void AArch64GenContext_t::leaveRecompilerCode()
+ {
+ 	str(LR.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
++	if (PPCRecompilerAArch64_cyclesInRegister())
++		str(CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+ 	ret();
+ }
+ 
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.h b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.h
+index b610ee04..7eb8db24 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.h
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.h
+@@ -8,6 +8,10 @@ void PPCRecompiler_cleanupAArch64Code(void* code, size_t size);
+ 
+ void PPCRecompilerAArch64Gen_generateRecompilerInterfaceFunctions();
+ 
++// true when PPCInterpreter_t::remainingCycles lives in a host register (w24) while recompiled code
++// runs; that register is then not handed to the register allocator. perf/tuning.txt jit_cycles_reg=0 turns it off.
++bool PPCRecompilerAArch64_cyclesInRegister();
++
+ // architecture specific constants
+ namespace IMLArchAArch64
+ {
+@@ -15,4 +19,5 @@ namespace IMLArchAArch64
+ 	static constexpr int PHYSREG_GPR_COUNT = 25;
+ 	static constexpr int PHYSREG_FPR_BASE = PHYSREG_GPR_COUNT;
+ 	static constexpr int PHYSREG_FPR_COUNT = 31;
++	static constexpr int PHYSREG_GPR_CYCLES = PHYSREG_GPR_BASE + 24; // remainingCycles, see PPCRecompilerAArch64_cyclesInRegister
+ }; // namespace IMLArchAArch64
+\ No newline at end of file
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index 20c1711..5b9fc80 100644
+index 29e13fb4..95df857b 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 @@ -264,6 +264,11 @@ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction,
  		x64Gen_int3(x64GenContext);
  		return true;
  	}
-+	else if( imlInstruction->operation == PPCREC_IML_MACRO_MEMORY_BARRIER )
++	else if( imlInstruction->operation == IMLOperation::MACRO_MEMORY_BARRIER )
 +	{
-+		// x86 already keeps loads and stores in the order the game expects
++		// Cemu LD+: x86 already keeps loads and stores in the order the game expects
 +		return true;
 +	}
- 	else if( imlInstruction->operation == PPCREC_IML_MACRO_COUNT_CYCLES )
+ 	else if( imlInstruction->operation == IMLOperation::MACRO_COUNT_CYCLES )
  	{
  		uint32 cycleCount = imlInstruction->op_macro.param;
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
-index cd26986..f5e8282 100644
+index a0b27e3e..e61737c3 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
 @@ -406,6 +406,10 @@ void IMLDebug_DisassembleInstruction(const IMLInstruction& inst, std::string& di
  		{
  			strOutput.addFmt("MACRO COUNT_CYCLES cycles: {}", inst.op_macro.param);
  		}
-+		else if (inst.operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
++		else if (inst.operation == IMLOperation::MACRO_MEMORY_BARRIER)
 +		{
 +			strOutput.add("MACRO MEMORY_BARRIER");
 +		}
  		else
  		{
- 			strOutput.addFmt("MACRO ukn operation {}", inst.operation);
+ 			strOutput.addFmt("MACRO ukn operation {}", static_cast<uint32>(inst.operation));
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
-index 997de4e..caaca3a 100644
+index 665478db..c14873ea 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
 @@ -143,7 +143,7 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
  	}
- 	else if (type == PPCREC_IML_TYPE_MACRO)
+ 	else if (type == IMLType::MACRO)
  	{
--		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_COUNT_CYCLES || operation == PPCREC_IML_MACRO_HLE)
-+		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_COUNT_CYCLES || operation == PPCREC_IML_MACRO_HLE || operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
+-		if (operation == IMLOperation::MACRO_BL || operation == IMLOperation::MACRO_B_FAR || operation == IMLOperation::MACRO_LEAVE || operation == IMLOperation::MACRO_DEBUGBREAK || operation == IMLOperation::MACRO_COUNT_CYCLES || operation == IMLOperation::MACRO_HLE)
++		if (operation == IMLOperation::MACRO_BL || operation == IMLOperation::MACRO_B_FAR || operation == IMLOperation::MACRO_LEAVE || operation == IMLOperation::MACRO_DEBUGBREAK || operation == IMLOperation::MACRO_COUNT_CYCLES || operation == IMLOperation::MACRO_HLE || operation == IMLOperation::MACRO_MEMORY_BARRIER)
  		{
  			// no effect on registers
  		}
 @@ -415,7 +415,7 @@ void IMLInstruction::RewriteGPR(const std::unordered_map<IMLRegID, IMLRegID>& tr
  	}
- 	else if (type == PPCREC_IML_TYPE_MACRO)
+ 	else if (type == IMLType::MACRO)
  	{
--		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_HLE || operation == PPCREC_IML_MACRO_COUNT_CYCLES)
-+		if (operation == PPCREC_IML_MACRO_BL || operation == PPCREC_IML_MACRO_B_FAR || operation == PPCREC_IML_MACRO_LEAVE || operation == PPCREC_IML_MACRO_DEBUGBREAK || operation == PPCREC_IML_MACRO_HLE || operation == PPCREC_IML_MACRO_COUNT_CYCLES || operation == PPCREC_IML_MACRO_MEMORY_BARRIER)
+-		if (operation == IMLOperation::MACRO_BL || operation == IMLOperation::MACRO_B_FAR || operation == IMLOperation::MACRO_LEAVE || operation == IMLOperation::MACRO_DEBUGBREAK || operation == IMLOperation::MACRO_HLE || operation == IMLOperation::MACRO_COUNT_CYCLES)
++		if (operation == IMLOperation::MACRO_BL || operation == IMLOperation::MACRO_B_FAR || operation == IMLOperation::MACRO_LEAVE || operation == IMLOperation::MACRO_DEBUGBREAK || operation == IMLOperation::MACRO_HLE || operation == IMLOperation::MACRO_COUNT_CYCLES || operation == IMLOperation::MACRO_MEMORY_BARRIER)
  		{
  			// no effect on registers
  		}
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
-index 4df2a66..ac658f7 100644
+index 64301400..bf3dd519 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
-@@ -178,6 +178,9 @@ enum
- 	PPCREC_IML_MACRO_LEAVE,			// leaves recompiler and switches to interpeter
+@@ -141,6 +141,11 @@ enum class IMLOperation : uint8
+ 	OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM, // round 64bit double to 64bit double with 32bit float precision (in bottom half of xmm register)
+ 	OP_FPR_FCTIWZ,
+ 	OP_FPR_SELECT, // selectively copy bottom value from operand B or C based on value in operand A
++	// fused multiply-add (FPR_R_R_R_R), one rounding like Espresso: R = A*C + B, A*C - B, -(A*C + B), -(A*C - B)
++	OP_FPR_FMADD,
++	OP_FPR_FMSUB,
++	OP_FPR_FNMADD,
++	OP_FPR_FNMSUB,
+ 	// Conversion (FPR_R_R)
+ 	OP_FPR_INT_TO_FLOAT, // convert integer value in gpr to floating point value in fpr
+ 	OP_FPR_FLOAT_TO_INT, // convert floating point value in fpr to integer value in gpr
+@@ -174,6 +179,9 @@ enum class IMLOperation : uint8
+ 	MACRO_LEAVE,			// leaves recompiler and switches to interpeter
  	// debugging
- 	PPCREC_IML_MACRO_DEBUGBREAK,	// throws a debugbreak
-+	// Cemu LD+: full memory barrier for PPC sync/lwsync. Only emitted in multi-core mode, where the emulated cores run on
-+	// separate host threads and ARM (unlike x86) can reorder memory accesses that the game expects to stay in order
-+	PPCREC_IML_MACRO_MEMORY_BARRIER, // param 0 = full barrier (sync/lwsync), 1 = load barrier (isync)
- };
+ 	MACRO_DEBUGBREAK,	// throws a debugbreak
++	// Cemu LD+: memory barrier for PPC sync/lwsync (param 0, full) and isync (param 1, loads). Only emitted in
++	// multi-core mode, where the emulated cores run on separate host threads and ARM can reorder memory accesses
++	MACRO_MEMORY_BARRIER,
  
- enum class IMLCondition : uint8
+ 	OP_FPR_COPY_PAIR = OP_ASSIGN,
+ };
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
+index 6fe2e981..6156c3ba 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
+@@ -1634,7 +1634,10 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
+ 	else
+ 		instructionsUntilEndOfSeg = (sint32)currentSegment->imlList.size() - range->usageEnd;
+ 	cemu_assert_debug(instructionsUntilEndOfSeg >= 0);
+-	sint32 remainingScanDist = 45 - instructionsUntilEndOfSeg;
++	// perf/tuning.txt ra_extend: how far ahead (in IML instructions) a next use may be for the range to
++	// stay in a register across segment boundaries instead of being stored and reloaded
++	static const sint32 s_extendDistance = (sint32)45 /* Fractal tunable ra_extend */;
++	sint32 remainingScanDist = s_extendDistance - instructionsUntilEndOfSeg;
+ 	if (remainingScanDist <= 0)
+ 		return; // can't reach end
+ 
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCFunctionBoundaryTracker.h b/src/Cafe/HW/Espresso/Recompiler/PPCFunctionBoundaryTracker.h
+index 45c5001d..2a765975 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCFunctionBoundaryTracker.h
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCFunctionBoundaryTracker.h
+@@ -58,6 +58,31 @@ public:
+ 		return r;
+ 	}
+ 
++	uint32 GetTotalSize() const
++	{
++		uint32 total = 0;
++		for (auto& it : map_ranges)
++			total += it->length;
++		return total;
++	}
++
++	// drops every range except the one containing the address; branches into the dropped ranges then leave
++	// the function through the jump table, like any other branch to code outside of it
++	void RestrictToRangeOf(uint32 address)
++	{
++		for (auto it = map_ranges.begin(); it != map_ranges.end();)
++		{
++			PPCRange_t* r = *it;
++			if (address >= r->startAddress && address < r->getEndAddress())
++			{
++				++it;
++				continue;
++			}
++			delete r;
++			it = map_ranges.erase(it);
++		}
++	}
++
+ 	bool ContainsAddress(uint32 addr) const
+ 	{
+ 		for (auto& it : map_ranges)
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
+index 3851700d..63c095b6 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
+@@ -331,6 +331,8 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+ 	{
+ 		if (i == IMLArchAArch64::PHYSREG_GPR_BASE + 18)
+ 			continue; // Skip reserved platform register
++		if (i == IMLArchAArch64::PHYSREG_GPR_CYCLES && PPCRecompilerAArch64_cyclesInRegister())
++			continue; // holds remainingCycles
+ 		gprPhysPool.SetAvailable(i);
+ 	}
+ 
+@@ -439,13 +441,46 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+ 		cemu_assert_debug(false);
+ 	}
+ 
+-	// todo - use info from previously compiled ranges to determine full size of this function (and merge all the entryAddresses)
++	// Functions that chain into each other through tail calls are tracked as one function of hundreds of ranges.
++	// The IML passes are far from linear in the number of segments (332 KB of PPC code in 473 ranges took over
++	// 30 s per translation on a Snapdragon 865, and every entry point translated all of it again), so past this
++	// size only the range that holds the address is translated and the other ranges are reached as far jumps.
++	static const uint32 s_maxFunctionBytes = (uint32)48 /* Fractal tunable jit_max_function_kb */ * 1024;
++	if (funcBoundaries.GetTotalSize() > s_maxFunctionBytes)
++		funcBoundaries.RestrictToRangeOf(address);
+ 
+ 	// collect all currently known entry points for this range
+ 	s_ppcRecompilerState.recompilerSpinlock.lock();
+ 	std::set<uint32> entryAddresses;
+ 	entryAddresses.emplace(address);
++	// Entry points of an earlier translation of this range (an address in the jump table that points
++	// into recompiled code) stay entry points, otherwise the new translation drops them and the next
++	// jump there queues yet another full recompilation.
++	for (uint32 v = range.startAddress; v < range.startAddress + range.length; v += 4)
++	{
++		PPCREC_JUMP_ENTRY e = ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[v / 4];
++		if (e != PPCRecompiler_leaveRecompilerCode_unvisited && e != PPCRecompiler_leaveRecompilerCode_visited)
++			entryAddresses.emplace(v);
++	}
+ 	s_ppcRecompilerState.recompilerSpinlock.unlock();
++	// MACRO_BL leaves the function and the callee returns through the jump table, so the instruction
++	// after every call is an entry point. Without this, each call site found later recompiles the whole
++	// function again, which for functions of thousands of instructions keeps the recompiler busy for minutes.
++	for (uint32 v = range.startAddress; v + 4 < range.startAddress + range.length; v += 4)
++	{
++		const uint32 opcode = memory_readU32(v);
++		const uint32 primary = opcode >> 26;
++		bool isCall = false;
++		if (primary == 18 || primary == 16) // b(l), bc(l)
++			isCall = (opcode & 1) != 0;
++		else if (primary == 19) // bclrl, bcctrl
++		{
++			const uint32 xo = (opcode >> 1) & 0x3FF;
++			isCall = (xo == 16 || xo == 528) && (opcode & 1) != 0;
++		}
++		if (isCall)
++			entryAddresses.emplace(v + 4);
++	}
+ 
+ 	std::vector<std::pair<MPTR, uint32>> functionEntryPoints;
+ 	PPCRecFunction_t* func = PPCRecompiler_recompileFunction(range, entryAddresses, functionEntryPoints, funcBoundaries);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
+index c93304e8..54120d72 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
+@@ -68,6 +68,7 @@ bool PPCRecompilerImlGen_PS_SUM0(ppcImlGenContext_t* ppcImlGenContext, uint32 op
+ bool PPCRecompilerImlGen_PS_SUM1(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+ bool PPCRecompilerImlGen_PS_NEG(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+ bool PPCRecompilerImlGen_PS_ABS(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
++bool PPCRecompilerImlGen_PS_NABS(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+ bool PPCRecompilerImlGen_PS_RES(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+ bool PPCRecompilerImlGen_PS_RSQRTE(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+ bool PPCRecompilerImlGen_PS_MR(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index e76a53f..57ac7c4 100644
+index 7bb68df2..d7eca188 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-@@ -8,6 +8,11 @@
+@@ -7,6 +7,11 @@
+ #include "IML/IMLRegisterAllocatorRanges.h"
  #include "PPCFunctionBoundaryTracker.h"
- #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
  
 +namespace coreinit
 +{
@@ -131,14 +1076,14 @@ index e76a53f..57ac7c4 100644
  bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext);
  
  struct PPCBasicBlockInfo
-@@ -770,11 +775,20 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+@@ -736,11 +741,20 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
  
  bool PPCRecompilerImlGen_ISYNC(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
  {
 +	// Cemu LD+: games put isync after taking a lock or after waiting for a flag, so that what they read next isn't read
 +	// early. ARM hosts can read ahead past a branch, so in multi-core mode emit a load barrier (param 1)
 +	if (coreinit::__CemuIsMulticoreMode())
-+		ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_MEMORY_BARRIER, 1, 0, 0, IMLREG_INVALID);
++		ppcImlGenContext->emitInst().make_macro(IMLOperation::MACRO_MEMORY_BARRIER, 1, 0, 0, IMLREG_INVALID);
  	return true;
  }
  
@@ -148,23 +1093,182 @@ index e76a53f..57ac7c4 100644
 +	// hand data between cores (locks, job queues, audio buffers). x86 hosts keep that order anyway, ARM hosts don't, so in
 +	// multi-core mode emit a real barrier
 +	if (coreinit::__CemuIsMulticoreMode())
-+		ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_MEMORY_BARRIER, 0, 0, 0, IMLREG_INVALID);
++		ppcImlGenContext->emitInst().make_macro(IMLOperation::MACRO_MEMORY_BARRIER, 0, 0, 0, IMLREG_INVALID);
  	return true;
  }
  
-@@ -3097,6 +3111,7 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+@@ -1956,6 +1970,11 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+ 					unsupportedInstructionFound = true;
+ 				ppcImlGenContext->hasFPUInstruction = true;
+ 				break;
++			case 4: // PS nabs
++				if (PPCRecompilerImlGen_PS_NABS(ppcImlGenContext, opcode) == false)
++					unsupportedInstructionFound = true;
++				ppcImlGenContext->hasFPUInstruction = true;
++				break;
+ 			case 8: // PS abs
+ 				if (PPCRecompilerImlGen_PS_ABS(ppcImlGenContext, opcode) == false)
+ 					unsupportedInstructionFound = true;
+@@ -2278,6 +2297,9 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+ 		case 86:
+ 			// DCBF -> No-Op
+ 			break;
++		case 278:
++			// DCBT (cache touch hint) -> No-Op
++			break;
+ 		case 87: // LBZX
+ 			PPCRecompilerImlGen_LOAD_INDEXED(ppcImlGenContext, opcode, 8, false, true, false);
+ 			break;
+@@ -3071,6 +3093,7 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
  					break;
- 				case PPCREC_IML_MACRO_DEBUGBREAK:
- 				case PPCREC_IML_MACRO_COUNT_CYCLES:
-+				case PPCREC_IML_MACRO_MEMORY_BARRIER:
+ 				case IMLOperation::MACRO_DEBUGBREAK:
+ 				case IMLOperation::MACRO_COUNT_CYCLES:
++				case IMLOperation::MACRO_MEMORY_BARRIER:
  					break;
  				default:
  				cemu_assert_unimplemented();
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp
+index 16d84ba1..7b4c97ea 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp
+@@ -267,6 +267,21 @@ bool PPCRecompilerImlGen_FDIV(ppcImlGenContext_t* ppcImlGenContext, uint32 opcod
+ 	return true;
+ }
+ 
++// Espresso fuses fmadd/fmsub/fnmadd/fnmsub (one rounding) and the interpreter does too (clang contracts a*c+b on
++// AArch64). Emitting a multiply and an add rounds twice and loses the low bits that games use for precise math
++// (a*c - p is the exact rounding error of p = a*c only when fused; Splinter Cell Blacklist overexposed without it).
++// AArch64 has fused instructions; perf/tuning.txt jit_fma=<mask> picks where they are used (1 double precision ops,
++// 2 single precision ops, default 3; 0 restores the old two-step code for comparisons)
++static bool _UseFusedMultiplyAdd(bool singlePrecision)
++{
++#if defined(__aarch64__)
++	static const uint32 s_fma = (uint32)3 /* Fractal tunable jit_fma */;
++	return (s_fma & (singlePrecision ? 2 : 1)) != 0;
++#else
++	return false;
++#endif
++}
++
+ bool PPCRecompilerImlGen_FMADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
+ {
+ 	sint32 frD, frA, frB, frC;
+@@ -275,6 +290,11 @@ bool PPCRecompilerImlGen_FMADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 	DefinePS0(fprB, frB);
+ 	DefinePS0(fprC, frC);
+ 	DefinePS0(fprD, frD);
++	if (_UseFusedMultiplyAdd(false))
++	{
++		ppcImlGenContext->emitInst().make_fpr_r_r_r_r(IMLOperation::OP_FPR_FMADD, fprD, fprA, fprB, fprC);
++		return true;
++	}
+ 	// if frB is already in frD we need a temporary register to store the product of frA*frC
+ 	if( frB == frD )
+ 	{
+@@ -313,6 +333,15 @@ bool PPCRecompilerImlGen_FMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 	DefinePS0(fprB, frB);
+ 	DefinePS0(fprC, frC);
+ 	DefinePS0(fprD, frD);
++	// frB == frD leaves the function to the interpreter, as before fused ops existed: recompiling those 38 functions of
++	// Splinter Cell Blacklist ended in a guest null write once (1 of 4 runs), not worth the risk
++	if (frB == frD)
++		return false;
++	if (_UseFusedMultiplyAdd(false))
++	{
++		ppcImlGenContext->emitInst().make_fpr_r_r_r_r(IMLOperation::OP_FPR_FMSUB, fprD, fprA, fprB, fprC);
++		return true;
++	}
+ 	if( frB == frD )
+ 	{
+ 		// if frB is already in frD we need a temporary register to store the product of frA*frC
+@@ -348,6 +377,11 @@ bool PPCRecompilerImlGen_FNMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
+ 	DefinePS0(fprB, frB);
+ 	DefinePS0(fprC, frC);
+ 	DefinePS0(fprD, frD);
++	if (_UseFusedMultiplyAdd(false))
++	{
++		ppcImlGenContext->emitInst().make_fpr_r_r_r_r(IMLOperation::OP_FPR_FNMSUB, fprD, fprA, fprB, fprC);
++		return true;
++	}
+ 	// if frB is already in frD we need a temporary register to store the product of frA*frC
+ 	if( frB == frD )
+ 	{
+@@ -498,6 +532,13 @@ bool PPCRecompilerImlGen_FMADDS(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
+ 	DefinePS0(fprB, frB);
+ 	DefinePS0(fprC, frC);
+ 	DefinePS0(fprD, frD);
++	if (_UseFusedMultiplyAdd(true))
++	{
++		ppcImlGenContext->emitInst().make_fpr_r_r_r_r(IMLOperation::OP_FPR_FMADD, fprD, fprA, fprB, fprC);
++		PPRecompilerImmGen_roundToSinglePrecision(ppcImlGenContext, fprD);
++		PSE_CopyResultToPs1();
++		return true;
++	}
+ 	// if none of the operand registers overlap with the result register then we can avoid the usage of a temporary register
+ 	IMLReg fprRegisterTemp;
+ 	if( frD != frA && frD != frB && frD != frC )
+@@ -525,6 +566,13 @@ bool PPCRecompilerImlGen_FMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
+ 	DefinePS0(fprB, frB);
+ 	DefinePS0(fprC, frC);
+ 	DefinePS0(fprD, frD);
++	if (_UseFusedMultiplyAdd(true))
++	{
++		ppcImlGenContext->emitInst().make_fpr_r_r_r_r(IMLOperation::OP_FPR_FMSUB, fprD, fprA, fprB, fprC);
++		PPRecompilerImmGen_roundToSinglePrecision(ppcImlGenContext, fprD);
++		PSE_CopyResultToPs1();
++		return true;
++	}
+ 
+ 	IMLReg fprRegisterTemp;
+ 	// if none of the operand registers overlap with the result register then we can avoid the usage of a temporary register
+@@ -553,6 +601,13 @@ bool PPCRecompilerImlGen_FNMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 op
+ 	DefinePS0(fprB, frB);
+ 	DefinePS0(fprC, frC);
+ 	DefinePS0(fprD, frD);
++	if (_UseFusedMultiplyAdd(true))
++	{
++		ppcImlGenContext->emitInst().make_fpr_r_r_r_r(IMLOperation::OP_FPR_FNMSUB, fprD, fprA, fprB, fprC);
++		PPRecompilerImmGen_roundToSinglePrecision(ppcImlGenContext, fprD);
++		PSE_CopyResultToPs1();
++		return true;
++	}
+ 	IMLReg fprRegisterTemp;
+ 	// if none of the operand registers overlap with the result register then we can avoid the usage of a temporary register
+ 	if( frD != frA && frD != frB && frD != frC )
+@@ -1524,6 +1579,28 @@ bool PPCRecompilerImlGen_PS_ABS(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
+ 	return true;
+ }
+ 
++// ps_nabs: frD = -|frB| for both slots (sign bit set, no rounding)
++bool PPCRecompilerImlGen_PS_NABS(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
++{
++	sint32 frD, frB;
++	frB = (opcode>>11)&0x1F;
++	frD = (opcode>>21)&0x1F;
++
++	DefinePS0(fprBps0, frB);
++	DefinePS1(fprBps1, frB);
++	DefinePS0(fprDps0, frD);
++	DefinePS1(fprDps1, frD);
++
++	if (frB != frD)
++	{
++		ppcImlGenContext->emitInst().make_fpr_r_r(IMLOperation::OP_FPR_ASSIGN, fprDps0, fprBps0);
++		ppcImlGenContext->emitInst().make_fpr_r_r(IMLOperation::OP_FPR_ASSIGN, fprDps1, fprBps1);
++	}
++	ppcImlGenContext->emitInst().make_fpr_r(IMLOperation::OP_FPR_NEGATIVE_ABS, fprDps0);
++	ppcImlGenContext->emitInst().make_fpr_r(IMLOperation::OP_FPR_NEGATIVE_ABS, fprDps1);
++	return true;
++}
++
+ bool PPCRecompilerImlGen_PS_RES(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
+ {
+ 	sint32 frD, frB;
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
-index 963c49f..ec07b2b 100644
+index a7167ba9..45912096 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
-@@ -142,12 +142,19 @@ void LatteCP_signalEnterWait()
+@@ -167,12 +167,19 @@ void LatteCP_signalEnterWait()
  */
  uint32 LatteCP_readU32Deprc()
  {
@@ -184,7 +1288,7 @@ index 963c49f..ec07b2b 100644
  
  		g_renderer->NotifyLatteCommandProcessorIdle(); // let the renderer know in case it wants to flush any commands
  		performanceMonitor.gpuTime_idleTime.beginMeasuring();
-@@ -159,7 +166,10 @@ uint32 LatteCP_readU32Deprc()
+@@ -184,7 +191,10 @@ uint32 LatteCP_readU32Deprc()
  		LatteThread_HandleOSScreen(); // check if new frame was presented via OSScreen API
  
  		if ( TCL::TCLGPUReadRBWord(cmdWord) )
@@ -195,7 +1299,7 @@ index 963c49f..ec07b2b 100644
  		if (Latte_GetStopSignal())
  			LatteThread_Exit();
  
-@@ -423,6 +433,7 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
+@@ -480,6 +490,7 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
  	{
  		// wait for memory address
  		performanceMonitor.gpuTime_fenceTime.beginMeasuring();
@@ -203,7 +1307,7 @@ index 963c49f..ec07b2b 100644
  		while (true)
  		{
  			uint32 fenceMemValue = _swapEndianU32(*fencePtr);
-@@ -905,6 +916,7 @@ LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
+@@ -962,6 +973,7 @@ LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
  	cemu_assert_debug(nWords == 1);
  	MPTR reserved1 = LatteReadCMD(); // reserved
  	// wait for flip
@@ -212,7 +1316,7 @@ index 963c49f..ec07b2b 100644
  	while (true)
  	{
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
-index a3bcb63..cfe10ac 100644
+index a3bcb63e..cfe10ac9 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 +++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 @@ -1,4 +1,8 @@
@@ -434,7 +1538,7 @@ index a3bcb63..cfe10ac 100644
 +	}
 +}
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
-index dbc3cff..ebfa097 100644
+index dbc3cff9..ebfa0972 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
 +++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
 @@ -145,5 +145,42 @@ extern performanceMonitor_t performanceMonitor;
@@ -482,12 +1586,12 @@ index dbc3cff..ebfa097 100644
  #define endPerfMonProfiling(__obj) if( THasProfiling ) __obj.endMeasuring()
 \ No newline at end of file
 diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
-index 18a2f2f..0d3b014 100644
+index 29bbbdb4..5e2232d5 100644
 --- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
-@@ -688,7 +688,11 @@ void LatteRenderTarget_itHLESwapScanBuffer()
- 		performanceMonitor.gpuTime_frameTime.endMeasuring();
+@@ -711,7 +711,11 @@ void LatteRenderTarget_itHLESwapScanBuffer()
  	LattePerformanceMonitor_frameEnd();
+ 	FrameBenchmarkHelper::FrameEnd();
  	LatteGPUState.frameCounter++;
 -	g_renderer->SwapBuffers(true, true);
 +	{
@@ -499,10 +1603,10 @@ index 18a2f2f..0d3b014 100644
  	catchOpenGLError();
  	performanceMonitor.gpuTime_frameTime.beginMeasuring();
 diff --git a/src/Cafe/HW/Latte/Core/LatteShader.cpp b/src/Cafe/HW/Latte/Core/LatteShader.cpp
-index 91de631..48e2eb1 100644
+index a25e7711..96618cd2 100644
 --- a/src/Cafe/HW/Latte/Core/LatteShader.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteShader.cpp
-@@ -823,6 +823,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableVertexShader2(uint64 baseHash
+@@ -856,6 +856,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableVertexShader2(uint64 baseHash
  // compile new vertex shader (relies partially on current state)
  LatteDecompilerShader* LatteShader_CompileSeparableVertexShader(uint64 baseHash, uint64& vsAuxHash, uint8* vertexShaderPtr, uint32 vertexShaderSize, bool usesGeometryShader, LatteFetchShader* fetchShader)
  {
@@ -510,15 +1614,15 @@ index 91de631..48e2eb1 100644
  	// new decompiler test
  	//LatteShader_CompileSeparableVertexShader2(baseHash, vsAuxHash, vertexShaderPtr, vertexShaderSize, usesGeometryShader, fetchShader);
  
-@@ -858,6 +859,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableVertexShader(uint64 baseHash,
+@@ -893,6 +894,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableVertexShader(uint64 baseHash,
  
- LatteDecompilerShader* LatteShader_CompileSeparableGeometryShader(uint64 baseHash, uint8* geometryShaderPtr, uint32 geometryShaderSize, uint8* geometryCopyShader, uint32 geometryCopyShaderSize)
+ LatteDecompilerShader* LatteShader_CompileSeparableGeometryShader(uint64 baseHash, uint8* geometryShaderPtr, uint32 geometryShaderSize, uint8* geometryCopyShader, uint32 geometryCopyShaderSize, LatteDecompilerShader* vertexShader)
  {
 +	LatteHitchScope hitchScope(LatteHitch::ShaderCreate);
  	LatteDecompilerOptions options;
  	LatteShader_GetDecompilerOptions(options, LatteConst::ShaderType::Geometry, true);
  
-@@ -887,6 +889,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableGeometryShader(uint64 baseHas
+@@ -924,6 +926,7 @@ LatteDecompilerShader* LatteShader_CompileSeparableGeometryShader(uint64 baseHas
  
  LatteDecompilerShader* LatteShader_CompileSeparablePixelShader(uint64 baseHash, uint64& psAuxHash, uint8* pixelShaderPtr, uint32 pixelShaderSize, bool usesGeometryShader)
  {
@@ -527,10 +1631,10 @@ index 91de631..48e2eb1 100644
  	LatteShader_GetDecompilerOptions(options, LatteConst::ShaderType::Pixel, usesGeometryShader);
  
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 4445fb2..d207809 100644
+index fb760e4a..78361092 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-@@ -7,6 +7,7 @@
+@@ -8,6 +8,7 @@
  #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
  
  #include "Cafe/GraphicPack/GraphicPack2.h"
@@ -538,7 +1642,7 @@ index 4445fb2..d207809 100644
  
  #include <boost/container/small_vector.hpp>
  
-@@ -385,6 +386,15 @@ void LatteTexture_CopySlice(LatteTexture* srcTexture, sint32 srcSlice, sint32 sr
+@@ -397,6 +398,15 @@ void LatteTexture_CopySlice(LatteTexture* srcTexture, sint32 srcSlice, sint32 sr
  			cemuLog_log(LogType::Force, "Destination: {:08x} origResolution {:4}/{:4} effectiveResolution {:4}/{:4} fmt {:04x} mipIndex {} ratioW/H: {:.4}/{:.4}", dstTexture->physAddress, dstTexture->width, dstTexture->height, effectiveWidth_dst, effectiveHeight_dst, (uint32)dstTexture->format, dstMip, ratioWidth_dst, ratioHeight_dst);
  		}
  		//cemuLog_logDebug(LogType::Force, "If these textures are not meant to share data you can ignore this");
@@ -554,7 +1658,7 @@ index 4445fb2..d207809 100644
  		return;
  	}
  	// todo - store 'lastUpdated' value per slice/mip and copy it's value when copying the slice data
-@@ -500,11 +510,18 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
+@@ -512,11 +522,18 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
  
  }
  
@@ -573,7 +1677,7 @@ index 4445fb2..d207809 100644
  		LatteTexture* baseTexture = texRel->baseTexture;
  		LatteTexture* subTexture = texRel->subTexture;
  		for (sint32 cMipIndex = 0; cMipIndex < texRel->mipCount; cMipIndex++)
-@@ -730,6 +747,405 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
+@@ -745,6 +762,405 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
  	}
  }
  
@@ -979,7 +2083,7 @@ index 4445fb2..d207809 100644
  void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  {
  	for (sint32 mipIndex = 0; mipIndex < texture->mipLevels; mipIndex++)
-@@ -768,6 +1184,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
+@@ -783,6 +1199,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
  						else
  						{
  							LatteTexture_TrackDataOverlap(texture, sliceMipInfo, occupancy);
@@ -987,7 +2091,7 @@ index 4445fb2..d207809 100644
  						}
  					}
  				}
-@@ -1216,6 +1633,7 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+@@ -1256,6 +1673,7 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
  	Latte::E_HWTILEMODE tileMode, bool isDepth)
  {
  	_AddTextureToGlobalList(this);
@@ -995,7 +2099,7 @@ index 4445fb2..d207809 100644
  	if (depth < 1)
  		depth = 1;
  	// setup texture object
-@@ -1303,6 +1721,10 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+@@ -1343,6 +1761,10 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
  			}
  		}
  	}
@@ -1003,11 +2107,11 @@ index 4445fb2..d207809 100644
 +		_LatteTexture_ApplyShadowAtlasScale(this);
 +	if (!this->overwriteInfo.hasResolutionOverwrite)
 +		_LatteTexture_ApplyHalfResEffectScale(this);
- 	// determine if this texture should ever be mirrored to CPU RAM
- 	if (this->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
- 	{
+ 	this->enableReadback = LatteTexture_ShouldEnableReadback(physAddress, format, tileMode, width, height, depth, mipLevels, isDepth);
+ 
+ 	// calculate number of potential mip levels (from effective size)
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.h b/src/Cafe/HW/Latte/Core/LatteTexture.h
-index 6c09e84..9d95036 100644
+index 9ea4b5f1..f0b7ea69 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.h
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.h
 @@ -273,6 +273,11 @@ struct LatteTextureRelation
@@ -1023,15 +2127,16 @@ index 6c09e84..9d95036 100644
  
  // used if external modules want to retrieve texture cache information
 diff --git a/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp b/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp
-index 589b3bd..dfb56e4 100644
+index 3c5821ce..0e8b2e3d 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTextureLoader.cpp
-@@ -1,3 +1,4 @@
+@@ -1,4 +1,5 @@
+ #include "Cafe/HW/Latte/Core/LatteTextureLoader.h"
 +#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
  #include "Cafe/HW/Latte/Renderer/Renderer.h"
  #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
  #include "config/ActiveSettings.h"
-@@ -591,6 +592,7 @@ void LatteTextureLoader_loadTextureDataIntoSlice(LatteTexture* hostTexture, sint
+@@ -592,6 +593,7 @@ void LatteTextureLoader_loadTextureDataIntoSlice(LatteTexture* hostTexture, sint
  
  void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIndex, uint32 mipIndex, MPTR physImagePtr, MPTR physMipPtr, Latte::E_DIM dim, uint32 width, uint32 height, uint32 depth, uint32 mipLevels, uint32 pitch, Latte::E_HWTILEMODE tileMode, uint32 swizzle, bool dumpTex)
  {
@@ -1040,10 +2145,10 @@ index 589b3bd..dfb56e4 100644
  
  	Latte::E_GX2SURFFMT format = tex->format;
 diff --git a/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp b/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp
-index 8df5dce..1b0703f 100644
+index f758486a..e1aca078 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTextureReadback.cpp
-@@ -78,6 +78,7 @@ void LatteTextureReadback_NotifyTextureDeletion(LatteTexture* texture)
+@@ -75,6 +75,7 @@ void LatteTextureReadback_NotifyTextureDeletion(LatteTexture* texture)
  
  void LatteTextureReadback_Initate(LatteTextureView* textureView)
  {
@@ -1051,7 +2156,7 @@ index 8df5dce..1b0703f 100644
  	// currently we don't support readback for resized textures
  	if (textureView->baseTexture->overwriteInfo.hasResolutionOverwrite)
  	{
-@@ -104,6 +105,9 @@ void LatteTextureReadback_Initate(LatteTextureView* textureView)
+@@ -101,6 +102,9 @@ void LatteTextureReadback_Initate(LatteTextureView* textureView)
  
  void LatteTextureReadback_UpdateFinishedTransfers(bool forceFinish)
  {
@@ -1062,10 +2167,10 @@ index 8df5dce..1b0703f 100644
  	{
  		// start any delayed transfers
 diff --git a/src/Cafe/HW/Latte/Renderer/Renderer.h b/src/Cafe/HW/Latte/Renderer/Renderer.h
-index 01a6d3b..61c893d 100644
+index 712d7321..ac83e2fb 100644
 --- a/src/Cafe/HW/Latte/Renderer/Renderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Renderer.h
-@@ -120,6 +120,16 @@ public:
+@@ -124,6 +124,16 @@ public:
  
  	// surface copy
  	virtual void surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 width, sint32 height) = 0;
@@ -1083,7 +2188,7 @@ index 01a6d3b..61c893d 100644
  	// buffer cache
  	virtual void bufferCache_init(const sint32 bufferSize) = 0;
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
-index 15fd66e..85c581d 100644
+index 15fd66e0..85c581dc 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
 @@ -9,6 +9,13 @@
@@ -1124,8 +2229,20 @@ index 15fd66e..85c581d 100644
  	ShaderVkThreadPool.s_compilationQueueMutex.lock();
  	bool isStillQueued = m_compilationState.hasState(COMPILATION_STATE::QUEUED);
  	if (isStillQueued)
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
+index ee85f720..9df17e22 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
+@@ -184,6 +184,7 @@ VKFUNC_DEVICE(vkCmdBindDescriptorSets);
+ VKFUNC_DEVICE(vkCmdPipelineBarrier);
+ VKFUNC_DEVICE(vkCmdClearDepthStencilImage);
+ VKFUNC_DEVICE(vkCmdCopyBuffer);
++VKFUNC_DEVICE(vkCmdFillBuffer);
+ VKFUNC_DEVICE(vkCmdCopyImage);
+ VKFUNC_DEVICE(vkCmdBlitImage);
+ VKFUNC_DEVICE(vkCmdPushConstants);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 55b2330..40a4e3f 100644
+index a1902c1a..1fe9d466 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 @@ -1,3 +1,4 @@
@@ -1133,9 +2250,9 @@ index 55b2330..40a4e3f 100644
  #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
  #include "Cafe/HW/Latte/Core/FetchShader.h"
  #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h"
-@@ -10,6 +11,12 @@
- #include "util/helpers/Serializer.h"
+@@ -11,6 +12,13 @@
  #include "Cafe/HW/Latte/Common/RegisterSerializer.h"
+ #include "HW/Latte/Renderer/RendererCore.h"
  
 +#if defined(__linux__)
 +#include <sys/resource.h>
@@ -1143,10 +2260,101 @@ index 55b2330..40a4e3f 100644
 +#include <unistd.h>
 +#endif
 +
- /* rects emulation */
++
+ RendererShaderVk* rectsEmulationGS_generate(LatteDecompilerShader* vertexShader, const LatteContextRegister& latteRegister)
+ {
+ 	std::string gsSrc;
+@@ -518,8 +526,8 @@ void PipelineCompiler::InitRasterizerState(const LatteContextRegister& latteRegi
+ 	uint32 cullBack = polygonControlReg.get_CULL_BACK();
+ 	uint32 polyOffsetFrontEnable = polygonControlReg.get_OFFSET_FRONT_ENABLED();
  
- void rectsEmulationGS_outputSingleVertex(std::string& gsSrc, LatteDecompilerShader* vertexShader, LatteShaderPSInputTable* psInputTable, sint32 vIdx, const LatteContextRegister& latteRegister)
-@@ -1132,13 +1139,25 @@ static void compilePipeline_thread(sint32 threadIndex)
+-	cemu_assert_debug(LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_ZCLIP_NEAR_DISABLE() == LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE()); // near or far clipping can be disabled individually
+-	bool zClipEnable = LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE() == false;
++	cemu_assert_debug(latteRegister.PA_CL_CLIP_CNTL.get_ZCLIP_NEAR_DISABLE() == latteRegister.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE()); // near or far clipping can be disabled individually
++	bool zClipEnable = latteRegister.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE() == false;
+ 
+ 	// z-clipping
+ 	rasterizerExt.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT;
+@@ -527,10 +535,10 @@ void PipelineCompiler::InitRasterizerState(const LatteContextRegister& latteRegi
+ 	rasterizerExt.flags = 0;
+ 
+ 	rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+-	rasterizer.rasterizerDiscardEnable = LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_DX_RASTERIZATION_KILL();
++	rasterizer.rasterizerDiscardEnable = latteRegister.PA_CL_CLIP_CNTL.get_DX_RASTERIZATION_KILL();
+ 	rasterizer.pNext = VulkanRenderer::GetInstance()->m_featureControl.deviceExtensions.depth_clip_enable ? &rasterizerExt : nullptr;
+ 	// GX2SetSpecialState(0, true) workaround
+-	if (!LatteGPUState.contextNew.PA_CL_VTE_CNTL.get_VPORT_X_OFFSET_ENA())
++	if (!latteRegister.PA_CL_VTE_CNTL.get_VPORT_X_OFFSET_ENA())
+ 		rasterizer.rasterizerDiscardEnable = false;
+ 
+ 	rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+@@ -731,12 +739,12 @@ void PipelineCompiler::InitDescriptorSetLayouts(VulkanRenderer* vkRenderer, Pipe
+ 	}
+ }
+ 
+-void PipelineCompiler::InitDepthStencilState()
++void PipelineCompiler::InitDepthStencilState(const LatteContextRegister& latteRegister)
+ {
+ 	// get depth control parameters
+-	bool depthEnable = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_Z_ENABLE();
+-	auto depthFunc = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_Z_FUNC();
+-	bool depthWriteEnable = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_Z_WRITE_ENABLE();
++	bool depthEnable = latteRegister.DB_DEPTH_CONTROL.get_Z_ENABLE();
++	auto depthFunc = latteRegister.DB_DEPTH_CONTROL.get_Z_FUNC();
++	bool depthWriteEnable = latteRegister.DB_DEPTH_CONTROL.get_Z_WRITE_ENABLE();
+ 
+ 	// setup VkPipelineDepthStencilStateCreateInfo
+ 	depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+@@ -762,23 +770,23 @@ void PipelineCompiler::InitDepthStencilState()
+ 	depthStencilState.maxDepthBounds = 1.0f;
+ 
+ 	// get stencil control parameters
+-	bool stencilEnable = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_ENABLE();
+-	bool backStencilEnable = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_BACK_STENCIL_ENABLE();
+-	auto frontStencilFunc = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_FUNC_F();
+-	auto frontStencilZPass = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_ZPASS_F();
+-	auto frontStencilZFail = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_ZFAIL_F();
+-	auto frontStencilFail = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_FAIL_F();
+-	auto backStencilFunc = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_FUNC_B();
+-	auto backStencilZPass = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_ZPASS_B();
+-	auto backStencilZFail = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_ZFAIL_B();
+-	auto backStencilFail = LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_STENCIL_FAIL_B();
++	bool stencilEnable = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_ENABLE();
++	bool backStencilEnable = latteRegister.DB_DEPTH_CONTROL.get_BACK_STENCIL_ENABLE();
++	auto frontStencilFunc = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_FUNC_F();
++	auto frontStencilZPass = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_ZPASS_F();
++	auto frontStencilZFail = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_ZFAIL_F();
++	auto frontStencilFail = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_FAIL_F();
++	auto backStencilFunc = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_FUNC_B();
++	auto backStencilZPass = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_ZPASS_B();
++	auto backStencilZFail = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_ZFAIL_B();
++	auto backStencilFail = latteRegister.DB_DEPTH_CONTROL.get_STENCIL_FAIL_B();
+ 	// get stencil control parameters
+-	uint32 stencilCompareMaskFront = LatteGPUState.contextNew.DB_STENCILREFMASK.get_STENCILMASK_F();
+-	uint32 stencilWriteMaskFront = LatteGPUState.contextNew.DB_STENCILREFMASK.get_STENCILWRITEMASK_F();
+-	uint32 stencilRefFront = LatteGPUState.contextNew.DB_STENCILREFMASK.get_STENCILREF_F();
+-	uint32 stencilCompareMaskBack = LatteGPUState.contextNew.DB_STENCILREFMASK_BF.get_STENCILMASK_B();
+-	uint32 stencilWriteMaskBack = LatteGPUState.contextNew.DB_STENCILREFMASK_BF.get_STENCILWRITEMASK_B();
+-	uint32 stencilRefBack = LatteGPUState.contextNew.DB_STENCILREFMASK_BF.get_STENCILREF_B();
++	uint32 stencilCompareMaskFront = latteRegister.DB_STENCILREFMASK.get_STENCILMASK_F();
++	uint32 stencilWriteMaskFront = latteRegister.DB_STENCILREFMASK.get_STENCILWRITEMASK_F();
++	uint32 stencilRefFront = latteRegister.DB_STENCILREFMASK.get_STENCILREF_F();
++	uint32 stencilCompareMaskBack = latteRegister.DB_STENCILREFMASK_BF.get_STENCILMASK_B();
++	uint32 stencilWriteMaskBack = latteRegister.DB_STENCILREFMASK_BF.get_STENCILWRITEMASK_B();
++	uint32 stencilRefBack = latteRegister.DB_STENCILREFMASK_BF.get_STENCILREF_B();
+ 
+ 	static const VkStencilOp stencilOpTable[8] = {
+ 		VK_STENCIL_OP_KEEP,
+@@ -901,7 +909,7 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
+ 
+ 	// ###################################################
+ 
+-	InitDepthStencilState();
++	InitDepthStencilState(latteRegister);
+ 
+ 	// ##########################################################################################################################################
+ 
+@@ -1106,13 +1114,25 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -1172,28 +2380,124 @@ index 55b2330..40a4e3f 100644
  		delete request;
  	}
  }
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h
+index 583c1fe6..87aa81e2 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h
+@@ -27,7 +27,7 @@ private:
+ 	void InitRasterizerState(const LatteContextRegister& latteRegister, VulkanRenderer* vkRenderer, bool isPrimitiveRect, bool& usesDepthBias);
+ 	void InitBlendState(const LatteContextRegister& latteRegister, PipelineInfo* pipelineInfo, bool& usesBlendConstants, VKRObjectRenderPass* renderPassObj);
+ 	void InitDescriptorSetLayouts(VulkanRenderer* vkRenderer, PipelineInfo* vkrPipelineInfo, LatteDecompilerShader* vertexShader, LatteDecompilerShader* pixelShader, LatteDecompilerShader* geometryShader);
+-	void InitDepthStencilState();
++	void InitDepthStencilState(const LatteContextRegister& latteRegister);
+ 	void InitDynamicState(PipelineInfo* pipelineInfo, bool usesBlendConstants, bool usesDepthBias);
+ 
+ public:
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index f6d7228..ae85f94 100644
+index 4d6eff87..a5c21948 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-@@ -2180,7 +2180,11 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
+@@ -220,6 +220,7 @@ void VulkanRenderer::DetermineVendor()
+ 
+ 	if(driverId == VK_DRIVER_ID_MESA_RADV || driverId == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
+ 		m_vendor = GfxVendor::Mesa;
++	m_isTurnip = driverId == VK_DRIVER_ID_MESA_TURNIP;
+ 
+ 	cemuLog_log(LogType::Force, "Using GPU: {}", properties.properties.deviceName);
+ 
+@@ -857,6 +858,22 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
+ 	vkMapMemory(m_logicalDevice, m_uniformVarBufferMemory, 0, VK_WHOLE_SIZE, 0, &bufferPtr);
+ 	m_uniformVarBufferPtr = (uint8*)bufferPtr;
+ 
++	// Cemu LD+ (from Fractal): command buffer completion marker, used on Turnip
++	m_useCompletionMarker = m_isTurnip;
++	if (m_useCompletionMarker && !memoryManager->CreateBuffer(64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_completionMarkerBuffer, m_completionMarkerMemory))
++		m_useCompletionMarker = false;
++	if (m_useCompletionMarker)
++	{
++		void* markerPtr = nullptr;
++		vkMapMemory(m_logicalDevice, m_completionMarkerMemory, 0, VK_WHOLE_SIZE, 0, &markerPtr);
++		m_completionMarker = (volatile uint32*)markerPtr;
++		if (m_completionMarker)
++			*m_completionMarker = 0;
++		else
++			m_useCompletionMarker = false;
++	}
++	cemuLog_log(LogType::Force, "Vulkan: command buffer completion marker {}", m_useCompletionMarker ? "on" : "off");
++
+ 	// texture readback buffer
+ 	if (!memoryManager->CreateBuffer(TEXTURE_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_textureReadbackBuffer, m_textureReadbackBufferMemory))
+ 	{
+@@ -930,6 +947,8 @@ VulkanRenderer::~VulkanRenderer()
+ 
+ 	// delete buffers
+ 	memoryManager->DeleteBuffer(m_uniformVarBuffer, m_uniformVarBufferMemory);
++	if (m_completionMarkerBuffer != VK_NULL_HANDLE)
++		memoryManager->DeleteBuffer(m_completionMarkerBuffer, m_completionMarkerMemory);
+ 	memoryManager->DeleteBuffer(m_textureReadbackBuffer, m_textureReadbackBufferMemory);
+ 	memoryManager->DeleteBuffer(m_xfbRingBuffer, m_xfbRingBufferMemory);
+ 	memoryManager->DeleteBuffer(m_occlusionQueries.bufferQueryResults, m_occlusionQueries.memoryQueryResults);
+@@ -2213,11 +2232,32 @@ void VulkanRenderer::InitFirstCommandBuffer()
+ 	m_state.resetCommandBufferState();
+ }
+ 
++bool VulkanRenderer::CommandBufferMarkerReached(uint32 slot) const
++{
++	const uint32 marker = __atomic_load_n(m_completionMarker, __ATOMIC_ACQUIRE);
++	return (sint32)(marker - (uint32)(m_cmdBufferSubmitIds[slot] + 1)) >= 0;
++}
++
++// at the end of the current command buffer: once all earlier work is done, write its id + 1 into the marker
++void VulkanRenderer::WriteCompletionMarker()
++{
++	VkCommandBuffer cmd = m_state.currentCommandBuffer;
++	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 0, nullptr);
++	vkCmdFillBuffer(cmd, m_completionMarkerBuffer, 0, 4, (uint32)(m_numSubmittedCmdBuffers + 1));
++	VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++	barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
++}
++
+ void VulkanRenderer::ProcessFinishedCommandBuffers()
+ {
+ 	bool finishedCmdBuffers = false;
+ 	while (m_commandBufferSyncIndex != m_commandBufferIndex)
+ 	{
++		// Cemu LD+ (from Fractal): the marker says the GPU hasn't reached the end of this command buffer yet, don't ask the fence
++		if (m_useCompletionMarker && !CommandBufferMarkerReached(m_commandBufferSyncIndex))
++			break;
+ 		VkResult fenceStatus = vkGetFenceStatus(m_logicalDevice, m_cmdBufferFences[m_commandBufferSyncIndex]);
+ 		if (fenceStatus == VK_SUCCESS)
+ 		{
+@@ -2246,7 +2286,11 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
  {
  	cemu_assert_debug(m_commandBufferSyncIndex != m_commandBufferIndex);
  	// wait on least recently submitted command buffer
--	VkResult result = vkWaitForFences(m_logicalDevice, 1, &m_cmd_buffer_fences[m_commandBufferSyncIndex], true, UINT64_MAX);
+-	VkResult result = vkWaitForFences(m_logicalDevice, 1, &m_cmdBufferFences[m_commandBufferSyncIndex], true, UINT64_MAX);
 +	VkResult result;
 +	{
 +		LatteHitchScope hitchScope(LatteHitch::GpuWait);
-+		result = vkWaitForFences(m_logicalDevice, 1, &m_cmd_buffer_fences[m_commandBufferSyncIndex], true, UINT64_MAX);
++		result = vkWaitForFences(m_logicalDevice, 1, &m_cmdBufferFences[m_commandBufferSyncIndex], true, UINT64_MAX);
 +	}
  	if (result == VK_TIMEOUT)
  	{
  		cemuLog_log(LogType::Force, "vkWaitForFences: Returned VK_TIMEOUT on infinite fence");
+@@ -2265,6 +2309,9 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+ 
+ 	occlusionQuery_notifyEndCommandBuffer();
+ 
++	if (m_useCompletionMarker)
++		WriteCompletionMarker();
++	m_cmdBufferSubmitIds[m_commandBufferIndex] = m_numSubmittedCmdBuffers;
+ 	vkEndCommandBuffer(m_state.currentCommandBuffer);
+ 
+ 	VkSubmitInfo submitInfo = {};
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index 8a93e12..bfa607c 100644
+index af253937..880220a4 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-@@ -310,10 +310,11 @@ public:
+@@ -322,10 +322,11 @@ public:
  
  	// surface copy
  	void surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 width, sint32 height) override;
@@ -1206,11 +2510,36 @@ index 8a93e12..bfa607c 100644
  
  	void surfaceCopy_cleanup();
  
+@@ -625,6 +626,16 @@ private:
+ 	VkBuffer m_uniformVarBuffer = VK_NULL_HANDLE;
+ 	VkDeviceMemory m_uniformVarBufferMemory = VK_NULL_HANDLE;
+ 	bool m_uniformVarBufferMemoryIsCoherent{false};
++	// Cemu LD+ (from Fractal): completion marker. The end of every command buffer writes its id + 1 into host visible
++	// memory, so finished command buffers can be found without vkGetFenceStatus, which blocks until the GPU is done on
++	// Turnip (KGSL) and made the render thread wait for every command buffer
++	bool m_isTurnip{false};
++	bool m_useCompletionMarker{false};
++	VkBuffer m_completionMarkerBuffer{VK_NULL_HANDLE};
++	VkDeviceMemory m_completionMarkerMemory{VK_NULL_HANDLE};
++	volatile uint32* m_completionMarker{nullptr};
++	bool CommandBufferMarkerReached(uint32 slot) const;
++	void WriteCompletionMarker();
+ 	uint8* m_uniformVarBufferPtr = nullptr;
+ 	uint32 m_uniformVarBufferWriteIndex = 0;
+ 	uint32 m_uniformVarBufferReadIndex = 0;
+@@ -685,6 +696,7 @@ private:
+ 	}
+ 
+ 	uint64 m_numSubmittedCmdBuffers{};
++	std::array<uint64, kCommandBufferPoolSize> m_cmdBufferSubmitIds{}; // Cemu LD+: m_numSubmittedCmdBuffers when the slot was submitted
+ 	uint64 m_countCommandBufferFinished{};
+ 
+ 	uint32 m_recordedDrawcalls{}; // number of drawcalls recorded into current command buffer
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index a681418..22e06ba 100644
+index c29ea70d..540405d4 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-@@ -222,6 +222,14 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
+@@ -240,6 +240,14 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
  	uint64 minimalStateHash = draw_calculateMinimalGraphicsPipelineHash(fetchShader, LatteGPUState.contextNew);
  	uint64 pipelineHash = draw_calculateGraphicsPipelineHash(fetchShader, vertexShader, geometryShader, pixelShader, cachedFboVk->GetRenderPassObj(), LatteGPUState.contextNew);
  
@@ -1225,7 +2554,7 @@ index a681418..22e06ba 100644
  	// create PipelineInfo
  	auto vkFBO = (CachedFBOVk*)(VulkanRenderer::GetInstance()->m_state.activeFBO);
  	PipelineInfo* pipelineInfo = new PipelineInfo(minimalStateHash, pipelineHash, fetchShader, vertexShader, pixelShader, geometryShader);
-@@ -260,7 +268,10 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
+@@ -278,7 +286,10 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
  	else
  	{
  		// synchronous compilation
@@ -1238,10 +2567,10 @@ index a681418..22e06ba 100644
  	}
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
-index e3e4201..198fb98 100644
+index 13c6189f..9db7e2d7 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
-@@ -579,7 +579,7 @@ VKRObjectDescriptorSet* VulkanRenderer::surfaceCopy_getOrCreateDescriptorSet(VkC
+@@ -577,7 +577,7 @@ VKRObjectDescriptorSet* VulkanRenderer::surfaceCopy_getOrCreateDescriptorSet(VkC
  	return vkObjDescriptorSet;
  }
  
@@ -1250,7 +2579,7 @@ index e3e4201..198fb98 100644
  {
  	draw_endRenderPass();
  
-@@ -640,8 +640,9 @@ void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint3
+@@ -638,8 +638,9 @@ void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint3
  	pushConstantData.vertexOffsets[6] = 1.0f;
  	pushConstantData.vertexOffsets[7] = -1.0f;
  
@@ -1262,7 +2591,7 @@ index e3e4201..198fb98 100644
  
  	vkCmdPushConstants(m_state.currentCommandBuffer, copySurfacePipelineInfo->vkObjPipeline->m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushConstantData), &pushConstantData);
  
-@@ -650,21 +651,21 @@ void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint3
+@@ -648,21 +649,21 @@ void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint3
  	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
  	renderPassInfo.renderPass = copySurfacePipelineInfo->vkObjRenderPass->m_renderPass;
  	renderPassInfo.framebuffer = vkObjFramebuffer->m_frameBuffer;
@@ -1289,7 +2618,7 @@ index e3e4201..198fb98 100644
  	scissor.extent.width = effectiveCopyWidth;
  	scissor.extent.height = effectiveCopyHeight;
  
-@@ -821,6 +822,39 @@ void VulkanRenderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* s
+@@ -819,6 +820,39 @@ void VulkanRenderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* s
  	surfaceCopy_viaDrawcall(srcTextureVk, texSrcMip, texSrcSlice, dstTextureVk, texDstMip, texDstSlice, effectiveCopyWidth, effectiveCopyHeight);
  }
  
@@ -1330,16 +2659,16 @@ index e3e4201..198fb98 100644
  // it is guaranteed that the texture is not in use and all associated resources (descriptor sets, framebuffers) can be destroyed safely
  void VulkanRenderer::surfaceCopy_notifyTextureRelease(LatteTextureVk* hostTexture)
 diff --git a/src/Cafe/IOSU/fsa/iosu_fsa.cpp b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-index 1429d08..fe27f06 100644
+index bba8b872..2c301c51 100644
 --- a/src/Cafe/IOSU/fsa/iosu_fsa.cpp
 +++ b/src/Cafe/IOSU/fsa/iosu_fsa.cpp
-@@ -6,6 +6,7 @@
+@@ -7,6 +7,7 @@
  
  #include "Cafe/OS/libs/coreinit/coreinit_FS.h"	 // get rid of this dependency, requires reworking some of the IPC stuff. See locations where we use coreinit::FSCmdBlockBody_t
  #include "Cafe/HW/Latte/Core/LatteBufferCache.h" // also remove this dependency
 +#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
  
- #include "Cafe/HW/MMU/MMU.h"
+ using namespace iosu::kernel;
  
 @@ -469,7 +470,33 @@ namespace iosu
  			if ((flags & FSA_CMD_FLAG_SET_POS) != 0)
@@ -1376,10 +2705,10 @@ index 1429d08..fe27f06 100644
  				return FSA_RESULT::OK;
  
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 7c7571f..fb47f84 100644
+index a0f721a2..1bd01782 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-@@ -14,6 +14,11 @@
+@@ -15,8 +15,13 @@
  #include "util/Fiber/Fiber.h"
  
  #include "util/helpers/helpers.h"
@@ -1389,9 +2718,61 @@ index 7c7571f..fb47f84 100644
 +#include <fstream>
 +#endif
  
- #ifdef __arm64__
+-#ifdef __arm64__
++#if defined(__arm64__) || defined(__aarch64__)
  #if defined(__clang__)
-@@ -1282,12 +1287,101 @@ namespace coreinit
+ #include <arm_acle.h>
+ #elif defined(_MSC_VER)
+@@ -28,7 +33,7 @@ static void ConfigureHostFloatingPointEnvironment()
+ {
+ #if defined(ARCH_X86_64)
+ 	_mm_setcsr(_mm_getcsr() | 0x8000);
+-#elif defined(__arm64__)
++#elif defined(__arm64__) || defined(__aarch64__) // Cemu LD+: the Android NDK only defines __aarch64__ (fix from Fractal)
+ 	// enable flush-to-zero and preserve NaN signs and payloads (FZ=1, DN=0)
+ #if defined(__clang__)
+ 	__arm_wsr64("fpcr", (__arm_rsr64("fpcr") | (1 << 24)) & ~(1 << 25));
+@@ -92,36 +97,21 @@ namespace coreinit
+ 
+ 	void SuspendActiveThreads()
+ 	{
+-		if (activeThreadCount == 0)
+-		{
+-			return;
+-		}
+-
++		// the active thread list only changes while the scheduler lock is held
+ 		__OSLockScheduler();
+ 
+-		for (sint32 i = 0; i < activeThreadCount; i++)
+-		{
+-			auto thread = reinterpret_cast<OSThread_t*>(memory_getPointerFromVirtualOffset(activeThread[i]));
++		for (OSThread_t* thread : s_activeThreads)
+ 			__OSSuspendThreadNolock(thread);
+-		}
+ 
+ 		__OSUnlockScheduler();
+ 	}
+ 
+ 	void ResumeActiveThreads()
+ 	{
+-		if (activeThreadCount == 0)
+-		{
+-			return;
+-		}
+-
+ 		__OSLockScheduler();
+ 
+-		for (sint32 i = 0; i < activeThreadCount; i++)
+-		{
+-			auto thread = reinterpret_cast<OSThread_t*>(memory_getPointerFromVirtualOffset(activeThread[i]));
++		for (OSThread_t* thread : s_activeThreads)
+ 			__OSResumeThreadInternal(thread, 1);
+-		}
+ 
+ 		__OSUnlockScheduler();
+ 	}
+@@ -1245,12 +1235,100 @@ namespace coreinit
  
  	Fiber* g_idleLoopFiber[3]{};
  
@@ -1446,9 +2827,8 @@ index 7c7571f..fb47f84 100644
 +		};
 +		std::vector<Entry> entries;
 +		__OSLockScheduler();
-+		for (sint32 i = 0; i < activeThreadCount && i < 256; i++)
++		for (OSThread_t* thread : s_activeThreads)
 +		{
-+			auto thread = reinterpret_cast<OSThread_t*>(memory_getPointerFromVirtualOffset(activeThread[i]));
 +			if (!thread)
 +				continue;
 +			Entry e;
@@ -1493,7 +2873,7 @@ index 7c7571f..fb47f84 100644
  		__OSUnlockScheduler();
  		while (true)
  		{
-@@ -1298,7 +1392,9 @@ namespace coreinit
+@@ -1261,7 +1339,9 @@ namespace coreinit
  				if (nextThread)
  				{
  					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
@@ -1503,7 +2883,7 @@ index 7c7571f..fb47f84 100644
  				}
  				__OSUnlockScheduler();
  			}
-@@ -1324,6 +1420,7 @@ namespace coreinit
+@@ -1287,6 +1367,7 @@ namespace coreinit
  
  		OSHostThread* hostThread = (OSHostThread*)Fiber::GetFiberPrivateData();
          cemu_assert_debug(hostThread);
@@ -1511,7 +2891,7 @@ index 7c7571f..fb47f84 100644
  
  		//if (ppcInterpreterCurrentInstance)
  		//	debug_printf("Core %d store thread %08x (t = %d)\n", hostThread->ppcInstance.sprNew.UPIR, memory_getVirtualOffsetFromPointer(hostThread->thread), t_assignedCoreIndex);
-@@ -1426,9 +1523,88 @@ namespace coreinit
+@@ -1389,9 +1470,88 @@ namespace coreinit
  	}
  #endif
  
@@ -1599,12 +2979,12 @@ index 7c7571f..fb47f84 100644
 +			__CemuSetHostThreadCpus(true, fmt::format("emulated core {}", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
  
- 		enableFlushDenormalsToZero();
+ 		ConfigureHostFloatingPointEnvironment();
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-index 974b52f..0ab04cd 100644
+index 7016fcc8..ecb105a5 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-@@ -513,6 +513,14 @@ namespace coreinit
+@@ -523,6 +523,14 @@ namespace coreinit
  
  	bool __CemuIsMulticoreMode();
  
@@ -1620,7 +3000,7 @@ index 974b52f..0ab04cd 100644
  	void* OSGetDefaultThreadStack(sint32 coreIndex, uint32& size);
  
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
-index b23560f..e937d8c 100644
+index b23560f1..e937d8c9 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.cpp
 @@ -575,6 +575,8 @@ namespace nsyshid
@@ -1878,7 +3258,7 @@ index b23560f..e937d8c 100644
  	DimensionsUSB::GetFigureByIndex(uint8 index)
  	{
 diff --git a/src/Cafe/OS/libs/nsyshid/Dimensions.h b/src/Cafe/OS/libs/nsyshid/Dimensions.h
-index 00ceff9..38a5726 100644
+index 00ceff9e..38a57263 100644
 --- a/src/Cafe/OS/libs/nsyshid/Dimensions.h
 +++ b/src/Cafe/OS/libs/nsyshid/Dimensions.h
 @@ -78,6 +78,21 @@ namespace nsyshid
@@ -1925,10 +3305,10 @@ index 00ceff9..38a5726 100644
  		std::queue<std::array<uint8, 32>> m_queries;
  	};
 diff --git a/src/Cafe/OS/libs/snd_core/ax.h b/src/Cafe/OS/libs/snd_core/ax.h
-index 0861e6a..b755fb2 100644
+index cd187fa4..43505613 100644
 --- a/src/Cafe/OS/libs/snd_core/ax.h
 +++ b/src/Cafe/OS/libs/snd_core/ax.h
-@@ -258,11 +258,14 @@ namespace snd_core
+@@ -255,11 +255,14 @@ namespace snd_core
  
  	void AXIst_Init();
  	void AXIst_ThreadEntry(PPCInterpreter_t* hCPU);
@@ -1963,9 +3343,8 @@ index 0861e6a..b755fb2 100644
  	COSModule* GetModuleSndCore1();
  	COSModule* GetModuleSndCore2();
  }
-\ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_ist.cpp b/src/Cafe/OS/libs/snd_core/ax_ist.cpp
-index 9be0c40..6864268 100644
+index 85bc3dd3..b6451d4b 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_ist.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_ist.cpp
 @@ -606,6 +606,7 @@ namespace snd_core
@@ -1978,7 +3357,7 @@ index 9be0c40..6864268 100644
  			// if voice is currently protected, dont sync remaining flags
 @@ -1042,14 +1043,14 @@ namespace snd_core
  
- 	SysAllocator<coreinit::OSMessage> _queueFrameMsg;
+ 	CafeStaticVar<coreinit::OSMessage> _queueFrameMsg{g_sndStaticData};
  
 -	void AXIst_QueueFrame()
 +	bool AXIst_QueueFrame()
@@ -2021,10 +3400,10 @@ index 9be0c40..6864268 100644
 +	}
  }
 diff --git a/src/Cafe/OS/libs/snd_core/ax_mix.cpp b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-index 31a24a4..f94364d 100644
+index 487eed7e..d132d4bb 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_mix.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_mix.cpp
-@@ -751,15 +751,24 @@ namespace snd_core
+@@ -866,15 +866,24 @@ namespace snd_core
  	{
  		if (internalShadowCopy->lpf.on == _swapEndianU16(AX_LPF_OFF))
  			return;
@@ -2055,10 +3434,10 @@ index 31a24a4..f94364d 100644
  
  	// mix audio generated from voice into main bus and aux buses
 diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-index 6cb1599..fd75205 100644
+index 0d9d930f..0087e4f0 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-@@ -216,86 +216,202 @@ namespace snd_core
+@@ -215,86 +215,202 @@ namespace snd_core
  		return nullptr;
  	}
  
@@ -2314,7 +3693,7 @@ index 6cb1599..fd75205 100644
  	}
  
  	void AIInitDRCDMA(sint16* sampleData, sint32 size)
-@@ -475,12 +591,18 @@ namespace snd_core
+@@ -476,12 +592,18 @@ namespace snd_core
  	}
  
  	// called periodically to check for AX updates
@@ -2333,7 +3712,7 @@ index 6cb1599..fd75205 100644
  
  		// if we haven't buffered any blocks, we will wait less time than usual
  		bool additional_blocks_required = false;
-@@ -492,40 +614,61 @@ namespace snd_core
+@@ -493,40 +615,61 @@ namespace snd_core
  
  		const auto wait_duration = additional_blocks_required ? kWaitDurationFast : kWaitDuration;
  
@@ -2419,7 +3798,7 @@ index 6cb1599..fd75205 100644
  	}
  
 diff --git a/src/Cafe/OS/libs/snd_core/ax_voice.cpp b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
-index d4e562e..3f225ff 100644
+index 80d3eda8..ca77a6e2 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_voice.cpp
 @@ -117,7 +117,7 @@ namespace snd_core
@@ -2505,10 +3884,10 @@ index d4e562e..3f225ff 100644
  		MPTR currentThreadMPTR = memory_getVirtualOffsetFromPointer(coreinit::OSGetCurrentThread());
  		if (__AXVoiceProtection[index].threadMPTR == currentThreadMPTR)
 diff --git a/src/Cafe/OS/libs/snd_user/snd_user.cpp b/src/Cafe/OS/libs/snd_user/snd_user.cpp
-index 58e8f4b..6c806fa 100644
+index 0f3bd732..5288675c 100644
 --- a/src/Cafe/OS/libs/snd_user/snd_user.cpp
 +++ b/src/Cafe/OS/libs/snd_user/snd_user.cpp
-@@ -1082,12 +1082,12 @@ namespace snd_user
+@@ -1236,12 +1236,12 @@ namespace snd_user
  			if(!clearChannel[channel])
  				continue;
  			sint32be* channelPtr = auxSamples->channelSamples[channel].GetPtr();
@@ -2527,7 +3906,7 @@ index 58e8f4b..6c806fa 100644
  		}
  
  	}
-@@ -1129,9 +1129,84 @@ namespace snd_user
+@@ -1283,9 +1283,84 @@ namespace snd_user
  		uint32 placeholder;
  	};
  
@@ -2613,7 +3992,7 @@ index 58e8f4b..6c806fa 100644
  	}
  
  	void AXFXMultiChReverbSettingsUpdate(AXFXMultiChReverbData* param)
-@@ -1141,13 +1216,52 @@ namespace snd_user
+@@ -1295,13 +1370,52 @@ namespace snd_user
  
  	void AXFXMultiChReverbShutdown(AXFXMultiChReverbData* param)
  	{
@@ -2669,8 +4048,59 @@ index 58e8f4b..6c806fa 100644
  	}
  
  	/* AXFXReverbStd */
+diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
+index 76df08c1..e6a3fbc1 100644
+--- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
++++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
+@@ -98,7 +98,9 @@ void swkbd::setSwkbdCallbacks(std::shared_ptr<swkbd::swkbdCallbacks> swkbdCallba
+ 	g_swkbdCallbacks = std::move(swkbdCallbacks);
+ }
+ 
+-void swkbdExport_SwkbdCreate(PPCInterpreter_t* hCPU)
++CafeStaticVar<swkbdInternalState_t> swkbdInternalState{s_swkbdStaticData};
++
++void SwkbdCreate(uint8* workMemory, uint32 regionType, uint32 unk, coreinit::FSClient_t* fsClient)
+ {
+ 	memset(swkbdInternalState.GetPtr(), 0, sizeof(swkbdInternalState_t));
+ 	coreinit::OSSleepTicks(ESPRESSO_TIMER_CLOCK); // simulate this function taking a bit of time to run. MH3U/MH3G requires this to not softlock
+@@ -229,7 +231,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
+ 	if (g_swkbdCallbacks)
+ 		g_swkbdCallbacks->showSoftwareKeyboard({swkbdInternalState->formStringBuffer, swkbdInternalState->formStringBuffer + swkbdInternalState->formStringLength}, swkbdInternalState->maxTextLength);
+ 
+-	osLib_returnFromFunction(hCPU, 1);
++	return 1;
+ }
+ 
+ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -253,7 +255,7 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+ 		sint32 maxLength = std::max(swkbdInternalState->keyboardArg.receiverArg.stringBufSize - 1, 0);
+ 		g_swkbdCallbacks->showSoftwareKeyboard({swkbdInternalState->formStringBuffer, swkbdInternalState->formStringBuffer + swkbdInternalState->formStringLength}, maxLength);
+ 	}
+-	osLib_returnFromFunction(hCPU, 1);
++	return 1;
+ }
+ 
+ uint32 SwkbdDisappearInputForm()
+@@ -262,7 +264,7 @@ uint32 SwkbdDisappearInputForm()
+ 	swkbdInternalState->isActive = false;
+ 	if (g_swkbdCallbacks)
+ 		g_swkbdCallbacks->hideSoftwareKeyboard();
+-	osLib_returnFromFunction(hCPU, 1);
++	return 1;
+ }
+ 
+ uint32 SwkbdDisappearKeyboard()
+@@ -271,7 +273,7 @@ uint32 SwkbdDisappearKeyboard()
+ 	swkbdInternalState->isActive = false;
+ 	if (g_swkbdCallbacks)
+ 		g_swkbdCallbacks->hideSoftwareKeyboard();
+-	osLib_returnFromFunction(hCPU, 1);
++	return 1;
+ }
+ 
+ uint16be* SwkbdGetInputFormString()
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler.cpp b/src/Common/ExceptionHandler/ExceptionHandler.cpp
-index 7530a2e..0d0d225 100644
+index 4223eaa1..38da9be9 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler.cpp
 +++ b/src/Common/ExceptionHandler/ExceptionHandler.cpp
 @@ -78,6 +78,21 @@ void ExceptionHandler_LogGeneralInfo()
@@ -2696,7 +4126,7 @@ index 7530a2e..0d0d225 100644
          // GPR info
          CrashLog_WriteLine("");
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 3c1587e..479b43e 100644
+index be9929f6..4f17194e 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -45,7 +45,8 @@ android {
@@ -2710,12 +4140,12 @@ index 3c1587e..479b43e 100644
          targetSdk = 35
          versionName = getVersionName()
 diff --git a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
-index 1190bf4..77319a1 100644
+index 54913bec..6a4715f7 100644
 --- a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 +++ b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 @@ -334,6 +334,9 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsFigure
  {
- 	if (const auto& opt = NativeEmulatedUSBDevices::g_dimensionSlots.at(slot))
+ 	if (const auto& opt = NativeEmulatedUSBDevices::s_dimensionSlots.at(slot))
  	{
 +		uint32 live = nsyshid::g_dimensionstoypad.GetFigureIdAtIndex((uint8)slot);
 +		if (live != 0 && live != opt->number)
@@ -2773,7 +4203,7 @@ index 1190bf4..77319a1 100644
 +	return result;
 +}
 diff --git a/src/android/app/src/main/cpp/NativeEmulation.cpp b/src/android/app/src/main/cpp/NativeEmulation.cpp
-index 82c1117..ac07e81 100644
+index 82c11176..ac07e81e 100644
 --- a/src/android/app/src/main/cpp/NativeEmulation.cpp
 +++ b/src/android/app/src/main/cpp/NativeEmulation.cpp
 @@ -46,6 +46,8 @@ namespace NativeEmulation
@@ -2786,7 +4216,7 @@ index 82c1117..ac07e81 100644
  		}
  #endif // HAS_CUBEB
 diff --git a/src/android/app/src/main/cpp/NativeLogging.cpp b/src/android/app/src/main/cpp/NativeLogging.cpp
-index 19a7547..27b96a6 100644
+index 19a75475..27b96a6f 100644
 --- a/src/android/app/src/main/cpp/NativeLogging.cpp
 +++ b/src/android/app/src/main/cpp/NativeLogging.cpp
 @@ -1,6 +1,11 @@
@@ -2812,7 +4242,7 @@ index 19a7547..27b96a6 100644
 +	snd_core::AXOut_SetVolumeBoostDb(db);
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
-index 29a5c74..342d30c 100644
+index 29a5c740..342d30c8 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/EmulationActivity.kt
 @@ -25,6 +25,8 @@ import info.cemu.cemu.emulation.input.DeviceMotionHandler
@@ -2862,7 +4292,7 @@ index 29a5c74..342d30c 100644
  
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt
 new file mode 100644
-index 0000000..c991f02
+index 00000000..c991f02c
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureAbilities.kt
 @@ -0,0 +1,366 @@
@@ -3234,7 +4664,7 @@ index 0000000..c991f02
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt
 new file mode 100644
-index 0000000..fc3d599
+index 00000000..fc3d5993
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/FigureCatalog.kt
 @@ -0,0 +1,365 @@
@@ -3605,7 +5035,7 @@ index 0000000..fc3d599
 +val CATALOG_BY_ID: Map<Int, CatalogFigure> = CATALOG.associateBy { it.id }
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 new file mode 100644
-index 0000000..c4477e1
+index 00000000..c4477e17
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadAssets.kt
 @@ -0,0 +1,433 @@
@@ -4044,7 +5474,7 @@ index 0000000..c4477e1
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt
 new file mode 100644
-index 0000000..1b23271
+index 00000000..1b23271a
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadBackground.kt
 @@ -0,0 +1,147 @@
@@ -4197,7 +5627,7 @@ index 0000000..1b23271
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
 new file mode 100644
-index 0000000..e8c0fe3
+index 00000000..e8c0fe32
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadLists.kt
 @@ -0,0 +1,52 @@
@@ -4255,7 +5685,7 @@ index 0000000..e8c0fe3
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 new file mode 100644
-index 0000000..8083757
+index 00000000..80837572
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadScreen.kt
 @@ -0,0 +1,1612 @@
@@ -5873,7 +7303,7 @@ index 0000000..8083757
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
 new file mode 100644
-index 0000000..457ffbf
+index 00000000..457ffbf6
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/emulation/toypadscreen/ToyPadSecondScreen.kt
 @@ -0,0 +1,153 @@
@@ -6032,7 +7462,7 @@ index 0000000..457ffbf
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
 new file mode 100644
-index 0000000..2cdc70a
+index 00000000..2cdc70af
 --- /dev/null
 +++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeAudioBoost.kt
 @@ -0,0 +1,29 @@
@@ -6066,7 +7496,7 @@ index 0000000..2cdc70a
 +    }
 +}
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
-index 5c178c2..3d1bfb7 100644
+index 5c178c2f..3d1bfb75 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/nativeinterface/NativeEmulatedUSBDevices.kt
 @@ -85,6 +85,18 @@ object NativeEmulatedUSBDevices {
@@ -6089,7 +7519,7 @@ index 5c178c2..3d1bfb7 100644
      external fun clearDimensionsFigure(pad: Int, index: Int)
  
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
-index 4c61cbd..066bc1f 100644
+index 4c61cbd5..066bc1f5 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/audio/AudioSettingsScreen.kt
 @@ -1,11 +1,13 @@
@@ -6134,7 +7564,7 @@ index 4c61cbd..066bc1f 100644
              label = tr("Gamepad"),
              description = tr("Enable audio output for the Wii U Gamepad"),
 diff --git a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
-index 5325cb1..6bad79a 100644
+index 3a98eeb4..d00e90f1 100644
 --- a/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 +++ b/src/android/app/src/main/java/info/cemu/cemu/settings/emulatedusbdevices/EmulatedUSBDevicesScreen.kt
 @@ -1,13 +1,47 @@
@@ -6183,7 +7613,7 @@ index 5325cb1..6bad79a 100644
 +    }
 +
      ScreenContent(
-         appBarText = tr("Emulated USB Devices settings"),
+         appBarText = tr("Emulated USB Devices"),
          navigateBack = navigateBack,
 @@ -29,5 +63,48 @@ fun EmulatedUSBDevicesSettingsScreen(navigateBack: () -> Unit) {
              initialCheckedState = NativeSettings::isEmulateDimensionsToypadEnabled,
@@ -6236,7 +7666,7 @@ index 5325cb1..6bad79a 100644
  }
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_recent.xml b/src/android/app/src/main/res/drawable/ic_toypad_recent.xml
 new file mode 100644
-index 0000000..0f599cc
+index 00000000..0f599ccc
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_recent.xml
 @@ -0,0 +1,9 @@
@@ -6251,7 +7681,7 @@ index 0000000..0f599cc
 +</vector>
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_star.xml b/src/android/app/src/main/res/drawable/ic_toypad_star.xml
 new file mode 100644
-index 0000000..8bb6680
+index 00000000..8bb66809
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_star.xml
 @@ -0,0 +1,9 @@
@@ -6266,7 +7696,7 @@ index 0000000..8bb6680
 +</vector>
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml b/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml
 new file mode 100644
-index 0000000..7aed036
+index 00000000..7aed0363
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_star_outline.xml
 @@ -0,0 +1,9 @@
@@ -6281,7 +7711,7 @@ index 0000000..7aed036
 +</vector>
 diff --git a/src/android/app/src/main/res/drawable/ic_toypad_team.xml b/src/android/app/src/main/res/drawable/ic_toypad_team.xml
 new file mode 100644
-index 0000000..133e382
+index 00000000..133e382f
 --- /dev/null
 +++ b/src/android/app/src/main/res/drawable/ic_toypad_team.xml
 @@ -0,0 +1,9 @@
@@ -6295,7 +7725,7 @@ index 0000000..133e382
 +        android:pathData="M16,11c1.66,0 2.99,-1.34 2.99,-3S17.66,5 16,5c-1.66,0 -3,1.34 -3,3s1.34,3 3,3zM8,11c1.66,0 2.99,-1.34 2.99,-3S9.66,5 8,5C6.34,5 5,6.34 5,8s1.34,3 3,3zM8,13c-2.33,0 -7,1.17 -7,3.5L1,19h14v-2.5c0,-2.33 -4.67,-3.5 -7,-3.5zM16,13c-0.29,0 -0.62,0.02 -0.97,0.05 1.16,0.84 1.97,1.97 1.97,3.45L17,19h6v-2.5c0,-2.33 -4.67,-3.5 -7,-3.5z" />
 +</vector>
 diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
-index 053d3be..71202a3 100644
+index 053d3be8..71202a35 100644
 --- a/src/android/app/src/main/res/values/strings.xml
 +++ b/src/android/app/src/main/res/values/strings.xml
 @@ -1,5 +1,5 @@
@@ -6306,7 +7736,7 @@ index 053d3be..71202a3 100644
      <string name="cemu_website" translatable="false">https://cemu.info</string>
      <string name="cemu_online_guide" translatable="false">https://cemu.info/online-guide</string>
 diff --git a/src/audio/CubebAPI.cpp b/src/audio/CubebAPI.cpp
-index f6d5d51..0a5198d 100644
+index f6d5d516..0a5198de 100644
 --- a/src/audio/CubebAPI.cpp
 +++ b/src/audio/CubebAPI.cpp
 @@ -39,14 +39,19 @@ long CubebAPI::data_cb(cubeb_stream* stream, void* user, const void* inputbuffer
@@ -6338,10 +7768,10 @@ index f6d5d51..0a5198d 100644
  	}
  
 diff --git a/src/audio/IAudioAPI.cpp b/src/audio/IAudioAPI.cpp
-index 05b9ac1..6b193f9 100644
+index 000b1182..a395ed68 100644
 --- a/src/audio/IAudioAPI.cpp
 +++ b/src/audio/IAudioAPI.cpp
-@@ -129,6 +129,8 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
+@@ -134,6 +134,8 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
  
  	audioAPIDev = CreateDevice(audio_api, device_description, rate, channels, samples_per_block, bits_per_sample);
  	audioAPIDev->SetVolume(GetVolumeFromType(type));
@@ -6350,7 +7780,7 @@ index 05b9ac1..6b193f9 100644
  
  	return audioAPIDev;
  }
-@@ -206,6 +208,50 @@ void IAudioAPI::SetAudioDelayOverride(uint32 delay)
+@@ -211,6 +213,50 @@ void IAudioAPI::SetAudioDelayOverride(uint32 delay)
  	m_audioDelayOverride = delay;
  }
  
@@ -6402,7 +7832,7 @@ index 05b9ac1..6b193f9 100644
  {
  	return m_audioDelayOverride > 0 ? m_audioDelayOverride : s_audioDelay;
 diff --git a/src/audio/IAudioAPI.h b/src/audio/IAudioAPI.h
-index 40e42e0..93fb736 100644
+index 504d615f..976557aa 100644
 --- a/src/audio/IAudioAPI.h
 +++ b/src/audio/IAudioAPI.h
 @@ -72,6 +72,17 @@ public:
@@ -6436,3 +7866,15 @@ index 40e42e0..93fb736 100644
  private:
  	static uint32 s_audioDelay;
  	void InitWFX(sint32 samplerate, sint32 channels, sint32 bits_per_sample);
+diff --git a/src/util/CMakeLists.txt b/src/util/CMakeLists.txt
+index 8aa50b22..4dd674c0 100644
+--- a/src/util/CMakeLists.txt
++++ b/src/util/CMakeLists.txt
+@@ -37,6 +37,7 @@ add_library(CemuUtil
+   helpers/SystemException.h
+   helpers/TempState.h
+   helpers/ZArchiveHelpers.h
++  helpers/ZipArchive.h
+   highresolutiontimer/HighResolutionTimer.cpp
+   highresolutiontimer/HighResolutionTimer.h
+   ImageWriter/bmp.h

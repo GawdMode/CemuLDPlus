@@ -1,6 +1,7 @@
 name: Build Cemu LD+ APK
 
-# Downloads SSimco's Cemu Android port at a fixed commit, applies lightfix.patch,
+# Downloads SSimco's Cemu Android port at a fixed commit, merges the official Cemu main branch at a fixed commit into it
+# (conflicting lines keep SSimco's side, lightfix.patch has the rest of the merge fixes), applies lightfix.patch,
 # builds the APK and publishes it as a GitHub release for direct download on the device.
 # It can also build "Cemu Control" (the same Cemu with no fixes, only a separate app id) for comparison tests,
 # see the commented-out matrix entry below.
@@ -17,7 +18,9 @@ permissions:
 
 env:
   CEMU_REPO: https://github.com/SSimco/Cemu.git
-  CEMU_COMMIT: 8759323e5b72594665b55e02f99db3c1e1e7de8a
+  CEMU_COMMIT: 7c2324eda01a3974ff89aa1e4ee7a594d278662a # SSimco "android" branch
+  UPSTREAM_REPO: https://github.com/cemu-project/Cemu.git
+  UPSTREAM_COMMIT: 2f49c079da1d50b85cea0ed99aedda58846b3523 # official Cemu main, 2026-11-20
   VCPKG_BINARY_SOURCES: "clear;files,/home/runner/vcpkg-binary-cache,readwrite"
   VCPKG_FORCE_DOWNLOADED_BINARIES: true
   # throwaway test signing key, kept fixed so newer test builds install over older ones
@@ -52,6 +55,9 @@ jobs:
           git clone "$CEMU_REPO" cemu
           cd cemu
           git checkout "$CEMU_COMMIT"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch -q upstream main
+          git -c user.name=ci -c user.email=ci@localhost merge --no-edit -X ours "$UPSTREAM_COMMIT"
           git submodule update --init --recursive
           git apply --verbose "../lightfix/${{ matrix.patch }}"
 
@@ -147,5 +153,5 @@ jobs:
             - Setup tips (game profile settings, volume boost, moving your save and shader cache): see the [README](https://github.com/${{ github.repository }}#readme).
             - Problems? Open an [Issue](https://github.com/${{ github.repository }}/issues) and attach your log (game list menu → **Share log file**).
 
-            Not affiliated with SSimco or the Cemu team. Based on SSimco/Cemu commit `${{ env.CEMU_COMMIT }}`. Licensed under MPL-2.0.
+            Not affiliated with SSimco or the Cemu team. Based on SSimco/Cemu commit `${{ env.CEMU_COMMIT }}` merged with official Cemu commit `${{ env.UPSTREAM_COMMIT }}`, plus some changes ported from [Fractal](https://github.com/dfdx047/Fractal). Licensed under MPL-2.0.
           files: out/*.apk
