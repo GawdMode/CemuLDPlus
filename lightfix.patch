@@ -2166,6 +2166,24 @@ index f758486a..e1aca078 100644
  	if (forceFinish)
  	{
  		// start any delayed transfers
+diff --git a/src/Cafe/HW/Latte/Core/LatteThread.cpp b/src/Cafe/HW/Latte/Core/LatteThread.cpp
+index 743ab679..e5894ac3 100644
+--- a/src/Cafe/HW/Latte/Core/LatteThread.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteThread.cpp
+@@ -1,3 +1,4 @@
++#include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
+ #include "Cafe/HW/Latte/ISA/RegDefines.h"
+ #include "Cafe/OS/libs/gx2/GX2.h" // todo - remove dependency
+ #include "Cafe/HW/Latte/Core/Latte.h"
+@@ -115,6 +116,8 @@ void LatteThread_HandleOSScreen()
+ int Latte_ThreadEntry()
+ {
+ 	SetThreadName("LatteThread");
++	// Cemu LD+: the render thread uses the fast CPUs but leaves the fastest one to the game's main thread
++	coreinit::__CemuSetHostThreadCpus(coreinit::HostCpuGroup::OtherFast, "render thread");
+ 	sint32 w,h;
+ 	WindowSystem::GetWindowPhysSize(w,h);
+ 
 diff --git a/src/Cafe/HW/Latte/Renderer/Renderer.h b/src/Cafe/HW/Latte/Renderer/Renderer.h
 index 712d7321..ac83e2fb 100644
 --- a/src/Cafe/HW/Latte/Renderer/Renderer.h
@@ -2242,7 +2260,7 @@ index ee85f720..9df17e22 100644
  VKFUNC_DEVICE(vkCmdBlitImage);
  VKFUNC_DEVICE(vkCmdPushConstants);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index a1902c1a..1fe9d466 100644
+index a1902c1a..4d91ac18 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 @@ -1,3 +1,4 @@
@@ -2354,7 +2372,7 @@ index a1902c1a..1fe9d466 100644
  
  	// ##########################################################################################################################################
  
-@@ -1106,13 +1114,25 @@ static void compilePipeline_thread(sint32 threadIndex)
+@@ -1106,13 +1114,26 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -2365,9 +2383,10 @@ index a1902c1a..1fe9d466 100644
 +		setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
 +	// Cemu LD+: pipelines needed during gameplay are built in the background (the draw is skipped until it's ready), so
 +	// the extra compile threads use the slow power-saving CPUs and leave the fast ones to the game and the renderer.
-+	// The first thread may still use any CPU so a burst of new pipelines doesn't wait too long.
-+	if (threadIndex != 0)
-+		coreinit::__CemuSetHostThreadCpus(false, fmt::format("pipeline compile thread {}", threadIndex).c_str());
++	// The first thread uses the fast CPUs (but not the fastest one, which is the game's) so a burst of new pipelines
++	// doesn't wait too long.
++	coreinit::__CemuSetHostThreadCpus(threadIndex == 0 ? coreinit::HostCpuGroup::OtherFast : coreinit::HostCpuGroup::Slow,
++		fmt::format("pipeline compile thread {}", threadIndex).c_str());
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
@@ -2705,13 +2724,14 @@ index bba8b872..2c301c51 100644
  				return FSA_RESULT::OK;
  
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index a0f721a2..1bd01782 100644
+index a0f721a2..087afbd9 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-@@ -15,8 +15,13 @@
+@@ -15,8 +15,14 @@
  #include "util/Fiber/Fiber.h"
  
  #include "util/helpers/helpers.h"
++#include <bit>
 +#if defined(__linux__)
 +#include <unistd.h>
 +#include <sys/syscall.h>
@@ -2723,7 +2743,7 @@ index a0f721a2..1bd01782 100644
  #if defined(__clang__)
  #include <arm_acle.h>
  #elif defined(_MSC_VER)
-@@ -28,7 +33,7 @@ static void ConfigureHostFloatingPointEnvironment()
+@@ -28,7 +34,7 @@ static void ConfigureHostFloatingPointEnvironment()
  {
  #if defined(ARCH_X86_64)
  	_mm_setcsr(_mm_getcsr() | 0x8000);
@@ -2732,7 +2752,7 @@ index a0f721a2..1bd01782 100644
  	// enable flush-to-zero and preserve NaN signs and payloads (FZ=1, DN=0)
  #if defined(__clang__)
  	__arm_wsr64("fpcr", (__arm_rsr64("fpcr") | (1 << 24)) & ~(1 << 25));
-@@ -92,36 +97,21 @@ namespace coreinit
+@@ -92,36 +98,21 @@ namespace coreinit
  
  	void SuspendActiveThreads()
  	{
@@ -2772,7 +2792,7 @@ index a0f721a2..1bd01782 100644
  
  		__OSUnlockScheduler();
  	}
-@@ -1245,12 +1235,100 @@ namespace coreinit
+@@ -1245,12 +1236,100 @@ namespace coreinit
  
  	Fiber* g_idleLoopFiber[3]{};
  
@@ -2873,7 +2893,7 @@ index a0f721a2..1bd01782 100644
  		__OSUnlockScheduler();
  		while (true)
  		{
-@@ -1261,7 +1339,9 @@ namespace coreinit
+@@ -1261,7 +1340,9 @@ namespace coreinit
  				if (nextThread)
  				{
  					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
@@ -2883,7 +2903,7 @@ index a0f721a2..1bd01782 100644
  				}
  				__OSUnlockScheduler();
  			}
-@@ -1287,6 +1367,7 @@ namespace coreinit
+@@ -1287,6 +1368,7 @@ namespace coreinit
  
  		OSHostThread* hostThread = (OSHostThread*)Fiber::GetFiberPrivateData();
          cemu_assert_debug(hostThread);
@@ -2891,45 +2911,54 @@ index a0f721a2..1bd01782 100644
  
  		//if (ppcInterpreterCurrentInstance)
  		//	debug_printf("Core %d store thread %08x (t = %d)\n", hostThread->ppcInstance.sprNew.UPIR, memory_getVirtualOffsetFromPointer(hostThread->thread), t_assignedCoreIndex);
-@@ -1389,9 +1470,88 @@ namespace coreinit
+@@ -1389,9 +1471,121 @@ namespace coreinit
  	}
  #endif
  
-+	// Cemu LD+: phones mix fast CPU cores with slow power-saving ones. Works out which host CPUs are which (once).
-+	// Returns false when there is no clear split, in which case everything is left to the OS.
-+	bool __CemuGetHostCpuSplit(uint64& fastMask, uint64& slowMask)
++	// Cemu LD+: phones mix fast CPU cores with slow power-saving ones, and often have one or two CPUs that are faster
++	// still (the AYN Thor: 3 slow, 4 fast and 1 fastest). Works out which host CPUs are which (once).
++	struct HostCpuTiers
 +	{
-+#if defined(__linux__)
-+		static uint64 s_fastMask = 0, s_slowMask = 0;
++		uint64 fastest = 0; // CPUs at the top speed
++		uint64 fast = 0;    // CPUs at 70% of the top speed or more (includes the fastest ones)
++		uint64 slow = 0;    // everything else
++	};
++
++	static const HostCpuTiers& _GetHostCpuTiers()
++	{
++		static HostCpuTiers s_tiers;
 +		static std::once_flag s_once;
 +		std::call_once(s_once, []() {
++#if defined(__linux__)
 +			const long cpuCount = std::clamp<long>(sysconf(_SC_NPROCESSORS_CONF), 0, 64);
 +			std::vector<uint64> maxKHz((size_t)cpuCount, 0);
-+			uint64 fastest = 0;
++			uint64 top = 0;
 +			for (long cpu = 0; cpu < cpuCount; cpu++)
 +			{
 +				std::ifstream f(fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu));
 +				uint64 v = 0;
 +				if (f >> v)
 +					maxKHz[(size_t)cpu] = v;
-+				fastest = std::max(fastest, maxKHz[(size_t)cpu]);
++				top = std::max(top, maxKHz[(size_t)cpu]);
 +			}
 +			std::string speeds;
 +			uint32 fastCount = 0, knownCount = 0;
-+			uint64 fast = 0, slow = 0;
++			HostCpuTiers tiers;
 +			for (long cpu = 0; cpu < cpuCount; cpu++)
 +			{
 +				if (maxKHz[(size_t)cpu] == 0)
 +					continue;
 +				knownCount++;
 +				speeds.append(fmt::format("{}{}:{}", speeds.empty() ? "" : " ", cpu, maxKHz[(size_t)cpu] / 1000));
-+				if (maxKHz[(size_t)cpu] * 10 >= fastest * 7)
++				if (maxKHz[(size_t)cpu] * 10 >= top * 7)
 +				{
-+					fast |= (1ull << cpu);
++					tiers.fast |= (1ull << cpu);
 +					fastCount++;
++					if (maxKHz[(size_t)cpu] * 100 >= top * 97)
++						tiers.fastest |= (1ull << cpu);
 +				}
 +				else
-+					slow |= (1ull << cpu);
++					tiers.slow |= (1ull << cpu);
 +			}
 +			cemuLog_log(LogType::Force, "[CPU] host CPU top speeds in MHz (cpu:speed): {}", speeds.empty() ? "unknown" : speeds);
 +			if (fastCount < 3 || fastCount >= knownCount)
@@ -2937,26 +2966,46 @@ index a0f721a2..1bd01782 100644
 +				cemuLog_log(LogType::Force, "[CPU] no clear split between fast and slow host CPUs, leaving thread placement to the system");
 +				return;
 +			}
-+			s_fastMask = fast;
-+			s_slowMask = slow;
-+		});
-+		fastMask = s_fastMask;
-+		slowMask = s_slowMask;
-+		return s_fastMask != 0 && s_slowMask != 0;
-+#else
-+		fastMask = slowMask = 0;
-+		return false;
++			s_tiers = tiers;
 +#endif
++		});
++		return s_tiers;
 +	}
 +
-+	// Cemu LD+: keeps the calling host thread on the given host CPUs (no effect without a fast/slow split)
-+	void __CemuSetHostThreadCpus(bool fastCpus, const char* what)
++	bool __CemuGetHostCpuSplit(uint64& fastMask, uint64& slowMask)
++	{
++		const HostCpuTiers& tiers = _GetHostCpuTiers();
++		fastMask = tiers.fast;
++		slowMask = tiers.slow;
++		return tiers.fast != 0 && tiers.slow != 0;
++	}
++
++	// Cemu LD+: keeps the calling host thread on a group of host CPUs (no effect without a fast/slow split)
++	void __CemuSetHostThreadCpus(HostCpuGroup group, const char* what)
 +	{
 +#if defined(__linux__)
-+		uint64 fastMask, slowMask;
-+		if (!__CemuGetHostCpuSplit(fastMask, slowMask))
++		const HostCpuTiers& tiers = _GetHostCpuTiers();
++		if (tiers.fast == 0 || tiers.slow == 0)
 +			return;
-+		uint64 mask = fastCpus ? fastMask : slowMask;
++		// the fastest CPUs are only kept apart when there are at least two other fast ones
++		const uint64 otherFast = tiers.fast & ~tiers.fastest;
++		const bool splitFastest = tiers.fastest != 0 && std::popcount(otherFast) >= 2;
++		uint64 mask = tiers.fast;
++		switch (group)
++		{
++		case HostCpuGroup::Fastest:
++			mask = splitFastest ? tiers.fastest : tiers.fast;
++			break;
++		case HostCpuGroup::OtherFast:
++			mask = splitFastest ? otherFast : tiers.fast;
++			break;
++		case HostCpuGroup::Fast:
++			mask = tiers.fast;
++			break;
++		case HostCpuGroup::Slow:
++			mask = tiers.slow;
++			break;
++		}
 +		if (syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask) != 0)
 +		{
 +			cemuLog_log(LogType::Force, "[CPU] could not set host CPUs for {} (error {})", what, errno);
@@ -2973,18 +3022,22 @@ index a0f721a2..1bd01782 100644
  	void OSSchedulerCoreEmulationThread(void* _assignedCoreIndex)
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
-+		// Cemu LD+: in multi-core mode each emulated core has its own host thread. The cores have to keep pace with each
-+		// other and with real time (the audio mixer runs on one of them), so keep them off the slow power-saving CPUs
-+		if (g_isMulticoreMode)
-+			__CemuSetHostThreadCpus(true, fmt::format("emulated core {}", (uintptr_t)_assignedCoreIndex).c_str());
++		// Cemu LD+: keep the emulated cores off the slow power-saving CPUs. Core 1 runs the game's main thread, which
++		// limits the frame rate in busy areas, so it gets the fastest CPU to itself. Otherwise Android tends to move it to
++		// a slower core whenever it isn't 100% busy (it waits for the GPU now and then), which makes it slower still.
++		// In single-core mode the one emulation thread runs everything, so it gets the fastest CPU too.
++		if (!g_isMulticoreMode || (uintptr_t)_assignedCoreIndex == 1)
++			__CemuSetHostThreadCpus(HostCpuGroup::Fastest, g_isMulticoreMode ? "emulated core 1 (game main thread)" : "emulated CPU (single-core)");
++		else
++			__CemuSetHostThreadCpus(HostCpuGroup::OtherFast, fmt::format("emulated core {}", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
  
  		ConfigureHostFloatingPointEnvironment();
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-index 7016fcc8..ecb105a5 100644
+index 7016fcc8..037d74a3 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.h
-@@ -523,6 +523,14 @@ namespace coreinit
+@@ -523,6 +523,21 @@ namespace coreinit
  
  	bool __CemuIsMulticoreMode();
  
@@ -2994,7 +3047,14 @@ index 7016fcc8..ecb105a5 100644
 +	void __OSTakeHostCpuStats(uint32 samples[3][kHostCpuSampleSlots]);
 +	void __OSLogThreadList(const OSThread_t* audioThread);
 +	bool __CemuGetHostCpuSplit(uint64& fastMask, uint64& slowMask);
-+	void __CemuSetHostThreadCpus(bool fastCpus, const char* what);
++	enum class HostCpuGroup
++	{
++		Fastest,   // the top speed CPUs (falls back to all fast CPUs when there are only a few)
++		OtherFast, // fast CPUs except the fastest ones
++		Fast,      // all fast CPUs
++		Slow,      // the power-saving CPUs
++	};
++	void __CemuSetHostThreadCpus(HostCpuGroup group, const char* what);
 +
  	OSThread_t* OSGetDefaultThread(sint32 coreIndex);
  	void* OSGetDefaultThreadStack(sint32 coreIndex, uint32& size);

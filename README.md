@@ -224,9 +224,12 @@ same time:
   whenever the audio thread hadn't gotten its turn yet. With multi-core, the audio thread often needed a bit longer than
   3 ms to get its turn in busy areas, so up to a third of the sound was skipped (the build 25 log showed 2090 of 3340
   pieces in 10 seconds). Now every missed piece is counted and made up, a few at a time.
-- **Fast CPU cores (build 26).** Phones mix fast CPU cores with slow power-saving ones. Android sometimes put an
-  emulated core that wasn't fully busy on a slow one, so it fell behind the others. The emulated cores are now kept on
-  the faster CPUs (the log lists which ones).
+- **Fast CPU cores (build 26, 31).** Phones mix fast CPU cores with slow power-saving ones, and often one fastest
+  core (the AYN Thor: 3 slow, 4 fast, 1 fastest). Android sometimes put an emulated core that wasn't fully busy on a
+  slower CPU, so it fell behind. The emulated cores are kept on the fast CPUs, and from build 31 emulated core 1,
+  which runs the game's main thread and limits the frame rate in busy areas, gets the fastest CPU to itself. The
+  render thread and the first pipeline compile thread use the other fast CPUs, the rest of the compile threads the
+  slow ones. The log lists which CPUs each one got.
 - **Memory order on ARM (build 25).** Games use `sync`/`lwsync` instructions to make sure data written on one core is
   complete before another core reads it. On a PC the processor keeps that order anyway, so Cemu skips those
   instructions. ARM processors can reorder memory accesses, so in multi-core mode Cemu LD+ turns them into real memory
