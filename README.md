@@ -8,7 +8,7 @@ An **unofficial** build of [SSimco's Cemu for Android](https://github.com/SSimco
   ready to place, pictures, Toy Tags, franchise logos, search and every figure's abilities.
 - **Better sound:** fixed sound filter, balanced left/right with a simple reverb, and an optional volume boost.
 
-- **Newer, faster Cemu (build 28):** based on the current official Cemu (November 2026) instead of the April
+- **Newer, faster Cemu (build 30):** based on the current official Cemu (November 2026) instead of the April
   version, plus some speedups ported from [Fractal](https://github.com/dfdx047/Fractal). See *Performance* below.
 
 Everything else matches SSimco's Android Cemu, including the built-in emulated Toy Pad.
@@ -195,9 +195,9 @@ competed with the game for the fast cores, so the frame rate dropped whenever ma
 (new areas, open worlds). Cemu LD+ now lowers their priority on Android too. Objects built in the background can take
 a moment longer to appear the first time, but the game itself keeps running smoothly.
 
-### Performance (build 28 and later)
+### Performance (build 30 and later)
 
-Build 28 moves Cemu LD+ from the April 2026 Cemu to the official Cemu of November 20, 2026, merged into SSimco's
+Build 30 moves Cemu LD+ from the April 2026 Cemu to the official Cemu of November 20, 2026, merged into SSimco's
 current Android port. That brings the Cemu team's work since April, including a much lighter render thread
 (incremental state checks, faster shader and pipeline lookups) and faster ARM code for floating point stores. On top
 of that, these changes come from [Fractal](https://github.com/dfdx047/Fractal), another Cemu fork for Android:
