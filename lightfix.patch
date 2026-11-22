@@ -4160,7 +4160,7 @@ index be9929f6..4f17194e 100644
          targetSdk = 35
          versionName = getVersionName()
 diff --git a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
-index 54913bec..6a4715f7 100644
+index 54913bec..d7cd06b8 100644
 --- a/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 +++ b/src/android/app/src/main/cpp/NativeEmulatedUSBDevices.cpp
 @@ -334,6 +334,9 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsFigure
@@ -4181,9 +4181,9 @@ index 54913bec..6a4715f7 100644
 +extern "C" JNIEXPORT jint JNICALL
 +Java_info_cemu_cemu_nativeinterface_NativeEmulatedUSBDevices_getDimensionsFigureSlotNumber([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jint slot)
 +{
-+	if (slot < 0 || slot >= (jint)NativeEmulatedUSBDevices::g_dimensionSlots.size())
++	if (slot < 0 || slot >= (jint)NativeEmulatedUSBDevices::s_dimensionSlots.size())
 +		return -1;
-+	if (const auto& opt = NativeEmulatedUSBDevices::g_dimensionSlots.at(slot))
++	if (const auto& opt = NativeEmulatedUSBDevices::s_dimensionSlots.at(slot))
 +	{
 +		// the game rewrites a vehicle's number when it's rebuilt, so prefer what's on the pad right now
 +		uint32 live = nsyshid::g_dimensionstoypad.GetFigureIdAtIndex((uint8)slot);
@@ -7886,6 +7886,18 @@ index 504d615f..976557aa 100644
  private:
  	static uint32 s_audioDelay;
  	void InitWFX(sint32 samplerate, sint32 channels, sint32 bits_per_sample);
+diff --git a/src/input/api/Device/DeviceController.h b/src/input/api/Device/DeviceController.h
+index b4ed43b8..ef0b60a7 100644
+--- a/src/input/api/Device/DeviceController.h
++++ b/src/input/api/Device/DeviceController.h
+@@ -2,6 +2,7 @@
+ 
+ #include "input/api/InputAPI.h"
+ #include "input/api/Controller.h"
++#include "input/motion/MotionHandler.h" // Cemu LD+: no longer included through Controller.h in newer Cemu
+ #include "DeviceControllerProvider.h"
+ 
+ class DeviceController : public Controller<DeviceControllerProvider>
 diff --git a/src/util/CMakeLists.txt b/src/util/CMakeLists.txt
 index 8aa50b22..4dd674c0 100644
 --- a/src/util/CMakeLists.txt
